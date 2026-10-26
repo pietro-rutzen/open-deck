@@ -93,6 +93,35 @@ pub enum Behavior {
     /// `steps` discrete values evenly spaced across `min..=max` inclusive (waveform index, beat-loop
     /// size…). `from_normalized` snaps to the nearest step.
     Stepped { min: f64, max: f64, steps: u32 },
+    /// Channel trim. Full counter-clockwise is silence, 12 o'clock is unity, full clockwise is
+    /// [`TRIM_MAX_GAIN`] (+18 dB), which is enough to drive a ReplayGain-normalized track into the
+    /// channel red line.
+    Trim,
+}
+
+/// Full-clockwise channel trim. Matches the audio engine's trim clamp: +18 dB.
+pub const TRIM_MAX_GAIN: f64 = 8.0;
+
+/// Gain for a trim-knob position. `0` is silence, `0.5` is unity, `1` is [`TRIM_MAX_GAIN`].
+pub fn trim_gain_from_normalized(norm: f64) -> f64 {
+    let n = norm.clamp(0.0, 1.0);
+    if n <= 0.5 {
+        let travel = n / 0.5;
+        travel * travel
+    } else {
+        let travel = (n - 0.5) / 0.5;
+        TRIM_MAX_GAIN.powf(travel)
+    }
+}
+
+/// Knob position for a trim gain, the inverse of [`trim_gain_from_normalized`].
+pub fn trim_normalized_from_gain(gain: f64) -> f64 {
+    let g = gain.clamp(0.0, TRIM_MAX_GAIN);
+    if g <= 1.0 {
+        0.5 * g.sqrt()
+    } else {
+        0.5 + 0.5 * g.log(TRIM_MAX_GAIN)
+    }
 }
 
 impl Behavior {
@@ -128,6 +157,7 @@ impl Behavior {
                 let idx = (n * last).round();
                 min + (max - min) * (idx / last)
             }
+            Behavior::Trim => trim_gain_from_normalized(n),
         }
     }
 
@@ -160,6 +190,7 @@ impl Behavior {
                     (value - min) / (max - min)
                 }
             }
+            Behavior::Trim => trim_normalized_from_gain(value),
         };
         n.clamp(0.0, 1.0)
     }
@@ -265,6 +296,42 @@ impl Registry {
                 "Sampler Pad",
                 Unit::Boolean,
             ));
+            r.add(ControlSpec::new(
+                ControlId(Cow::Owned(format!("sampler.{pad}.stop"))),
+                Behavior::Toggle,
+                "Sampler Stop",
+                Unit::Boolean,
+            ));
+        }
+        // Beat FX unit: one selected effect applied to a selected deck.
+        for (id, label) in [
+            ("fx.next", "Beat FX next"),
+            ("fx.prev", "Beat FX previous"),
+            ("fx.beat_down", "Beat FX beat down"),
+            ("fx.beat_up", "Beat FX beat up"),
+            ("fx.off_all", "Beat FX all off"),
+        ] {
+            r.add(ControlSpec::new(id, Behavior::Toggle, label, Unit::Boolean));
+        }
+        r.add(ControlSpec::new(
+            "fx.level",
+            Behavior::Linear { min: 0.0, max: 1.0 },
+            "Beat FX level/depth",
+            Unit::None,
+        ));
+        for d in 0..deck_count {
+            r.add(ControlSpec::new(
+                ControlId(Cow::Owned(format!("fx.channel.{d}"))),
+                Behavior::Toggle,
+                "Beat FX channel",
+                Unit::Boolean,
+            ));
+            r.add(ControlSpec::new(
+                ControlId(Cow::Owned(format!("fx.toggle.{d}"))),
+                Behavior::Toggle,
+                "Beat FX on/off",
+                Unit::Boolean,
+            ));
         }
         // Per-deck controls.
         for d in 0..deck_count {
@@ -275,6 +342,66 @@ impl Registry {
                 "Gain",
                 Unit::Ratio,
             ));
+            r.add(ControlSpec::new(
+                p("trim"),
+                Behavior::Trim,
+                "Trim",
+                Unit::Ratio,
+            ));
+            r.add(ControlSpec::new(
+                p("volume"),
+                Behavior::Linear { min: 0.0, max: 1.0 },
+                "Channel volume",
+                Unit::Ratio,
+            ));
+            r.add(ControlSpec::new(
+                p("headphone_cue"),
+                Behavior::Toggle,
+                "Headphone cue",
+                Unit::Boolean,
+            ));
+            for name in [
+                "loop.in",
+                "loop.out",
+                "loop.toggle",
+                "loop.half",
+                "loop.double",
+                "jump.back",
+                "jump.forward",
+                "start",
+                "quantize",
+                "loop.reloop_stop",
+                "sync_leader",
+            ] {
+                r.add(ControlSpec::new(
+                    p(name),
+                    Behavior::Toggle,
+                    "Deck action",
+                    Unit::Boolean,
+                ));
+            }
+            for pad in 0..8 {
+                for action in ["hotcue", "clear_hotcue", "beatloop", "beatjump"] {
+                    r.add(ControlSpec::new(
+                        p(&format!("{action}.{pad}")),
+                        Behavior::Toggle,
+                        "Hot cue",
+                        Unit::Boolean,
+                    ));
+                }
+                r.add(ControlSpec::new(
+                    p(&format!("key_shift.{pad}")),
+                    Behavior::Toggle,
+                    "Key shift pad",
+                    Unit::Boolean,
+                ));
+                r.add(ControlSpec::new(
+                    p(&format!("key_shift_step.{pad}")),
+                    Behavior::Toggle,
+                    "Key shift step pad",
+                    Unit::Boolean,
+                ));
+            }
             for band in ["low", "mid", "high"] {
                 r.add(ControlSpec::new(
                     ControlId(Cow::Owned(format!("deck.{d}.eq.{band}"))),
@@ -310,6 +437,20 @@ impl Registry {
                 "Cue",
                 Unit::Boolean,
             ));
+            r.add(ControlSpec::new(
+                p("censor"),
+                Behavior::Toggle,
+                "Censor",
+                Unit::Boolean,
+            ));
+            for name in ["beatjump.scale_down", "beatjump.scale_up"] {
+                r.add(ControlSpec::new(
+                    p(name),
+                    Behavior::Toggle,
+                    "Beat jump size",
+                    Unit::Boolean,
+                ));
+            }
             r.add(ControlSpec::new(
                 p("sync"),
                 Behavior::Toggle,
@@ -364,6 +505,22 @@ mod tests {
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn trim_is_unity_at_center_and_clips_a_normalized_track_at_full() {
+        let trim = Behavior::Trim;
+        assert!(approx(trim.from_normalized(0.0), 0.0));
+        assert!(approx(trim.from_normalized(0.5), 1.0));
+        assert!(approx(trim.from_normalized(1.0), TRIM_MAX_GAIN));
+        assert!(approx(trim.to_normalized(1.0), 0.5));
+        assert!(approx(trim.to_normalized(TRIM_MAX_GAIN), 1.0));
+        // ReplayGain parks program material near −18 dBFS. Full trim must cross 0 dBFS.
+        assert!(0.125 * trim.from_normalized(1.0) >= 1.0);
+        for &norm in &[0.0, 0.25, 0.5, 0.75, 1.0] {
+            let gain = trim.from_normalized(norm);
+            assert!(approx(trim.to_normalized(gain), norm));
+        }
     }
 
     #[test]
@@ -461,6 +618,36 @@ mod tests {
                 "sampler pad {pad} should be mappable"
             );
         }
+    }
+
+    #[test]
+    fn registry_exposes_performance_pad_and_beat_fx_targets() {
+        let r = Registry::defaults(2);
+        for id in [
+            "sampler.7.stop",
+            "fx.next",
+            "fx.prev",
+            "fx.beat_down",
+            "fx.beat_up",
+            "fx.off_all",
+            "fx.channel.1",
+            "fx.toggle.1",
+            "deck.1.key_shift.7",
+            "deck.1.key_shift_step.0",
+            "deck.0.loop.reloop_stop",
+            "deck.0.sync_leader",
+        ] {
+            assert_eq!(
+                r.get_str(id).map(|spec| spec.behavior),
+                Some(Behavior::Toggle),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            r.get_str("fx.level").map(|spec| spec.behavior),
+            Some(Behavior::Linear { min: 0.0, max: 1.0 })
+        );
+        assert!(r.get_str("fx.toggle.2").is_none());
     }
 
     #[test]

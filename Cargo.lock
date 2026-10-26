@@ -514,6 +514,7 @@ dependencies = [
 name = "compas-dj"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "compas-audio",
  "compas-core",
  "compas-dsp",
@@ -522,10 +523,14 @@ dependencies = [
  "hidapi",
  "midir",
  "notify",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "rtrb",
  "rusqlite",
  "serde",
  "serde_json",
+ "symphonia",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

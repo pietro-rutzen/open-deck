@@ -25,7 +25,8 @@ mod waveform;
 
 pub use cue::{
     open_booth_output, open_booth_output_with_latency, open_cue_output,
-    open_cue_output_with_latency, output_device_names, CueOutput, MonitorLatency,
+    open_cue_output_route_with_latency, open_cue_output_with_latency, output_device_details,
+    output_device_names, CueOutput, MonitorLatency, OutputDeviceInfo,
 };
 pub use engine::{AudioEngine, EngineConfig};
 pub use input::{input_device_names, open_aux_input, AuxInput};

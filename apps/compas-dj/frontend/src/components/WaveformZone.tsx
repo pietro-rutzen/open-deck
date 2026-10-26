@@ -1,15 +1,45 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react";
+import { type CSSProperties, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from "react";
+import { useElementSize } from "../hooks/useElementSize";
 import type { DeckState } from "../hooks/useDeck";
-import { bandColor } from "../lib/ipc";
+import { bandAmplitudes, filledWavePath, WAVE_COLORS, waveformScale } from "../lib/waveformDisplay";
+import { inTauri, onControllerUpdate } from "../lib/ipc";
 
-const VW = 1368;
-const VH = 80;
 const NOW_FRAC = 0.38; // NOW playhead sits 38% from the left; track scrolls under it
-const ZOOMS = [4, 8, 16, 32]; // seconds visible (preset buttons)
-const MIN_VIEW = 2; // most zoomed-in (seconds visible)
+const ZOOMS = [4, 8, 16, 32]; // audible seconds visible (preset buttons)
+const MIN_VIEW = 2; // most zoomed-in (audible seconds visible)
 const MAX_VIEW = 64; // most zoomed-out
 const WHEEL_STEP = 0.85; // per wheel notch: <1 zooms in (fewer seconds visible)
 const CLICK_STEP = 0.7; // per Ctrl/⌘+click step
+const EMPTY_PEAKS: number[] = [];
+const EMPTY_BANDS: [number, number, number][] = [];
+const WAVE_SPAN = 8;
+const WAVE_PAD = 3.2;
+const WAVE_SLACK = 0.5;
+const WAVE_HEIGHT_KEY = "opendeck.waveform.height.v1";
+const MIN_WAVE_HEIGHT = 72;
+const DECK_FLOOR = 200;
+const DOWNBEAT = "#ff1a1a";
+const DOWNBEAT_TEXT = "#ff3b30";
+
+interface PlayheadMotion {
+  playing: boolean;
+  frame: number;
+  frameAt: number;
+  rate: number;
+  sourceRate: number;
+  latencySecs: number;
+}
+
+function shownPlayheadSeconds(sample: PlayheadMotion): number {
+  if (sample.sourceRate <= 0) return 0;
+  const elapsed = sample.frameAt > 0 ? Math.min(0.08, (performance.now() - sample.frameAt) / 1000) : 0;
+  const frame = sample.frame + elapsed * sample.rate;
+  return Math.max(0, frame - sample.rate * sample.latencySecs) / sample.sourceRate;
+}
+
+function playbackStretch(tempo: number): number {
+  return tempo > 0.05 ? tempo : 1;
+}
 
 interface Lane {
   state: DeckState;
@@ -21,14 +51,45 @@ interface Lane {
 }
 
 export function WaveformZone({ lanes }: { lanes: Lane[] }) {
+  const zoneRef = useRef<HTMLDivElement>(null);
+  const drag = useRef<{ startY: number; startHeight: number } | null>(null);
   const [view, setView] = useState(8);
+  const [height, setHeight] = useState<number | null>(() => {
+    try {
+      const saved = localStorage.getItem(WAVE_HEIGHT_KEY);
+      const value = saved === null ? NaN : Number(saved);
+      return Number.isFinite(value) && value >= MIN_WAVE_HEIGHT ? value : null;
+    } catch {
+      return null;
+    }
+  });
   const zoomBy = useCallback((factor: number) => {
     setView((v) => Math.min(MAX_VIEW, Math.max(MIN_VIEW, v * factor)));
   }, []);
+  useEffect(() => {
+    if (!inTauri()) return;
+    const unlisten = onControllerUpdate(({ control, value }) => {
+      if (control === "waveform.zoom" && value !== 0) zoomBy(WHEEL_STEP ** value);
+    });
+    return () => {
+      unlisten.then((stop) => stop());
+    };
+  }, [zoomBy]);
+  useEffect(() => {
+    try {
+      if (height == null) localStorage.removeItem(WAVE_HEIGHT_KEY);
+      else localStorage.setItem(WAVE_HEIGHT_KEY, String(Math.round(height)));
+    } catch { /* The strip still resizes for this session. */ }
+  }, [height]);
+  const limitHeight = (pixels: number) => {
+    const parent = zoneRef.current?.parentElement?.clientHeight ?? pixels;
+    const max = Math.max(MIN_WAVE_HEIGHT, parent - DECK_FLOOR);
+    return Math.min(max, Math.max(MIN_WAVE_HEIGHT, pixels));
+  };
   // Highlight the preset closest to the current (possibly wheel-adjusted) view.
   const nearest = ZOOMS.reduce((a, b) => (Math.abs(b - view) < Math.abs(a - view) ? b : a));
   return (
-    <div className="wf-zone">
+    <div className="wf-zone" ref={zoneRef} style={height == null ? undefined : { height }}>
       <div className="wf-zoom">
         {ZOOMS.map((z) => (
           <button key={z} className={`wf-zoom-btn ${z === nearest ? "wf-zoom-btn--on" : ""}`} onClick={() => setView(z)}>
@@ -42,94 +103,225 @@ export function WaveformZone({ lanes }: { lanes: Lane[] }) {
       {lanes.map((lane, i) => (
         <WaveLane key={i} lane={lane} view={view} zoomBy={zoomBy} />
       ))}
+      <div
+        className="wf-resize"
+        role="separator"
+        tabIndex={0}
+        aria-orientation="horizontal"
+        aria-label="Resize waveform"
+        aria-valuemin={MIN_WAVE_HEIGHT}
+        aria-valuenow={height == null ? undefined : Math.round(height)}
+        title="Drag to resize the waveform · double-click to reset"
+        onDoubleClick={() => setHeight(null)}
+        onPointerDown={(event) => {
+          const zone = zoneRef.current;
+          if (!zone || event.button !== 0) return;
+          event.preventDefault();
+          event.stopPropagation();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          drag.current = { startY: event.clientY, startHeight: zone.getBoundingClientRect().height };
+        }}
+        onPointerMove={(event) => {
+          const gesture = drag.current;
+          if (!gesture) return;
+          setHeight(limitHeight(gesture.startHeight + event.clientY - gesture.startY));
+        }}
+        onPointerUp={(event) => {
+          drag.current = null;
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+        }}
+        onPointerCancel={() => { drag.current = null; }}
+        onLostPointerCapture={() => { drag.current = null; }}
+        onKeyDown={(event) => {
+          if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+          event.preventDefault();
+          const current = height ?? zoneRef.current?.getBoundingClientRect().height ?? MIN_WAVE_HEIGHT;
+          const parent = zoneRef.current?.parentElement?.clientHeight ?? current + DECK_FLOOR;
+          const max = Math.max(MIN_WAVE_HEIGHT, parent - DECK_FLOOR);
+          if (event.key === "Home") setHeight(MIN_WAVE_HEIGHT);
+          else if (event.key === "End") setHeight(max);
+          else setHeight(limitHeight(current + (event.key === "ArrowDown" ? 16 : -16)));
+        }}
+      >
+        <span aria-hidden="true" />
+      </div>
     </div>
   );
 }
 
-function WaveLane({ lane, view, zoomBy }: { lane: Lane; view: number; zoomBy: (factor: number) => void }) {
+const WaveGraphic = memo(function WaveGraphic({
+  peaks,
+  bands,
+  color,
+  origin,
+  binSec,
+  view,
+  width,
+  height,
+  beatInterval,
+  beatOffset,
+  stretch,
+}: {
+  peaks: number[];
+  bands: [number, number, number][];
+  color: string;
+  origin: number;
+  binSec: number;
+  view: number;
+  width: number;
+  height: number;
+  beatInterval: number;
+  beatOffset: number;
+  stretch: number;
+}) {
+  const displayScale = useMemo(() => waveformScale(peaks, bands), [peaks, bands]);
+  const useBands = bands.length === peaks.length && peaks.length > 0;
+  const centerY = height / 2;
+  const pixelsPerSecond = width / Math.max(view, 0.001);
+  const span = view * WAVE_SPAN;
+  const samples = useMemo(() => {
+    if (binSec <= 0 || peaks.length === 0 || width <= 0 || stretch <= 0) return [];
+    const sourceOrigin = origin * stretch;
+    const sourceEnd = (origin + span) * stretch;
+    const first = Math.max(0, Math.floor(sourceOrigin / binSec));
+    const last = Math.min(peaks.length - 1, Math.ceil(sourceEnd / binSec));
+    if (last < first) return [];
+    const columns = Math.max(1, Math.ceil(width * WAVE_SPAN * 1.15));
+    const step = Math.max(1, Math.ceil((last - first + 1) / columns));
+    const points: { x: number; amps: number[] }[] = [];
+    for (let index = first; index <= last; index += step) {
+      const end = Math.min(last, index + step - 1);
+      let loudest = index;
+      for (let probe = index + 1; probe <= end; probe += 1) {
+        if (peaks[probe] > peaks[loudest]) loudest = probe;
+      }
+      const peak = peaks[loudest] ?? 0;
+      const band = useBands ? bands[loudest] : undefined;
+      points.push({
+        x: (loudest * binSec / stretch - origin) * pixelsPerSecond,
+        amps: bandAmplitudes(peak, band, displayScale).map((amp) => amp * centerY * 0.94),
+      });
+    }
+    return points;
+  }, [bands, binSec, centerY, displayScale, origin, peaks, pixelsPerSecond, span, stretch, useBands, width]);
+  const beats = useMemo(() => {
+    if (beatInterval <= 0.05 || width <= 0 || stretch <= 0) return [];
+    const end = origin + span;
+    const marks: { x: number; down: boolean; bar: number; beat: number }[] = [];
+    let index = Math.floor((origin * stretch - beatOffset) / beatInterval) - 1;
+    for (let count = 0; count < 4096; count += 1, index += 1) {
+      const time = (beatOffset + index * beatInterval) / stretch;
+      if (time > end) break;
+      if (time < origin || time < 0) continue;
+      const beatInBar = ((index % 4) + 4) % 4;
+      marks.push({
+        x: (time - origin) * pixelsPerSecond,
+        down: beatInBar === 0,
+        bar: Math.floor(index / 4) + 1,
+        beat: beatInBar + 1,
+      });
+    }
+    return marks;
+  }, [beatInterval, beatOffset, origin, pixelsPerSecond, span, stretch, width]);
+  const showBeatNumber = beatInterval / view * width > 45;
+  return (
+    <g>
+      {samples.length > 0 && (useBands ? [0, 1, 2] : [0]).map((layer) => (
+        <path key={layer} d={filledWavePath(samples.map((sample) => ({ x: sample.x, amp: sample.amps[layer] ?? 0 })), centerY)} fill={useBands ? WAVE_COLORS[layer] : color} />
+      ))}
+      {samples.length > 0 && !useBands && (
+        <path d={filledWavePath(samples.map((sample) => ({ x: sample.x, amp: (sample.amps[0] ?? 0) * 0.42 })), centerY)} fill="#ffffff" opacity={0.78} />
+      )}
+      <g className="wf-beat-grid" aria-label="Beat grid, grouped in four beats">
+        {beats.map((beat) => (
+          <g key={`${beat.bar}-${beat.beat}-${beat.x.toFixed(1)}`}>
+            <line x1={beat.x} y1={0} x2={beat.x} y2={height} stroke={beat.down ? DOWNBEAT : "#e6ebf1"} strokeWidth={beat.down ? 1.5 : 0.8} strokeDasharray={beat.down ? undefined : "2 4"} opacity={beat.down ? 1 : 0.38} vectorEffect="non-scaling-stroke" />
+            <path d={`M ${beat.x - 3} 0 L ${beat.x + 3} 0 L ${beat.x} 5 Z M ${beat.x - 3} ${height} L ${beat.x + 3} ${height} L ${beat.x} ${height - 5} Z`} fill={beat.down ? DOWNBEAT : "#d9e0e8"} opacity={beat.down ? 1 : 0.7} />
+            {(beat.down || showBeatNumber) && (
+              <text x={beat.x + 6} y={12} fill={beat.down ? DOWNBEAT_TEXT : "#d9e0e8"} fontSize="10" fontWeight={beat.down ? 700 : 400} stroke="#080a0d" strokeWidth="3" paintOrder="stroke">
+                {beat.down ? `${beat.bar}.1` : beat.beat}
+              </text>
+            )}
+          </g>
+        ))}
+      </g>
+    </g>
+  );
+});
+
+const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; view: number; zoomBy: (factor: number) => void }) {
   const { state, color, letter, onSeek, onNudgeGrid, onResetGrid } = lane;
+  const [laneRef, size] = useElementSize<HTMLDivElement>(1368, 86);
+  const VW = size.width;
+  const VH = Math.max(1, size.height - 29);
   const meta = state.meta;
   const streaming = !state.dsp;
   const effBpm = meta ? meta.bpm * state.tempo : 0;
+  const stretch = playbackStretch(state.tempo);
 
   const sr = meta?.source_rate ?? 1;
   const frames = meta?.frames ?? 0;
   const duration = frames > 0 ? frames / sr : 0;
-  const peaks = meta?.peaks ?? [];
+  const peaks = meta?.peaks ?? EMPTY_PEAKS;
   const binSec = peaks.length > 0 && duration > 0 ? duration / peaks.length : 0;
-  // Frequency-band energy per bin (low→R, mid→G, high→B), aligned 1:1 with `peaks`.
-  const bands = meta?.band_peaks ?? [];
-  const useBands = bands.length === peaks.length && bands.length > 0;
-
-  // Play-head position (event-driven at the telemetry rate), offset by DAC latency so the marker
-  // matches what's being heard. (A display-rate rAF here re-rendered the whole band waveform every
-  // frame and saturated the UI; keep it event-driven.)
-  const nowTime = Math.max(0, state.frame - state.rate * state.latencySecs) / sr;
-  const t0 = nowTime - NOW_FRAC * view; // left edge time
-  const t1 = t0 + view;
-  // Overscan the right edge so the rAF interpolation (below) has drawn content to scroll in
-  // between the 30 Hz position samples — otherwise a thin gap would flicker at the right.
-  const overSec = view * 0.08;
-  const t1o = t1 + overSec;
-
-  const xOf = (t: number) => ((t - t0) / view) * VW;
-
-  // Smooth scroll: position events arrive at the telemetry rate (30 Hz), which alone looks
-  // stepped. We translate the rendered <g> by the sub-sample time elapsed since the last event
-  // via requestAnimationFrame — a GPU-composited transform, so the waveform/beat paths are NOT
-  // re-rendered each frame (the cost the event-driven design deliberately avoids).
-  const gRef = useRef<SVGGElement>(null);
-  const animRef = useRef({ playing: false, rate: 0, sr: 1, view, frameAt: 0 });
-  animRef.current = { playing: state.playing, rate: state.rate, sr, view, frameAt: state.frameAt };
+  const bands = meta?.band_peaks ?? EMPTY_BANDS;
+  const beatInterval = meta?.beat_interval_sec ?? 0;
+  const beatOffset = (meta?.first_beat_sec ?? 0) + state.gridOffset;
+  const [origin, setOrigin] = useState(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const motionRef = useRef<PlayheadMotion & { view: number; width: number; origin: number; stretch: number }>({
+    playing: state.playing,
+    frame: state.frame,
+    frameAt: state.frameAt,
+    rate: state.rate,
+    sourceRate: sr,
+    latencySecs: state.latencySecs,
+    view,
+    width: VW,
+    origin,
+    stretch,
+  });
+  motionRef.current = {
+    playing: state.playing,
+    frame: state.frame,
+    frameAt: state.frameAt,
+    rate: state.rate,
+    sourceRate: sr,
+    latencySecs: state.latencySecs,
+    view,
+    width: VW,
+    origin,
+    stretch,
+  };
+  const placeScroll = () => {
+    const motion = motionRef.current;
+    const playhead = shownPlayheadSeconds(motion) / motion.stretch;
+    const edge = playhead - NOW_FRAC * motion.view;
+    const dx = -((edge - motion.origin) * (motion.width / Math.max(motion.view, 0.001)));
+    const node = scrollRef.current;
+    if (!node) return;
+    node.style.width = `${motion.width * WAVE_SPAN}px`;
+    node.style.transform = `translate3d(${dx.toFixed(2)}px, 0, 0)`;
+  };
+  useLayoutEffect(() => {
+    const motion = motionRef.current;
+    const playhead = shownPlayheadSeconds(motion) / motion.stretch;
+    const edge = playhead - NOW_FRAC * motion.view;
+    const span = motion.view * WAVE_SPAN;
+    const slack = motion.view * WAVE_SLACK;
+    const covers = edge > origin + slack && edge + motion.view < origin + span - slack;
+    if (!covers) setOrigin(edge - motion.view * WAVE_PAD);
+    placeScroll();
+  }, [origin, view, VW, state.frame, state.frameAt, state.playing, state.rate, state.latencySecs, state.tempo, sr]);
   useEffect(() => {
     let raf = 0;
     const tick = () => {
-      const g = gRef.current;
-      if (g) {
-        const a = animRef.current;
-        let dxFrac = 0;
-        if (a.playing && a.frameAt > 0 && a.sr > 0 && a.view > 0) {
-          const elapsed = (performance.now() - a.frameAt) / 1000; // s since last sample
-          dxFrac = (elapsed * a.rate) / (a.sr * a.view); // fraction of the window advanced
-          dxFrac = Math.max(0, Math.min(0.08, dxFrac)); // cap at the overscan margin
-        }
-        g.setAttribute("transform", `translate(${(-dxFrac * VW).toFixed(2)} 0)`);
-      }
+      placeScroll();
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, []);
-
-  // waveform slice
-  const slice = (scale: number): string => {
-    if (binSec <= 0) return "";
-    const cy = VH / 2;
-    const i0 = Math.max(0, Math.floor(t0 / binSec));
-    const i1 = Math.min(peaks.length - 1, Math.ceil(t1o / binSec));
-    if (i1 <= i0) return "";
-    let d = `M ${xOf(i0 * binSec).toFixed(1)} ${cy}`;
-    for (let i = i0; i <= i1; i++) {
-      d += ` L ${xOf(i * binSec).toFixed(1)} ${(cy - Math.min(1, peaks[i]) * cy * scale).toFixed(1)}`;
-    }
-    for (let i = i1; i >= i0; i--) {
-      d += ` L ${xOf(i * binSec).toFixed(1)} ${(cy + Math.min(1, peaks[i]) * cy * scale).toFixed(1)}`;
-    }
-    return d + " Z";
-  };
-
-  // beat lines in the visible window
-  const beats: { x: number; down: boolean }[] = [];
-  const interval = meta?.beat_interval_sec ?? 0;
-  const offset = (meta?.first_beat_sec ?? 0) + state.gridOffset;
-  if (interval > 0.05) {
-    let k = Math.floor((t0 - offset) / interval) - 1;
-    for (let n = 0; n < 4096; n++, k++) {
-      const t = offset + k * interval;
-      if (t > t1o) break;
-      if (t >= t0 && t >= 0) beats.push({ x: xOf(t), down: ((k % 4) + 4) % 4 === 0 });
-    }
-  }
 
   // Grab-scrub the lane like vinyl: pointer-down anchors at the current play position, and dragging
   // moves the track under the fixed NOW needle (drag right → rewind). Using a frozen anchor (startSec
@@ -138,13 +330,15 @@ function WaveLane({ lane, view, zoomBy }: { lane: Lane; view: number; zoomBy: (f
   const drag = useRef<{ startX: number; startSec: number; moved: boolean } | null>(null);
   const needleDrop = (clientX: number, r: DOMRect) => {
     const frac = (clientX - r.left) / r.width;
-    const target = t0 + frac * view;
+    const motion = motionRef.current;
+    const playhead = shownPlayheadSeconds(motion);
+    const sourceView = view * motion.stretch;
+    const target = playhead - NOW_FRAC * sourceView + frac * sourceView;
     onSeek(Math.min(1, Math.max(0, target / duration)));
   };
 
   // Wheel zoom: React binds `onWheel` passively, so a native non-passive listener is needed to
   // preventDefault (otherwise the gesture would also scroll the page). Scroll up zooms in.
-  const laneRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = laneRef.current;
     if (!el) return;
@@ -164,7 +358,7 @@ function WaveLane({ lane, view, zoomBy }: { lane: Lane; view: number; zoomBy: (f
       return;
     }
     e.currentTarget.setPointerCapture(e.pointerId);
-    drag.current = { startX: e.clientX, startSec: nowTime, moved: false };
+    drag.current = { startX: e.clientX, startSec: shownPlayheadSeconds(motionRef.current), moved: false };
   };
   const onMove = (e: PointerEvent<HTMLDivElement>) => {
     const d = drag.current;
@@ -173,7 +367,7 @@ function WaveLane({ lane, view, zoomBy }: { lane: Lane; view: number; zoomBy: (f
     const dx = e.clientX - d.startX;
     if (Math.abs(dx) > 3) d.moved = true;
     if (!d.moved) return;
-    const target = d.startSec - (dx / r.width) * view; // grab: drag right rewinds, left fast-forwards
+    const target = d.startSec - (dx / r.width) * view * motionRef.current.stretch;
     onSeek(Math.min(1, Math.max(0, target / duration)));
   };
   const onUp = (e: PointerEvent<HTMLDivElement>) => {
@@ -188,73 +382,48 @@ function WaveLane({ lane, view, zoomBy }: { lane: Lane; view: number; zoomBy: (f
   };
 
   return (
-    <div className="wf-lane" ref={laneRef} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}>
+    <div className="wf-lane" style={{ "--deck-color": color } as CSSProperties} ref={laneRef} onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}>
       {peaks.length > 0 && (
-        <svg className="wf-svg" viewBox={`0 0 ${VW} ${VH}`} preserveAspectRatio="none">
-          <g ref={gRef}>
-          <g>
-            {beats.map((b, i) => (
-              <line key={i} x1={b.x} y1={0} x2={b.x} y2={VH} stroke={b.down ? color : "rgba(255,255,255,.12)"} strokeWidth={b.down ? 1.6 : 0.7} opacity={b.down ? 0.6 : 1} />
-            ))}
-          </g>
-          {useBands ? (
-            <g>
-              {(() => {
-                const cy = VH / 2;
-                const i0 = Math.max(0, Math.floor(t0 / binSec));
-                const i1 = Math.min(peaks.length - 1, Math.ceil(t1o / binSec));
-                // Cap at ~one line per pixel column so wide zooms stay cheap to render.
-                const step = Math.max(1, Math.ceil((i1 - i0) / VW));
-                const bw = Math.max(0.7, (binSec / view) * VW * step);
-                const bars = [];
-                for (let i = i0; i <= i1; i += step) {
-                  const x = xOf(i * binSec);
-                  const amp = Math.min(1, peaks[i]) * cy * 0.92;
-                  bars.push(
-                    <line key={i} x1={x} y1={cy - amp} x2={x} y2={cy + amp} stroke={bandColor(bands[i])} strokeWidth={bw} />,
-                  );
-                }
-                return bars;
-              })()}
-            </g>
-          ) : (
-            <>
-              <path d={slice(1)} fill={color} opacity={0.3} />
-              <path d={slice(0.46)} fill={color} opacity={0.92} />
-            </>
-          )}
-          </g>
-        </svg>
+        <div ref={scrollRef} className="wf-scroll">
+          <svg className="wf-svg" viewBox={`0 0 ${Math.max(1, VW * WAVE_SPAN)} ${VH}`} preserveAspectRatio="none">
+            <WaveGraphic peaks={peaks} bands={bands} color={color} origin={origin} binSec={binSec} view={view} width={VW} height={VH} beatInterval={beatInterval} beatOffset={beatOffset} stretch={stretch} />
+            {state.loop.active && state.loop.outFrame > state.loop.inFrame && (
+              <rect
+                x={(state.loop.inFrame / sr / stretch - origin) * (VW / Math.max(view, 0.001))}
+                y={0}
+                width={((state.loop.outFrame - state.loop.inFrame) / sr / stretch) * (VW / Math.max(view, 0.001))}
+                height={VH}
+                fill={color}
+                fillOpacity={0.12}
+                stroke={color}
+                strokeWidth={1}
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+            {!state.loop.active && state.loop.armed && (
+              <line
+                x1={(state.loop.inFrame / sr / stretch - origin) * (VW / Math.max(view, 0.001))}
+                x2={(state.loop.inFrame / sr / stretch - origin) * (VW / Math.max(view, 0.001))}
+                y1={0}
+                y2={VH}
+                stroke={color}
+                strokeWidth={2}
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+          </svg>
+        </div>
       )}
       <div className="wf-scrim" style={{ width: `${NOW_FRAC * 100}%` }} />
-      {state.loop.active &&
-        (() => {
-          const left = Math.max(0, (state.loop.inFrame / sr - t0) / view);
-          const right = Math.min(1, (state.loop.outFrame / sr - t0) / view);
-          if (right <= 0 || left >= 1 || right <= left) return null;
-          return (
-            <div
-              className="wf-loop"
-              style={{ left: `${left * 100}%`, width: `${(right - left) * 100}%`, background: `${color}22`, borderColor: color }}
-            />
-          );
-        })()}
-      {!state.loop.active &&
-        state.loop.armed &&
-        (() => {
-          const x = (state.loop.inFrame / sr - t0) / view;
-          if (x < 0 || x > 1) return null;
-          return <div className="wf-loop-in" style={{ left: `${x * 100}%`, background: color, boxShadow: `0 0 6px ${color}` }} />;
-        })()}
       {streaming && <div className="wf-hatch" />}
       <div className="wf-label">
-        <span className="wf-chip" style={{ color, background: `${color}1f`, borderColor: `${color}66` }}>{letter}</span>
+        <span className="wf-chip" style={{ color, background: `color-mix(in srgb, ${color} 12%, transparent)`, borderColor: color }}>{letter}</span>
         <span className="mono wf-bpm">
-          {meta && effBpm > 0 ? `${effBpm.toFixed(1)} · ${meta.key_camelot}` : "— · —"}
+          {meta && effBpm > 0 ? `${effBpm.toFixed(2)} · ${meta.key_camelot}` : "— · —"}
         </span>
         <span className="wf-title">{meta ? `${meta.title} — ${meta.artist}` : "No track loaded"}</span>
         {streaming && <span className="wf-badge">STREAM · CONTROL-ONLY</span>}
-        {meta && interval > 0.05 && onNudgeGrid && (
+        {meta && beatInterval > 0.05 && onNudgeGrid && (
           <span className="wf-grid-edit" onPointerDown={(e) => e.stopPropagation()} title="Nudge the beatgrid to line it up with the audio">
             <button onClick={() => onNudgeGrid(-0.005)}>◀</button>
             <button onClick={onResetGrid} className="wf-grid-reset">
@@ -266,4 +435,4 @@ function WaveLane({ lane, view, zoomBy }: { lane: Lane; view: number; zoomBy: (f
       </div>
     </div>
   );
-}
+}, (previous, next) => previous.view === next.view && previous.zoomBy === next.zoomBy && previous.lane.state === next.lane.state && previous.lane.onSeek === next.lane.onSeek && previous.lane.onNudgeGrid === next.lane.onNudgeGrid && previous.lane.onResetGrid === next.lane.onResetGrid && previous.lane.color === next.lane.color && previous.lane.letter === next.lane.letter);

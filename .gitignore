@@ -26,3 +26,10 @@ apps/*/frontend/dist/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local OpenDeck dependency caches
+/.build-cache/
+apps/*/src-tauri/.build-cache/
+
+# Local launcher shortcut
+/OpenDeck.app

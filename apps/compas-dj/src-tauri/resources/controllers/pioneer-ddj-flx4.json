@@ -1,29 +1,1657 @@
 {
   "id": "pioneer-ddj-flx4",
   "name": "Pioneer DDJ-FLX4",
-  "ports": { "input": "DDJ-FLX4", "output": "DDJ-FLX4" },
+  "ports": {
+    "input": "DDJ-FLX4",
+    "output": "DDJ-FLX4"
+  },
   "bindings": [
-    { "channel": 0, "input": { "kind": "cc", "cc": 19 }, "control": "deck.0.gain",     "soft_takeover": true },
-    { "channel": 0, "input": { "kind": "cc", "cc": 7 },  "control": "deck.0.eq.high",  "soft_takeover": true },
-    { "channel": 0, "input": { "kind": "cc", "cc": 11 }, "control": "deck.0.eq.mid",   "soft_takeover": true },
-    { "channel": 0, "input": { "kind": "cc", "cc": 15 }, "control": "deck.0.eq.low",   "soft_takeover": true },
-    { "channel": 0, "input": { "kind": "cc", "cc": 0 },  "control": "deck.0.tempo",    "soft_takeover": true },
-    { "channel": 6, "input": { "kind": "cc", "cc": 23 }, "control": "deck.0.filter",   "soft_takeover": true },
-    { "channel": 0, "input": { "kind": "note", "note": 11 }, "control": "deck.0.play" },
-    { "channel": 0, "input": { "kind": "note", "note": 12 }, "control": "deck.0.cue" },
-    { "channel": 0, "input": { "kind": "note", "note": 88 }, "control": "deck.0.sync" },
-
-    { "channel": 1, "input": { "kind": "cc", "cc": 19 }, "control": "deck.1.gain",     "soft_takeover": true },
-    { "channel": 1, "input": { "kind": "cc", "cc": 7 },  "control": "deck.1.eq.high",  "soft_takeover": true },
-    { "channel": 1, "input": { "kind": "cc", "cc": 11 }, "control": "deck.1.eq.mid",   "soft_takeover": true },
-    { "channel": 1, "input": { "kind": "cc", "cc": 15 }, "control": "deck.1.eq.low",   "soft_takeover": true },
-    { "channel": 1, "input": { "kind": "cc", "cc": 0 },  "control": "deck.1.tempo",    "soft_takeover": true },
-    { "channel": 6, "input": { "kind": "cc", "cc": 24 }, "control": "deck.1.filter",   "soft_takeover": true },
-    { "channel": 1, "input": { "kind": "note", "note": 11 }, "control": "deck.1.play" },
-    { "channel": 1, "input": { "kind": "note", "note": 12 }, "control": "deck.1.cue" },
-    { "channel": 1, "input": { "kind": "note", "note": 88 }, "control": "deck.1.sync" },
-
-    { "channel": 6, "input": { "kind": "cc", "cc": 31 }, "control": "mixer.crossfader", "soft_takeover": true },
-    { "channel": 6, "input": { "kind": "cc", "cc": 12 }, "control": "mixer.cue_mix",    "soft_takeover": true }
+    {
+      "channel": 0,
+      "input": {
+        "kind": "cc",
+        "cc": 19
+      },
+      "control": "deck.0.volume",
+      "soft_takeover": false
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "cc",
+        "cc": 7
+      },
+      "control": "deck.0.eq.high",
+      "soft_takeover": false
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "cc",
+        "cc": 11
+      },
+      "control": "deck.0.eq.mid",
+      "soft_takeover": false
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "cc",
+        "cc": 15
+      },
+      "control": "deck.0.eq.low",
+      "soft_takeover": false
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "cc",
+        "cc": 0
+      },
+      "control": "deck.0.tempo",
+      "soft_takeover": false
+    },
+    {
+      "channel": 6,
+      "input": {
+        "kind": "cc",
+        "cc": 23
+      },
+      "control": "deck.0.filter",
+      "soft_takeover": false
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 11
+      },
+      "control": "deck.0.play"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 12
+      },
+      "control": "deck.0.cue"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 88
+      },
+      "control": "deck.0.sync"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "cc",
+        "cc": 19
+      },
+      "control": "deck.1.volume",
+      "soft_takeover": false
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "cc",
+        "cc": 7
+      },
+      "control": "deck.1.eq.high",
+      "soft_takeover": false
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "cc",
+        "cc": 11
+      },
+      "control": "deck.1.eq.mid",
+      "soft_takeover": false
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "cc",
+        "cc": 15
+      },
+      "control": "deck.1.eq.low",
+      "soft_takeover": false
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "cc",
+        "cc": 0
+      },
+      "control": "deck.1.tempo",
+      "soft_takeover": false
+    },
+    {
+      "channel": 6,
+      "input": {
+        "kind": "cc",
+        "cc": 24
+      },
+      "control": "deck.1.filter",
+      "soft_takeover": false
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 11
+      },
+      "control": "deck.1.play"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 12
+      },
+      "control": "deck.1.cue"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 88
+      },
+      "control": "deck.1.sync"
+    },
+    {
+      "channel": 6,
+      "input": {
+        "kind": "cc",
+        "cc": 31
+      },
+      "control": "mixer.crossfader",
+      "soft_takeover": false
+    },
+    {
+      "channel": 6,
+      "input": {
+        "kind": "cc",
+        "cc": 12
+      },
+      "control": "mixer.cue_mix",
+      "soft_takeover": false
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "cc",
+        "cc": 4
+      },
+      "control": "deck.0.trim",
+      "soft_takeover": false
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 84
+      },
+      "control": "deck.0.headphone_cue"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "cc",
+        "cc": 4
+      },
+      "control": "deck.1.trim",
+      "soft_takeover": false
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 84
+      },
+      "control": "deck.1.headphone_cue"
+    },
+    {
+      "channel": 6,
+      "input": {
+        "kind": "cc",
+        "cc": 8
+      },
+      "control": "mixer.master_gain",
+      "soft_takeover": false
+    },
+    {
+      "channel": 6,
+      "input": {
+        "kind": "cc",
+        "cc": 13
+      },
+      "control": "mixer.cue_volume",
+      "soft_takeover": false
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 16
+      },
+      "control": "deck.0.loop.in"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 17
+      },
+      "control": "deck.0.loop.out"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 77
+      },
+      "control": "deck.0.loop.toggle"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 81
+      },
+      "control": "deck.0.loop.half"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 83
+      },
+      "control": "deck.0.loop.double"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 62
+      },
+      "control": "deck.0.jump.back"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 61
+      },
+      "control": "deck.0.jump.forward"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 72
+      },
+      "control": "deck.0.start"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 104
+      },
+      "control": "deck.0.quantize"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 0
+      },
+      "control": "deck.0.hotcue.0"
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 0
+      },
+      "control": "deck.0.clear_hotcue.0"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 1
+      },
+      "control": "deck.0.hotcue.1"
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 1
+      },
+      "control": "deck.0.clear_hotcue.1"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 2
+      },
+      "control": "deck.0.hotcue.2"
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 2
+      },
+      "control": "deck.0.clear_hotcue.2"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 3
+      },
+      "control": "deck.0.hotcue.3"
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 3
+      },
+      "control": "deck.0.clear_hotcue.3"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 4
+      },
+      "control": "deck.0.hotcue.4"
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 4
+      },
+      "control": "deck.0.clear_hotcue.4"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 5
+      },
+      "control": "deck.0.hotcue.5"
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 5
+      },
+      "control": "deck.0.clear_hotcue.5"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 6
+      },
+      "control": "deck.0.hotcue.6"
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 6
+      },
+      "control": "deck.0.clear_hotcue.6"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 7
+      },
+      "control": "deck.0.hotcue.7"
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 7
+      },
+      "control": "deck.0.clear_hotcue.7"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 16
+      },
+      "control": "deck.1.loop.in"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 17
+      },
+      "control": "deck.1.loop.out"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 77
+      },
+      "control": "deck.1.loop.toggle"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 81
+      },
+      "control": "deck.1.loop.half"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 83
+      },
+      "control": "deck.1.loop.double"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 62
+      },
+      "control": "deck.1.jump.back"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 61
+      },
+      "control": "deck.1.jump.forward"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 72
+      },
+      "control": "deck.1.start"
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 104
+      },
+      "control": "deck.1.quantize"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 0
+      },
+      "control": "deck.1.hotcue.0"
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 0
+      },
+      "control": "deck.1.clear_hotcue.0"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 1
+      },
+      "control": "deck.1.hotcue.1"
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 1
+      },
+      "control": "deck.1.clear_hotcue.1"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 2
+      },
+      "control": "deck.1.hotcue.2"
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 2
+      },
+      "control": "deck.1.clear_hotcue.2"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 3
+      },
+      "control": "deck.1.hotcue.3"
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 3
+      },
+      "control": "deck.1.clear_hotcue.3"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 4
+      },
+      "control": "deck.1.hotcue.4"
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 4
+      },
+      "control": "deck.1.clear_hotcue.4"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 5
+      },
+      "control": "deck.1.hotcue.5"
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 5
+      },
+      "control": "deck.1.clear_hotcue.5"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 6
+      },
+      "control": "deck.1.hotcue.6"
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 6
+      },
+      "control": "deck.1.clear_hotcue.6"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 7
+      },
+      "control": "deck.1.hotcue.7"
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 7
+      },
+      "control": "deck.1.clear_hotcue.7"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 96
+      },
+      "control": "deck.0.beatloop.0"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 32
+      },
+      "control": "deck.0.beatjump.0"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 97
+      },
+      "control": "deck.0.beatloop.1"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 33
+      },
+      "control": "deck.0.beatjump.1"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 98
+      },
+      "control": "deck.0.beatloop.2"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 34
+      },
+      "control": "deck.0.beatjump.2"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 99
+      },
+      "control": "deck.0.beatloop.3"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 35
+      },
+      "control": "deck.0.beatjump.3"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 100
+      },
+      "control": "deck.0.beatloop.4"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 36
+      },
+      "control": "deck.0.beatjump.4"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 101
+      },
+      "control": "deck.0.beatloop.5"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 37
+      },
+      "control": "deck.0.beatjump.5"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 102
+      },
+      "control": "deck.0.beatloop.6"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 38
+      },
+      "control": "deck.0.beatjump.6"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 103
+      },
+      "control": "deck.0.beatloop.7"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 39
+      },
+      "control": "deck.0.beatjump.7"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 96
+      },
+      "control": "deck.1.beatloop.0"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 32
+      },
+      "control": "deck.1.beatjump.0"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 97
+      },
+      "control": "deck.1.beatloop.1"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 33
+      },
+      "control": "deck.1.beatjump.1"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 98
+      },
+      "control": "deck.1.beatloop.2"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 34
+      },
+      "control": "deck.1.beatjump.2"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 99
+      },
+      "control": "deck.1.beatloop.3"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 35
+      },
+      "control": "deck.1.beatjump.3"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 100
+      },
+      "control": "deck.1.beatloop.4"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 36
+      },
+      "control": "deck.1.beatjump.4"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 101
+      },
+      "control": "deck.1.beatloop.5"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 37
+      },
+      "control": "deck.1.beatjump.5"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 102
+      },
+      "control": "deck.1.beatloop.6"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 38
+      },
+      "control": "deck.1.beatjump.6"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 103
+      },
+      "control": "deck.1.beatloop.7"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 39
+      },
+      "control": "deck.1.beatjump.7"
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 92
+      },
+      "control": "deck.0.sync_leader",
+      "soft_takeover": false
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 80
+      },
+      "control": "deck.0.loop.reloop_stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 112
+      },
+      "control": "deck.0.key_shift.0",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 112
+      },
+      "control": "deck.0.key_shift_step.0",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 48
+      },
+      "control": "sampler.0.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 48
+      },
+      "control": "sampler.0.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 113
+      },
+      "control": "deck.0.key_shift.1",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 113
+      },
+      "control": "deck.0.key_shift_step.1",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 49
+      },
+      "control": "sampler.1.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 49
+      },
+      "control": "sampler.1.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 114
+      },
+      "control": "deck.0.key_shift.2",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 114
+      },
+      "control": "deck.0.key_shift_step.2",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 50
+      },
+      "control": "sampler.2.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 50
+      },
+      "control": "sampler.2.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 115
+      },
+      "control": "deck.0.key_shift.3",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 115
+      },
+      "control": "deck.0.key_shift_step.3",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 51
+      },
+      "control": "sampler.3.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 51
+      },
+      "control": "sampler.3.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 116
+      },
+      "control": "deck.0.key_shift.4",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 116
+      },
+      "control": "deck.0.key_shift_step.4",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 52
+      },
+      "control": "sampler.4.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 52
+      },
+      "control": "sampler.4.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 117
+      },
+      "control": "deck.0.key_shift.5",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 117
+      },
+      "control": "deck.0.key_shift_step.5",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 53
+      },
+      "control": "sampler.5.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 53
+      },
+      "control": "sampler.5.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 118
+      },
+      "control": "deck.0.key_shift.6",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 118
+      },
+      "control": "deck.0.key_shift_step.6",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 54
+      },
+      "control": "sampler.6.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 54
+      },
+      "control": "sampler.6.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 119
+      },
+      "control": "deck.0.key_shift.7",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 119
+      },
+      "control": "deck.0.key_shift_step.7",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 55
+      },
+      "control": "sampler.7.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 55
+      },
+      "control": "sampler.7.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 92
+      },
+      "control": "deck.1.sync_leader",
+      "soft_takeover": false
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 80
+      },
+      "control": "deck.1.loop.reloop_stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 112
+      },
+      "control": "deck.1.key_shift.0",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 112
+      },
+      "control": "deck.1.key_shift_step.0",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 48
+      },
+      "control": "sampler.0.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 48
+      },
+      "control": "sampler.0.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 113
+      },
+      "control": "deck.1.key_shift.1",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 113
+      },
+      "control": "deck.1.key_shift_step.1",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 49
+      },
+      "control": "sampler.1.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 49
+      },
+      "control": "sampler.1.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 114
+      },
+      "control": "deck.1.key_shift.2",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 114
+      },
+      "control": "deck.1.key_shift_step.2",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 50
+      },
+      "control": "sampler.2.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 50
+      },
+      "control": "sampler.2.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 115
+      },
+      "control": "deck.1.key_shift.3",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 115
+      },
+      "control": "deck.1.key_shift_step.3",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 51
+      },
+      "control": "sampler.3.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 51
+      },
+      "control": "sampler.3.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 116
+      },
+      "control": "deck.1.key_shift.4",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 116
+      },
+      "control": "deck.1.key_shift_step.4",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 52
+      },
+      "control": "sampler.4.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 52
+      },
+      "control": "sampler.4.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 117
+      },
+      "control": "deck.1.key_shift.5",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 117
+      },
+      "control": "deck.1.key_shift_step.5",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 53
+      },
+      "control": "sampler.5.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 53
+      },
+      "control": "sampler.5.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 118
+      },
+      "control": "deck.1.key_shift.6",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 118
+      },
+      "control": "deck.1.key_shift_step.6",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 54
+      },
+      "control": "sampler.6.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 54
+      },
+      "control": "sampler.6.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 119
+      },
+      "control": "deck.1.key_shift.7",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 119
+      },
+      "control": "deck.1.key_shift_step.7",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 55
+      },
+      "control": "sampler.7.trigger",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 55
+      },
+      "control": "sampler.7.stop",
+      "soft_takeover": false
+    },
+    {
+      "channel": 4,
+      "input": {
+        "kind": "note",
+        "note": 99
+      },
+      "control": "fx.next",
+      "soft_takeover": false
+    },
+    {
+      "channel": 4,
+      "input": {
+        "kind": "note",
+        "note": 100
+      },
+      "control": "fx.prev",
+      "soft_takeover": false
+    },
+    {
+      "channel": 4,
+      "input": {
+        "kind": "note",
+        "note": 74
+      },
+      "control": "fx.beat_down",
+      "soft_takeover": false
+    },
+    {
+      "channel": 4,
+      "input": {
+        "kind": "note",
+        "note": 75
+      },
+      "control": "fx.beat_up",
+      "soft_takeover": false
+    },
+    {
+      "channel": 4,
+      "input": {
+        "kind": "note",
+        "note": 16
+      },
+      "control": "fx.channel.0",
+      "soft_takeover": false
+    },
+    {
+      "channel": 5,
+      "input": {
+        "kind": "note",
+        "note": 17
+      },
+      "control": "fx.channel.1",
+      "soft_takeover": false
+    },
+    {
+      "channel": 4,
+      "input": {
+        "kind": "cc",
+        "cc": 2
+      },
+      "control": "fx.level",
+      "soft_takeover": false
+    },
+    {
+      "channel": 4,
+      "input": {
+        "kind": "note",
+        "note": 71
+      },
+      "control": "fx.toggle.0",
+      "soft_takeover": false
+    },
+    {
+      "channel": 5,
+      "input": {
+        "kind": "note",
+        "note": 71
+      },
+      "control": "fx.toggle.1",
+      "soft_takeover": false
+    },
+    {
+      "channel": 4,
+      "input": {
+        "kind": "note",
+        "note": 67
+      },
+      "control": "fx.off_all",
+      "soft_takeover": false
+    },
+    {
+      "channel": 5,
+      "input": {
+        "kind": "note",
+        "note": 67
+      },
+      "control": "fx.off_all",
+      "soft_takeover": false
+    },
+    {
+      "channel": 0,
+      "input": {
+        "kind": "note",
+        "note": 14
+      },
+      "control": "deck.0.censor",
+      "soft_takeover": false
+    },
+    {
+      "channel": 1,
+      "input": {
+        "kind": "note",
+        "note": 14
+      },
+      "control": "deck.1.censor",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 38
+      },
+      "control": "deck.0.beatjump.scale_down",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 39
+      },
+      "control": "deck.0.beatjump.scale_up",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 38
+      },
+      "control": "deck.1.beatjump.scale_down",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 39
+      },
+      "control": "deck.1.beatjump.scale_up",
+      "soft_takeover": false
+    }
   ]
 }

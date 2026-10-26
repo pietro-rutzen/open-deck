@@ -14,10 +14,22 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod controller_session;
 mod controllers;
 mod db;
 mod export;
+mod flx4_jog;
+mod flx4_runtime;
+mod folder_drop;
+mod folder_order;
+mod headphone;
 mod hid;
+use headphone::CueState;
+mod library_analysis;
+#[cfg(target_os = "macos")]
+mod macos_drag;
+mod native_controls;
+mod track_visuals;
 
 use compas_audio::{
     compute_peaks, AudioCommand, AudioEngine, DeckBuffer, DeckTelemetry, EngineConfig, FilterMode,
@@ -56,6 +68,10 @@ enum EngineMsg {
         deck: usize,
         pressed: bool,
     },
+    SetCensor {
+        deck: usize,
+        active: bool,
+    },
     ScaleLoop {
         deck: usize,
         factor: f64,
@@ -84,6 +100,10 @@ enum EngineMsg {
         value: f32,
     },
     SetMasterGain(f32),
+    DeckTrim {
+        deck: usize,
+        gain: f32,
+    },
     DeckGain {
         deck: usize,
         gain: f32,
@@ -93,6 +113,11 @@ enum EngineMsg {
         low: f32,
         mid: f32,
         high: f32,
+    },
+    DeckEqBand {
+        deck: usize,
+        band: usize,
+        db: f32,
     },
     DeckFilter {
         deck: usize,
@@ -267,6 +292,7 @@ enum EngineMsg {
 
 /// Tauri-managed handle: a channel to the audio thread plus shared telemetry and output health.
 struct EngineHandle {
+    jog_output: flx4_runtime::JogOutput,
     tx: Sender<EngineMsg>,
     telemetry: Arc<DeckTelemetry>,
     audio: Arc<AudioRuntimeStatus>,
@@ -285,6 +311,7 @@ struct AudioRuntimeStatus {
     restarting: AtomicBool,
     restarts: AtomicU64,
     sample_rate: AtomicU32,
+    master_device: Mutex<Option<String>>,
     last_error: Mutex<Option<String>>,
 }
 
@@ -295,6 +322,7 @@ impl AudioRuntimeStatus {
             restarting: AtomicBool::new(false),
             restarts: AtomicU64::new(0),
             sample_rate: AtomicU32::new(0),
+            master_device: Mutex::new(None),
             last_error: Mutex::new(None),
         }
     }
@@ -332,6 +360,10 @@ impl AudioRuntimeStatus {
 
 /// Spawn the dedicated audio thread that owns the [`AudioEngine`].
 fn spawn_engine() -> EngineHandle {
+    let jog_output: flx4_runtime::JogOutput = Arc::new(std::array::from_fn(|_| {
+        AtomicU64::new(flx4_runtime::INACTIVE)
+    }));
+    let jog_for_thread = jog_output.clone();
     let (tx, rx) = channel::<EngineMsg>();
     let telemetry = Arc::new(DeckTelemetry::new());
     let audio = Arc::new(AudioRuntimeStatus::new());
@@ -354,6 +386,9 @@ fn spawn_engine() -> EngineHandle {
                         }
                         let sr = engine.sample_rate();
                         tracing::info!("audio engine started @ {sr} Hz");
+                        if let Ok(mut name) = audio_for_thread.master_device.lock() {
+                            *name = Some(engine.device_name().to_string());
+                        }
                         audio_for_thread.mark_online(sr);
                         if let Some(tx) = initial_report.take() {
                             let _ = tx.send(sr);
@@ -375,6 +410,7 @@ fn spawn_engine() -> EngineHandle {
             };
 
             let mut engine = start_engine(false);
+            let mut jog_applied = [flx4_runtime::INACTIVE; 2];
             let mut next_retry = Instant::now() + Duration::from_secs(2);
 
             loop {
@@ -392,10 +428,23 @@ fn spawn_engine() -> EngineHandle {
 
                 if engine.is_none() && Instant::now() >= next_retry {
                     engine = start_engine(true);
+                    jog_applied = [flx4_runtime::INACTIVE; 2]; // reapply latest desired state to the new stream
                     next_retry = Instant::now() + Duration::from_secs(2);
                 }
 
-                let msg = match rx.recv_timeout(Duration::from_millis(250)) {
+                if let Some(active) = engine.as_mut() {
+                    active.drain_reclaimed();
+                    for deck in 0..2 {
+                        let bits = jog_for_thread[deck].load(Ordering::Acquire);
+                        if bits != jog_applied[deck] {
+                            if active.send(flx4_runtime::command(deck, bits)).is_ok() {
+                                jog_applied[deck] = bits;
+                            } // full ring: retain latest desired value and retry next turn
+                        }
+                    }
+                }
+
+                let msg = match rx.recv_timeout(Duration::from_millis(5)) {
                     Ok(msg) => msg,
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -429,6 +478,9 @@ fn spawn_engine() -> EngineHandle {
                     EngineMsg::CueButton { deck, pressed } => {
                         AudioCommand::CueButton { deck, pressed }
                     }
+                    EngineMsg::SetCensor { deck, active } => {
+                        AudioCommand::SetCensor { deck, active }
+                    }
                     EngineMsg::ScaleLoop { deck, factor } => {
                         AudioCommand::ScaleLoop { deck, factor }
                     }
@@ -449,6 +501,7 @@ fn spawn_engine() -> EngineHandle {
                         AudioCommand::SetDeckFxMacro { deck, value }
                     }
                     EngineMsg::SetMasterGain(g) => AudioCommand::SetMasterGain(g),
+                    EngineMsg::DeckTrim { deck, gain } => AudioCommand::SetDeckTrim { deck, gain },
                     EngineMsg::DeckGain { deck, gain } => AudioCommand::SetDeckGain { deck, gain },
                     EngineMsg::DeckEq {
                         deck,
@@ -461,6 +514,9 @@ fn spawn_engine() -> EngineHandle {
                         mid_db: mid,
                         high_db: high,
                     },
+                    EngineMsg::DeckEqBand { deck, band, db } => {
+                        AudioCommand::SetDeckEqBand { deck, band, db }
+                    }
                     EngineMsg::DeckFilter {
                         deck,
                         mode,
@@ -654,6 +710,7 @@ fn spawn_engine() -> EngineHandle {
     let _ = sr_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(0);
 
     EngineHandle {
+        jog_output,
         tx,
         telemetry,
         audio,
@@ -694,6 +751,7 @@ struct DeckLoadedEvent {
 #[derive(Serialize, Clone)]
 struct DeckPositionEvent {
     deck: usize,
+    tempo_only: bool,
     frame: f64,
     playing: bool,
     /// Output peak (linear 0..~1) for the deck's VU meter.
@@ -923,7 +981,14 @@ fn export_diagnostics(
 /// Decode + analyze a file on a worker thread, then install it on `deck` and emit
 /// `deck:loaded` (or `deck:error`). Returns immediately.
 #[tauri::command]
-fn load_track(app: AppHandle, state: State<'_, EngineHandle>, deck: usize, path: String) {
+fn load_track(
+    jog: State<'_, flx4_runtime::JogRuntime>,
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    deck: usize,
+    path: String,
+) {
+    jog.reset();
     let tx = state.tx.clone();
     // Tell the UI immediately so it can show a loading state during decode + analysis.
     let _ = app.emit(
@@ -1054,7 +1119,7 @@ const AUDIO_EXTS: &[&str] = &[
     "mp3", "flac", "wav", "m4a", "aac", "ogg", "oga", "aiff", "aif",
 ];
 
-fn is_audio_file(p: &std::path::Path) -> bool {
+pub(crate) fn is_audio_file(p: &std::path::Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .map(|e| AUDIO_EXTS.contains(&e.to_ascii_lowercase().as_str()))
@@ -1101,15 +1166,24 @@ fn list_watch_folders(db: State<'_, db::Db>) -> Result<Vec<String>, String> {
     with_db(&db, db::list_watch_folders)
 }
 
-/// Re-scan every registered watched folder for new audio files; returns the total imported.
-/// Shared by the launch rescan, the manual `rescan_watch_folders` command, and the live watcher.
-fn rescan_all_watch_folders(db: &State<'_, db::Db>) -> usize {
+struct FolderScan {
+    added: usize,
+    removed: usize,
+}
+
+/// Re-scan every registered watched folder for new audio files and drop library rows whose
+/// files were deleted. Returns how many were imported and how many stale rows were removed.
+fn rescan_all_watch_folders(db: &State<'_, db::Db>) -> FolderScan {
     let folders = with_db(db, db::list_watch_folders).unwrap_or_default();
-    let mut total = 0;
-    for f in folders {
-        total += scan_folder(db, std::path::Path::new(&f), 0);
+    let mut added = 0;
+    for folder in &folders {
+        added += scan_folder(db, std::path::Path::new(folder), 0);
     }
-    total
+    let removed = with_db(db, |connection| {
+        db::forget_tracks_missing_under(connection, &folders)
+    })
+    .unwrap_or(0);
+    FolderScan { added, removed }
 }
 
 // ----------------------------------------------------------------------------------
@@ -1124,6 +1198,8 @@ fn rescan_all_watch_folders(db: &State<'_, db::Db>) -> usize {
 #[derive(Default)]
 struct Analyzer {
     running: AtomicBool,
+    requested: AtomicBool,
+    priority: Mutex<Option<String>>,
 }
 
 /// Start the background analyzer if it isn't already running. Drains every un-analyzed track
@@ -1131,7 +1207,8 @@ struct Analyzer {
 /// the list fills in live. A decode failure writes a 0 BPM sentinel so the row is never retried.
 fn kick_analysis(app: &AppHandle) {
     let analyzer = app.state::<Analyzer>();
-    // Claim the single-flight slot; bail if a run already owns it.
+    // Set before claiming: a kick racing with an empty-query/worker-exit cannot be lost.
+    analyzer.requested.store(true, Ordering::SeqCst);
     if analyzer
         .running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1142,44 +1219,89 @@ fn kick_analysis(app: &AppHandle) {
     let app = app.clone();
     thread::spawn(move || {
         loop {
+            app.state::<Analyzer>()
+                .requested
+                .store(false, Ordering::SeqCst);
             let paths = {
                 let db = app.state::<db::Db>();
-                with_db(&db, db::list_unanalyzed).unwrap_or_default()
+                with_db(&db, db::list_unanalyzed)
+            };
+            let mut paths = match paths {
+                Ok(paths) => paths,
+                Err(error) => {
+                    tracing::warn!("Library analysis queue read failed: {error}");
+                    break;
+                }
             };
             if paths.is_empty() {
                 break;
             }
-            for path in paths {
-                let (bpm, conf, first, interval, camelot, name) =
-                    match compas_sources::decode_full(&path) {
-                        Ok((buffer, _meta)) => {
-                            let (grid, key) = analyze_track(&buffer);
-                            (
-                                grid.bpm as f64,
-                                grid.confidence as f64,
-                                grid.first_beat_sec as f64,
-                                grid.beat_interval_sec as f64,
-                                key.camelot,
-                                key.name,
-                            )
-                        }
-                        // Couldn't decode (missing/corrupt/unsupported): write a 0 sentinel so the
-                        // row leaves the NULL work list and isn't retried forever.
-                        Err(_) => (0.0, 0.0, 0.0, 0.0, String::new(), String::new()),
-                    };
-                {
-                    let db = app.state::<db::Db>();
-                    let _ = with_db(&db, |c| {
-                        db::upsert_analysis(c, &path, bpm, conf, first, interval, &camelot, &name)
-                    });
-                }
-                let _ = app.emit("library:changed", ());
+            // Consume one track then re-query, so selection jumps ahead of the remaining batch.
+            let priority = app
+                .state::<Analyzer>()
+                .priority
+                .lock()
+                .ok()
+                .and_then(|mut p| p.take());
+            let index = priority
+                .as_ref()
+                .and_then(|p| paths.iter().position(|v| v == p))
+                .unwrap_or(0);
+            let path = paths.swap_remove(index);
+            let (bpm, conf, first, interval, camelot, name) =
+                match library_analysis::analyze_file(std::path::Path::new(&path)) {
+                    Ok((grid, key)) => (
+                        grid.bpm as f64,
+                        grid.confidence as f64,
+                        grid.first_beat_sec as f64,
+                        grid.beat_interval_sec as f64,
+                        key.camelot,
+                        key.name,
+                    ),
+                    // Preserve existing failed-decode sentinel; never retry corrupt files forever.
+                    Err(error) => {
+                        tracing::warn!("Library analysis failed: {error}");
+                        (0.0, 0.0, 0.0, 0.0, String::new(), String::new())
+                    }
+                };
+            let result = {
+                let db = app.state::<db::Db>();
+                with_db(&db, |c| {
+                    db::upsert_analysis(c, &path, bpm, conf, first, interval, &camelot, &name)
+                })
+            };
+            if let Err(error) = result {
+                // Do not spin on an unwritable database; a later import/selection can retry.
+                tracing::warn!("Library analysis cache write failed: {error}");
+                break;
             }
+            let _ = app.emit("library:changed", ());
         }
-        app.state::<Analyzer>()
-            .running
-            .store(false, Ordering::SeqCst);
+        let analyzer = app.state::<Analyzer>();
+        analyzer.running.store(false, Ordering::SeqCst);
+        if analyzer.requested.swap(false, Ordering::SeqCst) {
+            kick_analysis(&app);
+        }
     });
+}
+
+/// Prioritize the selected library track after the current bounded analysis completes.
+/// A single pending path is retained; repeated selection never builds an unbounded queue.
+#[tauri::command]
+fn prioritize_analysis(app: AppHandle, path: String) -> Result<(), String> {
+    if path.len() > 4096 || !std::path::Path::new(&path).is_absolute() {
+        return Err("Track path must be an absolute library path".into());
+    }
+    let db = app.state::<db::Db>();
+    if !with_db(&db, |c| db::track_exists(c, &path))? {
+        return Err("Import this track before requesting analysis".into());
+    }
+    *app.state::<Analyzer>()
+        .priority
+        .lock()
+        .map_err(|e| e.to_string())? = Some(path);
+    kick_analysis(&app);
+    Ok(())
 }
 
 /// Register a folder, start live-watching it, and import its audio files now; returns the count
@@ -1229,12 +1351,14 @@ fn remove_watch_folder(
 /// Re-scan every watched folder for files added since; returns the total newly imported.
 #[tauri::command]
 fn rescan_watch_folders(app: AppHandle, db: State<'_, db::Db>) -> Result<usize, String> {
-    let total = rescan_all_watch_folders(&db);
-    if total > 0 {
+    let scan = rescan_all_watch_folders(&db);
+    if scan.added > 0 || scan.removed > 0 {
         let _ = app.emit("library:changed", ());
+    }
+    if scan.added > 0 {
         kick_analysis(&app);
     }
-    Ok(total)
+    Ok(scan.added)
 }
 
 /// Build the live filesystem watcher over the currently-registered folders and spawn the
@@ -1295,12 +1419,14 @@ fn spawn_folder_watch(
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
-        let total = {
+        let scan = {
             let db = handle.state::<db::Db>();
             rescan_all_watch_folders(&db)
         };
-        if total > 0 {
+        if scan.added > 0 || scan.removed > 0 {
             let _ = handle.emit("library:changed", ());
+        }
+        if scan.added > 0 {
             kick_analysis(&handle);
         }
     });
@@ -1350,6 +1476,167 @@ fn db_remove_track(db: State<'_, db::Db>, path: String) -> Result<(), String> {
     with_db(&db, |c| db::remove_track(c, &path))
 }
 
+#[derive(serde::Serialize, Clone)]
+struct PathMove {
+    from: String,
+    to: String,
+}
+
+/// Move audio files dropped from Finder into a folder the library is already watching.
+#[tauri::command]
+fn move_into_open_folder(
+    app: AppHandle,
+    db: State<'_, db::Db>,
+    folder: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(&folder)
+        .map_err(|_| "Open a folder before dropping files into it".to_string())?;
+    if !canonical.is_dir() {
+        return Err("Open a folder before dropping files into it".to_string());
+    }
+    let watched = with_db(&db, db::list_watch_folders)?;
+    let inside_library = watched.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .map(|root| canonical.starts_with(root))
+            .unwrap_or(false)
+    });
+    if !inside_library {
+        return Err("Open a library folder before dropping files into it".to_string());
+    }
+    let planned = folder_drop::plan_audio_moves(&canonical, &paths)?;
+    let mut described = Vec::new();
+    for item in &planned {
+        let from = item
+            .from
+            .to_str()
+            .ok_or_else(|| format!("{} is not a valid path", item.from.display()))?
+            .to_string();
+        let known = with_db(&db, |connection| db::track_exists(connection, &from))?;
+        let (title, artist, duration_ms) = if known {
+            (String::new(), String::new(), 0)
+        } else {
+            match probe_track(from.clone()) {
+                Ok(probed) => (probed.title, probed.artist, probed.duration_ms as i64),
+                Err(_) => (dropped_file_title(&from), String::new(), 0),
+            }
+        };
+        described.push(DescribedDrop {
+            from,
+            to: item
+                .to
+                .to_str()
+                .ok_or_else(|| format!("{} is not a valid path", item.to.display()))?
+                .to_string(),
+            title,
+            artist,
+            duration_ms,
+            source: item.from.clone(),
+            target: item.to.clone(),
+        });
+    }
+    let mut relocated = Vec::new();
+    let mut failures = Vec::new();
+    let mut imported = false;
+    for item in described {
+        if let Err(error) = folder_drop::commit_move(&item.source, &item.target) {
+            failures.push(error);
+            continue;
+        }
+        let recorded = with_db(&db, |connection| {
+            if db::track_exists(connection, &item.from)? {
+                db::relocate_tracks(connection, &[(item.from.clone(), item.to.clone())])?;
+                Ok(true)
+            } else {
+                db::add_track(
+                    connection,
+                    &item.to,
+                    &item.title,
+                    &item.artist,
+                    item.duration_ms,
+                )?;
+                Ok(false)
+            }
+        });
+        match recorded {
+            Ok(true) => relocated.push(PathMove {
+                from: item.from,
+                to: item.to,
+            }),
+            Ok(false) => imported = true,
+            Err(error) => match folder_drop::commit_move(&item.target, &item.source) {
+                Ok(()) => failures.push(format!(
+                    "Could not keep {} in the library: {error}",
+                    item.from
+                )),
+                Err(undo) => failures.push(format!(
+                    "Moved {} but the library could not follow it ({error}), and moving it back failed: {undo}",
+                    item.target.display()
+                )),
+            },
+        }
+    }
+    if !relocated.is_empty() {
+        let _ = app.emit("library:paths-moved", &relocated);
+    }
+    if !relocated.is_empty() || imported {
+        let _ = app.emit("library:changed", ());
+        kick_analysis(&app);
+    }
+    if !failures.is_empty() {
+        return Err(failures.join("\n"));
+    }
+    Ok(())
+}
+
+struct DescribedDrop {
+    from: String,
+    to: String,
+    title: String,
+    artist: String,
+    duration_ms: i64,
+    source: std::path::PathBuf,
+    target: std::path::PathBuf,
+}
+
+fn dropped_file_title(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "Untitled".to_string())
+}
+
+/// Rename the audio files in one folder so Finder's name order matches `paths`.
+#[tauri::command]
+fn reorder_folder_tracks(
+    app: AppHandle,
+    db: State<'_, db::Db>,
+    paths: Vec<String>,
+) -> Result<Vec<PathMove>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let outcome = folder_order::reorder_folder(&conn, &paths)?;
+    drop(conn);
+    if !outcome.moves.is_empty() {
+        let payload: Vec<PathMove> = outcome
+            .moves
+            .iter()
+            .map(|(from, to)| PathMove {
+                from: from.clone(),
+                to: to.clone(),
+            })
+            .collect();
+        let _ = app.emit("library:paths-moved", &payload);
+        let _ = app.emit("library:changed", ());
+        return Ok(payload);
+    }
+    if !outcome.removed.is_empty() {
+        let _ = app.emit("library:changed", ());
+    }
+    Ok(Vec::new())
+}
+
 #[tauri::command]
 fn db_add_tag(db: State<'_, db::Db>, path: String, tag: String) -> Result<(), String> {
     with_db(&db, |c| db::add_tag(c, &path, &tag))
@@ -1368,6 +1655,7 @@ fn db_track_state(db: State<'_, db::Db>, path: String) -> Result<db::TrackState,
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn db_upsert_analysis(
+    app: AppHandle,
     db: State<'_, db::Db>,
     path: String,
     bpm: f64,
@@ -1388,7 +1676,9 @@ fn db_upsert_analysis(
             &key_camelot,
             &key_name,
         )
-    })
+    })?;
+    let _ = app.emit("library:changed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -1431,8 +1721,28 @@ fn db_set_gain(db: State<'_, db::Db>, path: String, gain: f64) -> Result<(), Str
 }
 
 #[tauri::command]
-fn db_record_play(db: State<'_, db::Db>, path: String) -> Result<(), String> {
-    with_db(&db, |c| db::record_play(c, &path))
+fn db_record_play(app: AppHandle, db: State<'_, db::Db>, path: String) -> Result<(), String> {
+    with_db(&db, |c| db::record_play(c, &path))?;
+    let _ = app.emit("library:changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+fn db_reset_play_counts(
+    app: AppHandle,
+    db: State<'_, db::Db>,
+    folder: Option<String>,
+) -> Result<usize, String> {
+    if let Some(folder) = folder.as_deref() {
+        if folder.is_empty() || folder.len() > 4096 || !std::path::Path::new(folder).is_absolute() {
+            return Err(
+                "Played reset needs an absolute folder, or no folder for the whole library".into(),
+            );
+        }
+    }
+    let cleared = with_db(&db, |c| db::reset_play_counts(c, folder.as_deref()))?;
+    let _ = app.emit("library:changed", ());
+    Ok(cleared)
 }
 
 #[tauri::command]
@@ -1599,7 +1909,12 @@ fn deck_seek(state: State<'_, EngineHandle>, deck: usize, frame: f64) -> Result<
 }
 
 #[tauri::command]
-fn deck_unload(state: State<'_, EngineHandle>, deck: usize) -> Result<(), String> {
+fn deck_unload(
+    jog: State<'_, flx4_runtime::JogRuntime>,
+    state: State<'_, EngineHandle>,
+    deck: usize,
+) -> Result<(), String> {
+    jog.reset();
     state.send(EngineMsg::Unload { deck })
 }
 
@@ -1724,24 +2039,59 @@ fn deck_scratch(
 }
 
 #[tauri::command]
+fn set_deck_trim(state: State<'_, EngineHandle>, deck: usize, gain: f32) -> Result<(), String> {
+    if deck >= compas_audio::NUM_DECKS || !gain.is_finite() || !(0.0..=8.0).contains(&gain) {
+        return Err("invalid deck trim".into());
+    }
+    state.send(EngineMsg::DeckTrim { deck, gain })
+}
+
+#[tauri::command]
 fn set_deck_gain(state: State<'_, EngineHandle>, deck: usize, gain: f32) -> Result<(), String> {
+    if deck >= compas_audio::NUM_DECKS || !gain.is_finite() || !(0.0..=8.0).contains(&gain) {
+        return Err("Invalid deck gain".into());
+    }
     state.send(EngineMsg::DeckGain { deck, gain })
 }
 
 #[tauri::command]
 fn set_deck_eq(
     state: State<'_, EngineHandle>,
+    eq: State<'_, native_controls::DeckEqState>,
     deck: usize,
     low: f32,
     mid: f32,
     high: f32,
 ) -> Result<(), String> {
+    if deck >= compas_audio::NUM_DECKS {
+        return Err("invalid deck eq".into());
+    }
+    let low = native_controls::clamp_eq_db(low).ok_or("invalid deck eq")?;
+    let mid = native_controls::clamp_eq_db(mid).ok_or("invalid deck eq")?;
+    let high = native_controls::clamp_eq_db(high).ok_or("invalid deck eq")?;
+    eq.record(deck, low, mid, high);
     state.send(EngineMsg::DeckEq {
         deck,
         low,
         mid,
         high,
     })
+}
+
+#[tauri::command]
+fn set_deck_eq_band(
+    state: State<'_, EngineHandle>,
+    eq: State<'_, native_controls::DeckEqState>,
+    deck: usize,
+    band: usize,
+    db: f32,
+) -> Result<(), String> {
+    if deck >= compas_audio::NUM_DECKS {
+        return Err("invalid deck eq".into());
+    }
+    let db = native_controls::clamp_eq_db(db).ok_or("invalid deck eq")?;
+    eq.with_band(deck, band, db).ok_or("invalid deck eq")?;
+    state.send(EngineMsg::DeckEqBand { deck, band, db })
 }
 
 #[tauri::command]
@@ -2072,11 +2422,6 @@ const CUE_RING_CAPACITY: usize = 1 << 16;
 
 /// Holds the signal that keeps the active cue-output thread alive. Dropping the sender (or
 /// replacing it) tells that thread to drop its `cpal::Stream` and exit. `None` = cue off.
-struct CueState {
-    stop: Mutex<Option<Sender<()>>>,
-    latency: Arc<compas_audio::MonitorLatency>,
-}
-
 /// Same ownership model as [`CueState`], but for the booth/monitor output.
 struct BoothState {
     stop: Mutex<Option<Sender<()>>>,
@@ -2087,94 +2432,6 @@ struct BoothState {
 #[tauri::command]
 fn list_output_devices() -> Vec<String> {
     compas_audio::output_device_names()
-}
-
-/// Stop the active cue-output thread (if any) and tell the mixer to stop pushing.
-fn stop_cue_internal(state: &EngineHandle, cue: &CueState) {
-    let _ = state.send(EngineMsg::StopCueOutput);
-    if let Ok(mut guard) = cue.stop.lock() {
-        guard.take(); // dropping the sender ends the thread's recv() → it drops the stream
-    }
-}
-
-/// Start headphone cue monitoring on `device` (None = default output). The mixer pushes the
-/// PFL/cue blend into a ring; a dedicated thread drains it through a 2nd cpal output stream.
-/// Returns the opened device's name.
-#[tauri::command]
-fn start_cue_output(
-    state: State<'_, EngineHandle>,
-    cue: State<'_, CueState>,
-    device: Option<String>,
-) -> Result<String, String> {
-    stop_cue_internal(&state, &cue); // replace any existing cue output
-
-    let (producer, consumer) = RingBuffer::<f32>::new(CUE_RING_CAPACITY);
-    // Start the mixer pushing before opening the device so the prime buffer fills promptly.
-    state.send(EngineMsg::StartCueOutput { sink: producer })?;
-
-    let (stop_tx, stop_rx) = channel::<()>();
-    let (ready_tx, ready_rx) = channel::<Result<String, String>>();
-    let latency = cue.latency.clone();
-    let spawn = thread::Builder::new()
-        .name("compas-cue".to_string())
-        .spawn(move || {
-            match compas_audio::open_cue_output_with_latency(device.as_deref(), consumer, latency) {
-                Ok(out) => {
-                    let _ = ready_tx.send(Ok(out.device_name.clone()));
-                    let _ = stop_rx.recv(); // park until told to stop (or the sender is dropped)
-                    drop(out); // closes the cue stream
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e.to_string()));
-                }
-            }
-        });
-    if let Err(e) = spawn {
-        let _ = state.send(EngineMsg::StopCueOutput);
-        return Err(format!("could not spawn cue thread: {e}"));
-    }
-
-    match ready_rx.recv() {
-        Ok(Ok(name)) => {
-            if let Ok(mut guard) = cue.stop.lock() {
-                *guard = Some(stop_tx);
-            }
-            tracing::info!("cue output started → {name}");
-            Ok(name)
-        }
-        Ok(Err(e)) => {
-            let _ = state.send(EngineMsg::StopCueOutput);
-            Err(e)
-        }
-        Err(_) => {
-            let _ = state.send(EngineMsg::StopCueOutput);
-            Err("cue output thread exited before reporting".into())
-        }
-    }
-}
-
-#[tauri::command]
-fn stop_cue_output(state: State<'_, EngineHandle>, cue: State<'_, CueState>) -> Result<(), String> {
-    stop_cue_internal(&state, &cue);
-    Ok(())
-}
-
-/// Toggle pre-fader-listen (PFL) for a deck on the headphone cue bus.
-#[tauri::command]
-fn set_deck_cue(state: State<'_, EngineHandle>, deck: usize, active: bool) -> Result<(), String> {
-    state.send(EngineMsg::DeckCue { deck, active })
-}
-
-/// Headphone cue/master blend (0 = cue only, 1 = master only).
-#[tauri::command]
-fn set_cue_mix(state: State<'_, EngineHandle>, value: f32) -> Result<(), String> {
-    state.send(EngineMsg::CueMix(value))
-}
-
-/// Headphone output level.
-#[tauri::command]
-fn set_cue_volume(state: State<'_, EngineHandle>, value: f32) -> Result<(), String> {
-    state.send(EngineMsg::CueVolume(value))
 }
 
 /// Stop the active booth-output thread (if any) and tell the mixer to stop pushing.
@@ -2424,23 +2681,175 @@ fn live_beat_clock(aux: State<'_, AuxState>) -> LiveBeat {
 /// shared flag deciding whether incoming notes drive the synth. With it off, a controller's
 /// pads/keys can be mapped to deck controls (via `midi:note`) without honking the synth.
 struct MidiState {
-    conn: Mutex<Option<MidiInputConnection<()>>>,
+    conn: Mutex<Option<MidiConnection>>,
     synth: Arc<AtomicBool>,
+    // Serialize manual changes and discovery, off all MIDI/audio callbacks.
+    operation: Mutex<()>,
+    session: Mutex<ControllerSession>,
+    preference: Mutex<controller_session::SessionPreference>,
 }
 
-#[derive(Serialize, Clone)]
-struct MidiCcEvent {
-    channel: u8,
-    controller: u8,
-    value: u8,
+// Closed/replaced callbacks cannot leave synth notes or stale jog input behind.
+struct MidiConnection {
+    _connection: MidiInputConnection<()>,
+    enabled: Arc<AtomicBool>,
+}
+impl Drop for MidiConnection {
+    fn drop(&mut self) {
+        self.enabled.store(false, Ordering::Release);
+    }
 }
 
-#[derive(Serialize, Clone)]
-struct MidiNoteEvent {
-    channel: u8,
-    note: u8,
-    velocity: u8,
-    on: bool,
+#[derive(Default, Clone, Serialize)]
+struct ControllerSession {
+    connected: Option<String>,
+    profile: Option<compas_core::ControllerProfile>,
+    auto_paused: bool,
+    error: Option<String>,
+}
+
+#[tauri::command]
+fn controller_session(midi: State<'_, MidiState>) -> Result<ControllerSession, String> {
+    midi.session
+        .lock()
+        .map(|session| session.clone())
+        .map_err(|e| e.to_string())
+}
+
+fn publish_controller_session(app: &AppHandle) {
+    let midi = app.state::<MidiState>();
+    if let Ok(session) = midi.session.lock() {
+        let _ = app.emit("controller:session", session.clone());
+    };
+}
+
+fn persist_controller_session(app: &AppHandle) {
+    let midi = app.state::<MidiState>();
+    let result = (|| {
+        let base = app.path().app_data_dir().map_err(|e| e.to_string())?;
+        let preference = midi.preference.lock().map_err(|e| e.to_string())?;
+        controller_session::save_preference(&base, &preference)
+    })();
+    if let Err(error) = result {
+        if let Ok(mut session) = midi.session.lock() {
+            session.error = Some(format!(
+                "Controller is active; could not remember setup: {error}"
+            ));
+        }
+    }
+}
+
+// Caller holds MidiState.operation. Changes here run only on control/IPC workers.
+fn activate_controller_session(
+    app: &AppHandle,
+    profile: compas_core::ControllerProfile,
+) -> Result<(), String> {
+    let profile = controllers::upgrade_flx4_profile(profile);
+    let midi = app.state::<MidiState>();
+    app.state::<flx4_runtime::JogRuntime>()
+        .set_profile(profile.id == "pioneer-ddj-flx4");
+    app.state::<controllers::ControllerEngine>()
+        .send(controllers::ControllerMsg::Activate(Box::new(
+            profile.clone(),
+        )));
+    {
+        let mut session = midi.session.lock().map_err(|e| e.to_string())?;
+        session.profile = Some(profile.clone());
+        session.error = None;
+    }
+    midi.preference.lock().map_err(|e| e.to_string())?.profile = Some(profile);
+    persist_controller_session(app);
+    Ok(())
+}
+
+fn close_midi_connection(app: &AppHandle, manual: bool) -> Result<(), String> {
+    let midi = app.state::<MidiState>();
+    app.state::<flx4_runtime::JogRuntime>().set_connected(false);
+    midi.conn.lock().map_err(|e| e.to_string())?.take();
+    app.state::<controllers::ControllerEngine>()
+        .send(controllers::ControllerMsg::SetOutputPort(None));
+    let _ = app.state::<EngineHandle>().send(EngineMsg::AllNotesOff);
+    let mut session = midi.session.lock().map_err(|e| e.to_string())?;
+    session.connected = None;
+    session.auto_paused = manual;
+    session.error = None;
+    Ok(())
+}
+
+/// Enumerate on a control worker; never select a random first MIDI device.
+fn spawn_controller_autoconnect(app: AppHandle) {
+    // Restore before setup returns and frontend commands become available. A delayed
+    // discovery thread must never overwrite a user's manual connection/profile choice.
+    {
+        let midi = app.state::<MidiState>();
+        let preference = app
+            .path()
+            .app_data_dir()
+            .ok()
+            .map(|base| controller_session::load_preference(&base))
+            .unwrap_or_default();
+        if let Ok(_operation) = midi.operation.lock() {
+            if let Ok(mut stored) = midi.preference.lock() {
+                *stored = preference.clone();
+            }
+            if let Some(profile) = preference.profile {
+                let _ = activate_controller_session(&app, profile);
+            }
+        };
+    }
+    publish_controller_session(&app);
+    thread::spawn(move || {
+        let midi = app.state::<MidiState>();
+        loop {
+            {
+                let Ok(_operation) = midi.operation.lock() else {
+                    return;
+                };
+                let snapshot = midi.session.lock().map(|s| s.clone()).unwrap_or_default();
+                if let Ok(ports) = midi_list_ports() {
+                    if snapshot
+                        .connected
+                        .as_ref()
+                        .is_some_and(|name| !ports.contains(name))
+                    {
+                        let _ = close_midi_connection(&app, snapshot.auto_paused);
+                        publish_controller_session(&app);
+                    }
+                    let snapshot = midi.session.lock().map(|s| s.clone()).unwrap_or_default();
+                    if snapshot.connected.is_none() && !snapshot.auto_paused {
+                        let profiles = controller_list(app.clone()).unwrap_or_default();
+                        let preference = midi
+                            .preference
+                            .lock()
+                            .map(|p| p.clone())
+                            .unwrap_or_default();
+                        if let Some((profile, name)) =
+                            controller_session::choose_profile(&profiles, &ports, &preference)
+                        {
+                            if snapshot.profile.as_ref().map(|p| &p.id) != Some(&profile.id) {
+                                let _ = activate_controller_session(&app, profile);
+                            }
+                            if let Some(index) = ports.iter().position(|port| port == &name) {
+                                match connect_midi_port(&app, index, Some(&name)) {
+                                    Ok(_) => publish_controller_session(&app),
+                                    Err(error) => {
+                                        if let Ok(mut session) = midi.session.lock() {
+                                            if session.error.as_ref() != Some(&error) {
+                                                session.error = Some(error);
+                                                drop(session);
+                                                publish_controller_session(&app);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(1000));
+        }
+    });
 }
 
 #[tauri::command]
@@ -2545,7 +2954,11 @@ fn midi_list_ports() -> Result<Vec<String>, String> {
     Ok(midi_in
         .ports()
         .iter()
-        .filter_map(|p| midi_in.port_name(p).ok())
+        .map(|p| {
+            midi_in
+                .port_name(p)
+                .unwrap_or_else(|_| "Unnamed MIDI port".into())
+        })
         .collect())
 }
 
@@ -2620,17 +3033,33 @@ fn import_profile_pack(app: AppHandle, src_path: String) -> Result<Vec<String>, 
 /// Activate a controller profile (declarative bindings + optional script) in the controller engine.
 #[tauri::command]
 fn controller_activate(
-    ctrl: State<'_, controllers::ControllerEngine>,
+    app: AppHandle,
     profile: compas_core::ControllerProfile,
 ) -> Result<(), String> {
-    ctrl.send(controllers::ControllerMsg::Activate(Box::new(profile)));
+    let midi = app.state::<MidiState>();
+    let _operation = midi.operation.lock().map_err(|e| e.to_string())?;
+    activate_controller_session(&app, profile)?;
+    publish_controller_session(&app);
     Ok(())
 }
 
-/// Drop the active controller profile.
+/// Drop the active profile and respect manual deactivation for this run.
 #[tauri::command]
-fn controller_deactivate(ctrl: State<'_, controllers::ControllerEngine>) {
-    ctrl.send(controllers::ControllerMsg::Deactivate);
+fn controller_deactivate(app: AppHandle) -> Result<(), String> {
+    let midi = app.state::<MidiState>();
+    let _operation = midi.operation.lock().map_err(|e| e.to_string())?;
+    app.state::<flx4_runtime::JogRuntime>().set_profile(false);
+    app.state::<controllers::ControllerEngine>()
+        .send(controllers::ControllerMsg::Deactivate);
+    {
+        let mut session = midi.session.lock().map_err(|e| e.to_string())?;
+        session.profile = None;
+        session.auto_paused = true;
+    }
+    midi.preference.lock().map_err(|e| e.to_string())?.profile = None;
+    persist_controller_session(&app);
+    publish_controller_session(&app);
+    Ok(())
 }
 
 /// Reflect a control's current engine value back onto the device (LED rings, motor faders). The
@@ -2643,6 +3072,13 @@ fn controller_feedback(
     value: f64,
 ) {
     ctrl.send(controllers::ControllerMsg::Feedback { control, value });
+}
+
+/// While learning, republish every MIDI message as raw input, including addresses the active
+/// profile already consumes, so they can be captured and remapped.
+#[tauri::command]
+fn controller_learn(ctrl: State<'_, controllers::ControllerEngine>, active: bool) {
+    ctrl.send(controllers::ControllerMsg::Learn(active));
 }
 
 /// List connected HID devices (for the controller picker / learn editor).
@@ -2674,102 +3110,117 @@ fn hid_disconnect(hid_state: State<'_, hid::HidState>) -> Result<(), String> {
 
 /// Open a MIDI input port; its messages drive the synth (notes) and emit `midi:cc` (knobs).
 #[tauri::command]
-fn midi_connect(
-    app: AppHandle,
-    engine: State<'_, EngineHandle>,
-    midi: State<'_, MidiState>,
-    ctrl: State<'_, controllers::ControllerEngine>,
+fn midi_connect(app: AppHandle, index: usize) -> Result<String, String> {
+    let midi = app.state::<MidiState>();
+    let _operation = midi.operation.lock().map_err(|e| e.to_string())?;
+    midi.session.lock().map_err(|e| e.to_string())?.auto_paused = false;
+    let result = connect_midi_port(&app, index, None);
+    if let Err(error) = &result {
+        midi.session.lock().map_err(|e| e.to_string())?.error = Some(error.clone());
+    }
+    publish_controller_session(&app);
+    result
+}
+
+fn connect_midi_port(
+    app: &AppHandle,
     index: usize,
+    expected_name: Option<&str>,
 ) -> Result<String, String> {
+    let midi = app.state::<MidiState>();
+    let ctrl = app.state::<controllers::ControllerEngine>();
+    let jog = app.state::<flx4_runtime::JogRuntime>();
+    let engine = app.state::<EngineHandle>();
     let ctrl_tx = ctrl.sender();
+    let jog_input = jog.inner().clone();
     let midi_in = MidiInput::new("compas").map_err(|e| e.to_string())?;
     let ports = midi_in.ports();
-    let port = ports.get(index).ok_or("invalid MIDI port index")?.clone();
+    let port = if let Some(expected) = expected_name {
+        let mut matches = ports
+            .iter()
+            .filter(|port| midi_in.port_name(port).is_ok_and(|name| name == expected));
+        let port = matches
+            .next()
+            .ok_or("Controller disconnected before connection completed")?;
+        if matches.next().is_some() {
+            return Err(
+                "Multiple controllers have the same MIDI port name; select a port manually".into(),
+            );
+        }
+        port.clone()
+    } else {
+        ports.get(index).ok_or("invalid MIDI port index")?.clone()
+    };
     let name = midi_in.port_name(&port).unwrap_or_else(|_| "MIDI".into());
 
     let tx = engine.tx.clone();
-    let app_cc = app.clone();
     let synth = midi.synth.clone();
+    let enabled = Arc::new(AtomicBool::new(false));
+    let input_enabled = enabled.clone();
     let conn = midi_in
         .connect(
             &port,
             "compas-in",
             move |_t, message, _| {
-                if message.len() < 2 {
+                if !input_enabled.load(Ordering::Acquire) || message.len() < 2 {
                     return;
                 }
-                // Forward the raw message to the controller engine (active profile maps it to
-                // controls and emits controller:update).
+                if jog_input.midi(message[0], message[1], *message.get(2).unwrap_or(&0)) {
+                    return;
+                }
+                // The controller engine resolves the active profile and republishes only
+                // unconsumed messages as raw `midi:cc`/`midi:note` events for MIDI learn.
                 let _ = ctrl_tx.send(controllers::ControllerMsg::Midi(
                     message[0],
                     message[1],
                     *message.get(2).unwrap_or(&0),
                 ));
-                // Every note/CC is forwarded to the frontend so the MIDI-mapping layer can
-                // bind any source to a deck control; notes additionally drive the synth when
-                // its routing flag is on (the instrument panel owns that toggle).
-                let channel = message[0] & 0x0F;
-                match message[0] & 0xF0 {
-                    0x90 => {
-                        let (note, vel) = (message[1], *message.get(2).unwrap_or(&0));
-                        let on = vel > 0;
-                        let _ = app_cc.emit(
-                            "midi:note",
-                            MidiNoteEvent {
-                                channel,
-                                note,
-                                velocity: vel,
-                                on,
-                            },
-                        );
-                        if synth.load(Ordering::Relaxed) {
-                            let _ = if on {
-                                tx.send(EngineMsg::NoteOn {
-                                    note,
-                                    velocity: vel,
-                                })
-                            } else {
-                                tx.send(EngineMsg::NoteOff { note })
-                            };
-                        }
-                    }
-                    0x80 => {
-                        let note = message[1];
-                        let _ = app_cc.emit(
-                            "midi:note",
-                            MidiNoteEvent {
-                                channel,
-                                note,
-                                velocity: 0,
-                                on: false,
-                            },
-                        );
-                        if synth.load(Ordering::Relaxed) {
-                            let _ = tx.send(EngineMsg::NoteOff { note });
-                        }
-                    }
-                    0xB0 => {
-                        let _ = app_cc.emit(
-                            "midi:cc",
-                            MidiCcEvent {
-                                channel,
-                                controller: message[1],
-                                value: *message.get(2).unwrap_or(&0),
-                            },
-                        );
-                    }
-                    _ => {}
+                // Notes additionally drive the synth when the instrument panel enables routing.
+                if synth.load(Ordering::Relaxed) {
+                    let note = message[1];
+                    let velocity = *message.get(2).unwrap_or(&0);
+                    let _ = match message[0] & 0xF0 {
+                        0x90 if velocity > 0 => tx.send(EngineMsg::NoteOn { note, velocity }),
+                        0x90 | 0x80 => tx.send(EngineMsg::NoteOff { note }),
+                        _ => Ok(()),
+                    };
                 }
             },
             (),
         )
         .map_err(|e| e.to_string())?;
 
-    *midi.conn.lock().map_err(|e| e.to_string())? = Some(conn);
+    // Opening failed above leaves the current port intact. Once successful, close
+    // the previous callback before releasing its notes and enabling the replacement.
+    close_midi_connection(app, false)?;
+    *midi.conn.lock().map_err(|e| e.to_string())? = Some(MidiConnection {
+        _connection: conn,
+        enabled: enabled.clone(),
+    });
+    jog.set_connected(name.contains("DDJ-FLX4"));
     // Open a matching MIDI output (same device name) for LED/feedback echo.
-    ctrl.send(controllers::ControllerMsg::SetOutputPort(Some(
-        name.clone(),
-    )));
+    let output = midi
+        .session
+        .lock()
+        .ok()
+        .and_then(|session| {
+            session
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.ports.output.clone())
+        })
+        .filter(|hint| !hint.trim().is_empty())
+        .unwrap_or_else(|| name.clone());
+    ctrl.send(controllers::ControllerMsg::SetOutputPort(Some(output)));
+    {
+        let mut session = midi.session.lock().map_err(|e| e.to_string())?;
+        session.connected = Some(name.clone());
+        session.auto_paused = false;
+        session.error = None;
+    }
+    midi.preference.lock().map_err(|e| e.to_string())?.port = Some(name.clone());
+    persist_controller_session(app);
+    enabled.store(true, Ordering::Release);
     tracing::info!("MIDI connected: {name}");
     Ok(name)
 }
@@ -2783,14 +3234,11 @@ fn set_midi_synth(midi: State<'_, MidiState>, enabled: bool) {
 
 /// Close the MIDI input connection (releases all held notes).
 #[tauri::command]
-fn midi_disconnect(
-    state: State<'_, EngineHandle>,
-    midi: State<'_, MidiState>,
-) -> Result<(), String> {
-    if let Ok(mut guard) = midi.conn.lock() {
-        guard.take(); // dropping the connection closes the port
-    }
-    let _ = state.send(EngineMsg::AllNotesOff);
+fn midi_disconnect(app: AppHandle) -> Result<(), String> {
+    let midi = app.state::<MidiState>();
+    let _operation = midi.operation.lock().map_err(|e| e.to_string())?;
+    close_midi_connection(&app, true)?;
+    publish_controller_session(&app);
     Ok(())
 }
 
@@ -2805,6 +3253,7 @@ fn spawn_telemetry(app: AppHandle, telemetry: Arc<DeckTelemetry>) {
                         "deck:position",
                         DeckPositionEvent {
                             deck,
+                            tempo_only: telemetry.tempo_only(deck),
                             frame: telemetry.playhead_frames(deck),
                             playing: telemetry.is_playing(deck),
                             level: telemetry.deck_level(deck),
@@ -2851,11 +3300,12 @@ pub fn run() {
         .manage(MidiState {
             conn: Mutex::new(None),
             synth: Arc::new(AtomicBool::new(false)),
+            operation: Mutex::new(()),
+            session: Mutex::new(ControllerSession::default()),
+            preference: Mutex::new(controller_session::SessionPreference::default()),
         })
-        .manage(CueState {
-            stop: Mutex::new(None),
-            latency: Arc::new(compas_audio::MonitorLatency::default()),
-        })
+        .manage(CueState::new())
+        .manage(native_controls::DeckEqState::default())
         .manage(BoothState {
             stop: Mutex::new(None),
             latency: Arc::new(compas_audio::MonitorLatency::default()),
@@ -2868,9 +3318,17 @@ pub fn run() {
         .manage(FolderWatch::default())
         .manage(Analyzer::default())
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            macos_drag::keep_html_drags_with_the_webview();
             spawn_telemetry(app.handle().clone(), telemetry.clone());
+            let engine = app.state::<EngineHandle>();
+            app.manage(flx4_runtime::JogRuntime::spawn(
+                engine.jog_output.clone(),
+                telemetry.clone(),
+            ));
             // Controller engine: owns the script runtime + active mapping; emits controller:update.
             app.manage(controllers::ControllerEngine::spawn(app.handle().clone()));
+            headphone::initialize(app.handle());
             // Open the library DB in the app-data dir. If it fails, log and carry on —
             // DB-backed commands will then error and the frontend degrades gracefully.
             match app.path().app_data_dir() {
@@ -2883,11 +3341,11 @@ pub fn run() {
                             // closed, off the main thread; the UI refreshes on `library:changed`.
                             let handle = app.handle().clone();
                             thread::spawn(move || {
-                                let total = {
+                                let scan = {
                                     let db = handle.state::<db::Db>();
                                     rescan_all_watch_folders(&db)
                                 };
-                                if total > 0 {
+                                if scan.added > 0 || scan.removed > 0 {
                                     let _ = handle.emit("library:changed", ());
                                 }
                                 // Backfill BPM/key for imported-but-unanalyzed tracks — this
@@ -2903,16 +3361,21 @@ pub fn run() {
                 }
                 Err(e) => tracing::error!("no app-data dir for library DB: {e}"),
             }
+            spawn_controller_autoconnect(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            track_visuals::track_visuals,
             build_info,
             engine_status,
             export_diagnostics,
             probe_track,
             db_list_tracks,
+            prioritize_analysis,
             db_add_track,
             db_remove_track,
+            reorder_folder_tracks,
+            move_into_open_folder,
             db_add_tag,
             db_remove_tag,
             list_watch_folders,
@@ -2928,6 +3391,7 @@ pub fn run() {
             db_set_grid_offset,
             db_set_gain,
             db_record_play,
+            db_reset_play_counts,
             db_history,
             db_search,
             db_create_crate,
@@ -2957,7 +3421,9 @@ pub fn run() {
             set_deck_sync,
             set_deck_xfader_assign,
             set_deck_gain,
+            set_deck_trim,
             set_deck_eq,
+            set_deck_eq_band,
             set_deck_filter,
             set_deck_echo,
             set_deck_reverb,
@@ -2979,11 +3445,14 @@ pub fn run() {
             start_recording,
             stop_recording,
             list_output_devices,
-            start_cue_output,
-            stop_cue_output,
-            set_deck_cue,
-            set_cue_mix,
-            set_cue_volume,
+            headphone::cue_session,
+            headphone::list_output_device_details,
+            headphone::configure_cue_output,
+            headphone::start_cue_output,
+            headphone::stop_cue_output,
+            headphone::set_deck_cue,
+            headphone::set_cue_mix,
+            headphone::set_cue_volume,
             start_booth_output,
             stop_booth_output,
             set_booth_volume,
@@ -3010,6 +3479,7 @@ pub fn run() {
             midi_list_ports,
             midi_connect,
             controller_registry,
+            controller_session,
             controller_list,
             controller_save,
             export_profile_pack,
@@ -3017,6 +3487,7 @@ pub fn run() {
             controller_activate,
             controller_deactivate,
             controller_feedback,
+            controller_learn,
             hid_list,
             hid_connect,
             hid_disconnect,

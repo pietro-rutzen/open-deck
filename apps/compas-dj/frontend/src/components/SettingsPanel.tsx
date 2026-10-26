@@ -61,16 +61,38 @@ export function SettingsPanel({
             </button>
           </div>
           <div className="settings-device-list">
-            <DevicePicker
-              icon="headphones"
-              label="Headphones"
-              value={cue.device}
-              devices={cue.devices}
-              defaultLabel="Default output"
-              disabled={cue.enabled}
-              status={cue.enabled ? `On: ${cue.connectedName ?? "selected output"}` : "Off"}
-              onChange={cue.setDevice}
-            />
+            <div className="settings-device-row">
+              <label className="settings-device-title" htmlFor="cue-output-device"><Icon name="headphones" size={16} /><span>Headphones</span></label>
+              <select id="cue-output-device" value={cue.device ?? ""} disabled={cue.enabled}
+                onChange={(event) => cue.setDevice(event.target.value || null)}>
+                <option value="" disabled>Choose headphone output…</option>
+                {cue.device && !cue.details.some((device) => device.name === cue.device) &&
+                  <option value={cue.device}>{cue.device} (unavailable)</option>}
+                {cue.details.map((device) => <option key={device.name} value={device.name} disabled={device.channels < 2}>
+                  {device.name} · {device.channels} output channels
+                </option>)}
+              </select>
+              <span className="settings-device-status">{cue.enabled ? `On: ${cue.connectedName ?? cue.device}` : "Off"}</span>
+            </div>
+            <div className="settings-device-row">
+              <label className="settings-device-title" htmlFor="cue-output-pair">Headphone channels</label>
+              <select id="cue-output-pair" value={cue.firstChannel} disabled={cue.enabled || !cue.device}
+                onChange={(event) => cue.setChannel(Number(event.target.value))}>
+                {(() => {
+                  const channels = cue.details.find((device) => device.name === cue.device)?.channels ?? 0;
+                  const pairs = Array.from({ length: Math.floor(channels / 2) }, (_, index) => index * 2);
+                  return <>
+                    {!pairs.includes(cue.firstChannel) && <option value={cue.firstChannel}>{cue.firstChannel + 1} / {cue.firstChannel + 2} (unavailable)</option>}
+                    {pairs.map((first) => <option key={first} value={first}>{first + 1} / {first + 2}</option>)}
+                  </>;
+                })()}
+              </select>
+              <button className={`chip ${cue.enabled ? "chip--on" : ""}`} disabled={!cue.device} onClick={cue.toggle}>
+                {cue.enabled ? "Stop headphones" : "Start headphones"}
+              </button>
+            </div>
+            <p className="ctrl-hint">Channel numbers refer to the selected audio device. Master playback stays on the system output. Select a separate headphone pair or a separate device.</p>
+            {cue.error && <p role="alert" className="ctrl-hint">{cue.error}</p>}
             <DevicePicker
               icon="sliders"
               label="Booth"

@@ -9,7 +9,7 @@ type AudioStatus = {
   booth_prime_latency_secs: number;
 };
 
-export function StatusBar({ sampleRate, audioStatus }: { sampleRate: number | null; audioStatus: AudioStatus | null }) {
+export function StatusBar({ sampleRate, audioStatus, beatFxLabel }: { sampleRate: number | null; audioStatus: AudioStatus | null; beatFxLabel?: string }) {
   const ok = sampleRate != null && sampleRate > 0 && (audioStatus?.audio_online ?? true);
   const restarting = audioStatus?.audio_restarting ?? false;
   const label = restarting ? "Audio restarting" : ok ? "Engine OK" : "No audio device";
@@ -27,9 +27,15 @@ export function StatusBar({ sampleRate, audioStatus }: { sampleRate: number | nu
       <span className="st-sep">·</span>
       <span>{ok ? `${(sampleRate / 1000).toFixed(1)} kHz` : "— kHz"}</span>
       <span className="st-sep">·</span>
-      <span className="st-rt">RT-SAFE</span>
+      <span className="st-rt">Local audio</span>
+      {beatFxLabel && (
+        <>
+          <span className="st-sep">·</span>
+          <span title="Beat FX selection driven by the controller">Beat FX {beatFxLabel}</span>
+        </>
+      )}
       <span className="st-right">
-        <span>compas — public beta</span>
+        <span>OpenDeck · Prototype</span>
       </span>
     </footer>
   );

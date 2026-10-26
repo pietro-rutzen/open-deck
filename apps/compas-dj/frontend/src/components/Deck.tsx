@@ -1,12 +1,15 @@
-import { memo, useEffect, useRef, useState, type DragEvent, type ReactElement } from "react";
+import { type CSSProperties, memo, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import type { DeckController, DeckState } from "../hooks/useDeck";
-import { bandColor, formatKey, loadTrack, transposeKey, type KeyNotation } from "../lib/ipc";
+import { formatKey, loadTrack, transposeKey, type KeyNotation } from "../lib/ipc";
 
 // drag-and-drop MIME carrying a track path from the library onto a deck
 const TRACK_DND = "application/x-compas-track";
+import { bandAmplitudes, filledWavePath, WAVE_COLORS, waveformScale } from "../lib/waveformDisplay";
+import { useElementSize } from "../hooks/useElementSize";
 import { Fader } from "./Fader";
 import { Knob } from "./Knob";
 import { Icon } from "./icons";
+import { useTrackVisuals } from "./LibraryVisuals";
 
 /// Beat-synced echo time choices, with compact labels.
 const ECHO_BEATS: { v: number; label: string }[] = [
@@ -42,6 +45,26 @@ const END_WARNING_SECS = 30;
 /// Degrees of platter rotation per second of audio (≈33⅓ RPM). Matches the play-head
 /// `spin` mapping so a scratch gesture converts cleanly to a read-rate: speed = ω / this.
 const DEG_PER_SEC = 200;
+
+interface PlayheadSample {
+  playing: boolean;
+  frame: number;
+  frameAt: number;
+  rate: number;
+  sourceRate: number;
+  frames: number;
+}
+
+function playheadFrame(sample: PlayheadSample): number {
+  if (sample.frameAt <= 0) return sample.frame;
+  const elapsed = Math.min(0.08, (performance.now() - sample.frameAt) / 1000);
+  return sample.frame + elapsed * sample.rate;
+}
+
+function playheadSeconds(sample: PlayheadSample): number {
+  if (sample.sourceRate <= 0) return 0;
+  return playheadFrame(sample) / sample.sourceRate;
+}
 
 function fmt(frame: number, rate: number): string {
   if (rate <= 0) return "0:00";
@@ -80,12 +103,17 @@ export function Deck({
   slots?: { label: string; active: boolean; onSelect: () => void }[];
 }) {
   const { state, actions } = ctrl;
-  const { meta, frame, playing, tempo, dsp, loading } = state;
+  const { meta, frame, playing, tempo, tempoRange, beatJumpScale, dsp, loading } = state;
+  const artwork = useTrackVisuals(meta?.path ?? null).data?.artwork_data_url ?? null;
+  const [artworkFailed, setArtworkFailed] = useState(false);
+  useEffect(() => setArtworkFailed(false), [meta?.path, artwork]);
   const rate = meta?.source_rate ?? 1;
   const frames = meta?.frames ?? 0;
   const noGrid = !meta || (meta.beat_interval_sec ?? 0) <= 0;
 
   // Loop-roll is momentary: held while the pad is pressed, released on pointer up/leave.
+  // Full control layout is the default; workspace scrolling handles smaller windows.
+  const expanded = true;
   const [rollBeats, setRollBeats] = useState<number | null>(null);
   const rollRef = useRef<number | null>(null);
   const startRoll = (b: number) => {
@@ -99,9 +127,7 @@ export function Deck({
     setRollBeats(null);
     actions.loopRoll(0, false);
   };
-  const frac = frames > 0 ? Math.min(1, frame / frames) : 0;
   const effBpm = meta ? meta.bpm * tempo : 0;
-  const spin = (((frame / rate) * 200) % 360 + 360) % 360;
 
   // End-of-track warning: source-time remaining (natural-rate seconds, like the TIME readout).
   // Flashes only while playing so a deck parked near the end doesn't blink forever.
@@ -119,8 +145,10 @@ export function Deck({
   // velocity, and rotates the disc 1:1 with the hand. A rAF loop samples the pointer
   // so a held-but-still finger decays to a clean "held" (speed 0) instead of coasting.
   const platterRef = useRef<HTMLDivElement>(null);
+  const needleRef = useRef<SVGGElement>(null);
+  const arcRef = useRef<SVGCircleElement>(null);
+  const shownAngle = useRef(0);
   const [scratching, setScratching] = useState(false);
-  const [dragAngle, setDragAngle] = useState(0);
   // Library → deck drag-and-drop: highlight while a track hovers, load it on drop.
   const [dropActive, setDropActive] = useState(false);
   const onTrackDragOver = (e: DragEvent) => {
@@ -170,7 +198,6 @@ export function Deck({
       j.lastSent = j.smooth;
     }
     j.angle += dTheta; // disc follows the hand exactly
-    setDragAngle(j.angle);
     j.prevAngle = j.curAngle;
     j.lastTick = now;
     j.rafId = requestAnimationFrame(tick);
@@ -188,7 +215,7 @@ export function Deck({
     j.lastTick = performance.now();
     j.smooth = 0;
     j.lastSent = 0;
-    j.angle = spin; // start from the current visual position to avoid a jump
+    j.angle = shownAngle.current; // start from the current visual position to avoid a jump
     setScratching(true);
     actions.scratch(true, 0);
     j.rafId = requestAnimationFrame(tick);
@@ -213,6 +240,47 @@ export function Deck({
     actions.scratch(false, 0);
   };
 
+  const platterMotion = useRef({
+    playing,
+    frame,
+    frameAt: state.frameAt,
+    rate: state.rate,
+    sourceRate: rate,
+    frames,
+  });
+  platterMotion.current = {
+    playing,
+    frame,
+    frameAt: state.frameAt,
+    rate: state.rate,
+    sourceRate: rate,
+    frames,
+  };
+  useEffect(() => {
+    const circumference = 2 * Math.PI * 44;
+    let raf = 0;
+    const paint = () => {
+      const motion = platterMotion.current;
+      const jogState = jog.current;
+      let degrees = shownAngle.current;
+      if (jogState.active) {
+        degrees = jogState.angle;
+      } else if (motion.sourceRate > 0) {
+        degrees = playheadSeconds(motion) * DEG_PER_SEC;
+      }
+      const wrapped = ((degrees % 360) + 360) % 360;
+      shownAngle.current = wrapped;
+      needleRef.current?.setAttribute("transform", `rotate(${wrapped.toFixed(2)} 50 50)`);
+      if (arcRef.current) {
+        const played = motion.frames > 0 ? Math.min(1, Math.max(0, playheadFrame(motion) / motion.frames)) : 0;
+        arcRef.current.setAttribute("stroke-dashoffset", (circumference * (1 - played)).toFixed(2));
+      }
+      raf = requestAnimationFrame(paint);
+    };
+    raf = requestAnimationFrame(paint);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   // Release scratch and any held loop-roll if the deck unmounts mid-gesture.
   useEffect(() => {
     return () => {
@@ -233,11 +301,12 @@ export function Deck({
 
   return (
     <section
-      className={`deck${mirror ? " deck--mirror" : ""}${compact ? " deck--compact" : ""}`}
+      className={`deck${expanded ? " deck--expanded" : ""}${mirror ? " deck--mirror" : ""}${compact ? " deck--compact" : ""}`}
       style={{
         borderTopColor: color,
-        ...(dropActive ? { outline: `2px dashed ${color}`, outlineOffset: "-4px", background: `${color}10` } : null),
-      }}
+        "--deck-color": color,
+        ...(dropActive ? { outline: `2px dashed ${color}`, outlineOffset: "-4px", background: `color-mix(in srgb, ${color} 8%, transparent)` } : null),
+      } as CSSProperties}
       onDragOver={onTrackDragOver}
       onDragLeave={() => setDropActive(false)}
       onDrop={onTrackDrop}
@@ -250,7 +319,7 @@ export function Deck({
               <button
                 key={s.label}
                 className={`deck-slot ${s.active ? "deck-slot--on" : ""}`}
-                style={s.active ? { color, borderColor: color, background: `${color}22` } : undefined}
+                style={s.active ? { color, borderColor: color, background: `color-mix(in srgb, ${color} 14%, transparent)` } : undefined}
                 onClick={s.onSelect}
                 title={`Control deck ${s.label} in this slot`}
               >
@@ -261,11 +330,15 @@ export function Deck({
         )}
         <button
           className="art"
-          style={{ background: `linear-gradient(135deg, ${color}, var(--violet))` }}
+          style={{ background: `color-mix(in srgb, ${color} 12%, var(--surface-sunken))`, color }}
           onClick={actions.load}
           title={meta ? "Load a different track" : "Load a track"}
         >
-          <Icon name="music" size={20} />
+          {artwork && !artworkFailed ? (
+            <img src={artwork} alt="" draggable={false} onError={() => setArtworkFailed(true)} />
+          ) : (
+            <Icon name="music" size={20} />
+          )}
         </button>
         <div className="deck-titles">
           <div className="deck-title display">{loading ? "Loading…" : meta ? meta.title : "—"}</div>
@@ -293,7 +366,7 @@ export function Deck({
       <div className="readouts">
         <div className="tile">
           <span className="overline">BPM</span>
-          <span className="mono tile-val">{meta && effBpm > 0 ? effBpm.toFixed(1) : "—"}</span>
+          <span className="mono tile-val">{meta && effBpm > 0 ? effBpm.toFixed(2) : "—"}</span>
         </div>
         <div className="tile">
           <span className="overline">KEY</span>
@@ -338,19 +411,26 @@ export function Deck({
             onPointerCancel={endScratch}
             title={dsp ? "Drag to scratch / nudge" : undefined}
           >
-            <div
-              className="platter-ring"
-              style={{
-                // Position ring: elapsed in the deck color, the remaining track kept visible (not
-                // near-invisible) so the whole circle reads as song progress, CDJ-style.
-                background: `conic-gradient(${color} ${frac * 360}deg, rgba(255,255,255,.16) 0)`,
-              }}
-            />
-            <div className="platter-disc" style={{ transform: `rotate(${scratching ? dragAngle : spin}deg)` }}>
-              <div className="platter-marker" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />
-            </div>
+            <svg className="platter-svg" viewBox="0 0 100 100" aria-hidden="true">
+              <circle cx="50" cy="50" r="44" fill="none" stroke="rgba(255,255,255,.16)" strokeWidth="3.4" />
+              <circle
+                ref={arcRef}
+                cx="50"
+                cy="50"
+                r="44"
+                fill="none"
+                stroke={color}
+                strokeWidth="3.4"
+                strokeDasharray={2 * Math.PI * 44}
+                transform="rotate(-90 50 50)"
+              />
+              <g ref={needleRef}>
+                <line x1="50" y1="7.5" x2="50" y2="20" stroke={color} strokeOpacity="0.35" strokeWidth="4.2" strokeLinecap="round" />
+                <line x1="50" y1="8" x2="50" y2="19.5" stroke={color} strokeWidth="2.2" strokeLinecap="round" />
+              </g>
+            </svg>
             <div className="platter-center">
-              <span className="mono platter-bpm">{meta && effBpm > 0 ? effBpm.toFixed(1) : "—"}</span>
+              <span className="mono platter-bpm">{meta && effBpm > 0 ? effBpm.toFixed(2) : "—"}</span>
               <span className="overline" style={{ color: endWarning ? "var(--cue)" : scratching || playing ? color : "var(--text-tertiary)" }}>
                 {scratching ? "SCRATCH" : endWarning ? "ENDING" : playing ? "PLAYING" : "CUED"}
               </span>
@@ -391,6 +471,8 @@ export function Deck({
 
         {/* controls */}
         <div className="controls-col">
+          <div className="pad-bank">
+          <span className="overline">HOT CUES</span>
           <div className="pads">
             {Array.from({ length: 8 }, (_, i) => {
               const set = state.hotCues[i] != null;
@@ -412,12 +494,13 @@ export function Deck({
             })}
           </div>
 
+          </div>
           {dsp ? (
             <>
-              <div className="chip-row">
+              <div className="chip-row loop-controls" aria-label="Loop controls">
                 <button
                   className={`chip chip--round ${loopArmed ? "chip--armed" : ""}`}
-                  onClick={actions.loopIn}
+                  onClick={() => actions.loopIn()}
                   disabled={!meta}
                   title="Set loop-in point (then press OUT to close the loop)"
                 >
@@ -425,7 +508,7 @@ export function Deck({
                 </button>
                 <button
                   className={`chip chip--round ${state.loop.active ? "chip--loopon" : loopArmed ? "chip--armflash" : ""}`}
-                  onClick={actions.loopOut}
+                  onClick={() => actions.loopOut()}
                   disabled={!meta}
                   title={loopArmed ? "Set loop-out & enable the loop" : "Set loop out & enable"}
                 >
@@ -458,7 +541,8 @@ export function Deck({
                   ✕
                 </button>
               </div>
-              <div className="chip-row">
+              <div className="deck-tool-row">
+              <div className="chip-row beat-tools" aria-label="Beat jump and loop roll">
                 <button
                   className={`chip ${state.quantize ? "chip--on" : ""}`}
                   onClick={actions.toggleQuantize}
@@ -467,11 +551,11 @@ export function Deck({
                 >
                   Q
                 </button>
-                <button className="chip" onClick={() => actions.beatJump(-4)} disabled={noGrid} title="Jump back 4 beats">
-                  ◀4
+                <button className="chip" onClick={() => actions.beatJump(-4)} disabled={noGrid} title={`Jump back ${4 * beatJumpScale} beats`}>
+                  ◀{4 * beatJumpScale}
                 </button>
-                <button className="chip" onClick={() => actions.beatJump(4)} disabled={noGrid} title="Jump forward 4 beats">
-                  4▶
+                <button className="chip" onClick={() => actions.beatJump(4)} disabled={noGrid} title={`Jump forward ${4 * beatJumpScale} beats`}>
+                  {4 * beatJumpScale}▶
                 </button>
                 {ROLLS.map((r) => (
                   <button
@@ -488,7 +572,7 @@ export function Deck({
                   </button>
                 ))}
               </div>
-              <div className="chip-row">
+              <div className="chip-row effect-tools" aria-label="Effects">
                 <button
                   className={`chip ${state.echo.active ? "chip--on" : ""}`}
                   onClick={actions.toggleEcho}
@@ -521,6 +605,7 @@ export function Deck({
                 >
                   CRUSH
                 </button>
+              </div>
               </div>
               {state.echo.active && (
                 <div className="fx-detail">
@@ -632,12 +717,12 @@ export function Deck({
               </button>
             </div>
           )}
-          <span className="overline">TEMPO</span>
+          <span className="overline" title={`Tempo range ±${tempoRange}%`}>TEMPO ±{tempoRange}</span>
           <Fader
             value={dsp ? pct : 0}
-            min={-8}
-            max={8}
-            length={compact ? 88 : 130}
+            min={-tempoRange}
+            max={tempoRange}
+            length={compact ? 72 : 112}
             center
             color={color}
             disabled={!dsp || !meta}
@@ -705,8 +790,8 @@ export function Deck({
   );
 }
 
-/// Full-track overview waveform. Rendered once per loaded track (memoized on the peaks
-/// identity) so the frequent play-head/position updates don't re-rasterize the whole
+/// Full-track overview waveform. Redrawn on track/viewport changes (memoized on peaks
+/// identity and observed size) so the frequent play-head/position updates don't re-rasterize the whole
 /// summary every telemetry tick — the moving parts (head, played scrim, markers) are cheap
 /// absolutely-positioned divs layered on top.
 const OverviewWave = memo(function OverviewWave({
@@ -718,16 +803,17 @@ const OverviewWave = memo(function OverviewWave({
   bands: [number, number, number][];
   color: string;
 }) {
-  const W = 600;
-  const H = 100;
+  const [svgRef, size] = useElementSize<SVGSVGElement>(600, 96);
+  const W = size.width;
+  const H = size.height;
   const cy = H / 2;
   const N = peaks.length;
   const useBands = bands.length === N && N > 0;
+  const displayScale = useMemo(() => waveformScale(peaks, bands), [peaks, bands]);
   // Cap at ~one bar per output column so long tracks stay cheap to draw.
   const cols = Math.min(N, W);
   const step = Math.max(1, Math.ceil(N / cols));
-  const bw = Math.max(0.8, W / Math.ceil(N / step));
-  const bars: ReactElement[] = [];
+  const samples: { x: number; amps: number[] }[] = [];
   for (let i = 0; i < N; i += step) {
     let pk = 0;
     let bi = i;
@@ -738,15 +824,20 @@ const OverviewWave = memo(function OverviewWave({
         bi = j;
       }
     }
-    const x = (i / N) * W;
-    const amp = Math.min(1, pk) * cy * 0.94;
-    bars.push(
-      <line key={i} x1={x} x2={x} y1={cy - amp} y2={cy + amp} stroke={useBands ? bandColor(bands[bi]) : color} strokeWidth={bw} />,
-    );
+    samples.push({
+      x: (bi / N) * W,
+      amps: bandAmplitudes(pk, useBands ? bands[bi] : undefined, displayScale).map((amp) => amp * cy * 0.94),
+    });
   }
+  const layers = useBands ? [0, 1, 2] : [0];
   return (
-    <svg className="ov-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
-      {bars}
+    <svg ref={svgRef} className="ov-svg" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+      {layers.map((layer) => (
+        <path key={layer} d={filledWavePath(samples.map((sample) => ({ x: sample.x, amp: sample.amps[layer] ?? 0 })), cy)} fill={useBands ? WAVE_COLORS[layer] : color} shapeRendering="geometricPrecision" />
+      ))}
+      {!useBands && (
+        <path d={filledWavePath(samples.map((sample) => ({ x: sample.x, amp: (sample.amps[0] ?? 0) * 0.42 })), cy)} fill="#ffffff" opacity={0.78} shapeRendering="geometricPrecision" />
+      )}
     </svg>
   );
 });
@@ -761,7 +852,6 @@ function OverviewBar({ state, color, onSeek }: { state: DeckState; color: string
     return <div className="overview overview--empty" />;
   }
 
-  const frac = Math.min(1, Math.max(0, state.frame / frames));
   const seekAt = (clientX: number, el: HTMLElement) => {
     const r = el.getBoundingClientRect();
     onSeek(Math.min(1, Math.max(0, (clientX - r.left) / r.width)));
@@ -795,8 +885,7 @@ function OverviewBar({ state, color, onSeek }: { state: DeckState; color: string
       }}
     >
       <OverviewWave peaks={peaks} bands={meta.band_peaks ?? []} color={color} />
-      {/* dim the portion already played so what's coming reads bright */}
-      <div className="ov-played" style={{ width: `${frac * 100}%` }} />
+      <OverviewPlayhead state={state} color={color} />
       {loop.active && loopRight > loopLeft && (
         <div className="ov-loop" style={{ left: `${loopLeft * 100}%`, width: `${(loopRight - loopLeft) * 100}%`, background: `${color}26`, borderColor: color }} />
       )}
@@ -805,7 +894,47 @@ function OverviewBar({ state, color, onSeek }: { state: DeckState; color: string
           <div key={i} className="ov-cue" style={{ left: `${Math.min(100, (c / frames) * 100)}%`, background: CUE_COLORS[i % CUE_COLORS.length] }} />
         ),
       )}
-      <div className="ov-head" style={{ left: `${frac * 100}%`, background: color, boxShadow: `0 0 6px ${color}` }} />
     </div>
+  );
+}
+
+function OverviewPlayhead({ state, color }: { state: DeckState; color: string }) {
+  const playedRef = useRef<SVGRectElement>(null);
+  const headRef = useRef<SVGLineElement>(null);
+  const sample = useRef<PlayheadSample>({
+    playing: state.playing,
+    frame: state.frame,
+    frameAt: state.frameAt,
+    rate: state.rate,
+    sourceRate: state.meta?.source_rate ?? 1,
+    frames: state.meta?.frames ?? 0,
+  });
+  sample.current = {
+    playing: state.playing,
+    frame: state.frame,
+    frameAt: state.frameAt,
+    rate: state.rate,
+    sourceRate: state.meta?.source_rate ?? 1,
+    frames: state.meta?.frames ?? 0,
+  };
+  useEffect(() => {
+    let raf = 0;
+    const paint = () => {
+      const motion = sample.current;
+      const frac = motion.frames > 0 ? Math.min(1, Math.max(0, playheadFrame(motion) / motion.frames)) : 0;
+      const x = (frac * 1000).toFixed(2);
+      playedRef.current?.setAttribute("width", x);
+      headRef.current?.setAttribute("x1", x);
+      headRef.current?.setAttribute("x2", x);
+      raf = requestAnimationFrame(paint);
+    };
+    raf = requestAnimationFrame(paint);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+  return (
+    <svg className="ov-motion" viewBox="0 0 1000 100" preserveAspectRatio="none" aria-hidden="true">
+      <rect ref={playedRef} x="0" y="0" height="100" fill="rgba(0,0,0,.42)" />
+      <line ref={headRef} y1="0" y2="100" stroke={color} strokeWidth="2" vectorEffect="non-scaling-stroke" />
+    </svg>
   );
 }

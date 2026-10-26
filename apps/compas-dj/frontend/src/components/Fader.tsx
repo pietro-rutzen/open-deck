@@ -25,7 +25,7 @@ export function Fader({
   center?: boolean;
   disabled?: boolean;
 }) {
-  const drag = useRef<{ pos: number; v: number } | null>(null);
+  const drag = useRef<{ pos: number; v: number; length: number } | null>(null);
   const vertical = orientation === "vertical";
   // clamp so a value driven beyond range (e.g. SYNC) doesn't push the handle off-track
   const norm = Math.min(1, Math.max(0, (value - min) / (max - min)));
@@ -34,7 +34,8 @@ export function Fader({
     (e: PointerEvent) => {
       if (disabled) return;
       e.currentTarget.setPointerCapture(e.pointerId);
-      drag.current = { pos: vertical ? e.clientY : e.clientX, v: value };
+      const bounds = e.currentTarget.getBoundingClientRect();
+      drag.current = { pos: vertical ? e.clientY : e.clientX, v: value, length: Math.max(1, vertical ? bounds.height : bounds.width) };
     },
     [disabled, value, vertical],
   );
@@ -45,10 +46,10 @@ export function Fader({
       const cur = vertical ? e.clientY : e.clientX;
       // vertical: up increases; horizontal: right increases
       const delta = vertical ? drag.current.pos - cur : cur - drag.current.pos;
-      const next = Math.min(max, Math.max(min, drag.current.v + (delta / length) * (max - min)));
+      const next = Math.min(max, Math.max(min, drag.current.v + (delta / drag.current.length) * (max - min)));
       onChange(next);
     },
-    [vertical, min, max, length, onChange],
+    [vertical, min, max, onChange],
   );
 
   const end = useCallback(() => {

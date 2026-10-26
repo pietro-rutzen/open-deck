@@ -72,3 +72,10 @@ panic = "abort"
 # Even in dev builds, optimize dependencies so the audio thread can keep up while debugging app code.
 [profile.dev.package."*"]
 opt-level = 2
+
+# Keep offline BPM/key analysis responsive in local prototype builds as well as releases.
+[profile.dev.package.compas-dsp]
+opt-level = 2
+
+[profile.dev.package.compas-sources]
+opt-level = 2

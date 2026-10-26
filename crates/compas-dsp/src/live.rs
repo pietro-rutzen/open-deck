@@ -246,20 +246,37 @@ impl LiveTracker {
         // exactly as the offline `select_tempo` does, so live and offline agree on the octave.
         let mut chosen_period = best_lag as f32;
         let mut chosen_score = f32::MIN;
-        for &mult in &[1.0f32, 2.0, 0.5] {
-            let lag = (best_lag as f32 * mult).round() as usize;
-            if lag < 1 || lag >= n {
+        for &mult in &[1.0f32, 2.0, 0.5, 2.0 / 3.0] {
+            let probe = (best_lag as f32 * mult).round() as usize;
+            if probe < 1 || probe >= n {
                 continue;
             }
+            let lag = strongest_local_lag(env, probe, energy, self.env_rate);
             let support = autocorr(env, lag, energy) / best_r;
-            let mut bpm = 60.0 * self.env_rate / lag as f32;
+            let raw_bpm = 60.0 * self.env_rate / lag as f32;
+            let mut bpm = raw_bpm;
+            if bpm > MAX_BPM && bpm <= MAX_BPM + 2.0 {
+                bpm = MAX_BPM;
+            }
             while bpm < MIN_BPM {
                 bpm *= 2.0;
             }
             while bpm > MAX_BPM {
                 bpm /= 2.0;
             }
-            let score = support * tempo_prior(bpm);
+            let offbeat_ratio = if (mult - 0.5).abs() < 1e-3 {
+                crate::analysis::odd_even_onset_ratio(env, lag as f32)
+            } else {
+                0.0
+            };
+            let weight = if (mult - 2.0 / 3.0).abs() < 1e-3 {
+                crate::analysis::hemiola_weight(raw_bpm, bpm, support)
+            } else if (mult - 0.5).abs() < 1e-3 {
+                crate::analysis::fast_pulse_weight(raw_bpm, bpm, support, offbeat_ratio)
+            } else {
+                1.0
+            };
+            let score = support * tempo_prior(bpm) * weight;
             if score > chosen_score {
                 chosen_score = score;
                 chosen_period = 60.0 * self.env_rate / bpm; // period for the folded bpm
@@ -305,6 +322,38 @@ impl LiveTracker {
             self.locked = false;
         }
     }
+}
+
+/// Strongest local autocorrelation peak within 3% of `probe`'s tempo.
+fn strongest_local_lag(env: &[f32], probe: usize, energy: f32, env_rate: f32) -> usize {
+    let target = 60.0 * env_rate / probe as f32;
+    let radius = ((probe as f32) * 0.03).ceil() as usize;
+    let start = probe.saturating_sub(radius).max(1);
+    let end = (probe + radius).min(env.len().saturating_sub(1));
+    let mut best_lag = probe;
+    let mut best_r = f32::MIN;
+    for lag in start..=end {
+        let bpm = 60.0 * env_rate / lag as f32;
+        if (bpm - target).abs() > target * 0.03 {
+            continue;
+        }
+        let score = autocorr(env, lag, energy);
+        let left = if lag <= 1 {
+            f32::MIN
+        } else {
+            autocorr(env, lag - 1, energy)
+        };
+        let right = if lag + 1 >= env.len() {
+            f32::MIN
+        } else {
+            autocorr(env, lag + 1, energy)
+        };
+        if score >= left && score >= right && score > best_r {
+            best_r = score;
+            best_lag = lag;
+        }
+    }
+    best_lag
 }
 
 /// Normalized autocorrelation of `env` at `lag` (fraction of energy repeating at that lag).

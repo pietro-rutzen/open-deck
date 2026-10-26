@@ -43,6 +43,13 @@ fn beat_phase(playhead: f64, offset: f64, interval: f64) -> f64 {
     p - p.floor()
 }
 
+/// Resources whose final destructor must run on the engine control thread.
+#[derive(Debug)]
+pub(crate) enum RetiredResource {
+    Buffer(Arc<DeckBuffer>),
+    Monitor(Producer<f32>),
+}
+
 /// Per-deck DJ filter mode (the single HPF/LPF "filter knob").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterMode {
@@ -127,7 +134,13 @@ pub enum AudioCommand {
         reverse: bool,
     },
     SetMasterGain(f32),
+    /// Post-trim channel fader; does not attenuate the headphone PFL bus.
     SetDeckGain {
+        deck: usize,
+        gain: f32,
+    },
+    /// Input trim before tone/FX and both output buses.
+    SetDeckTrim {
         deck: usize,
         gain: f32,
     },
@@ -141,6 +154,13 @@ pub enum AudioCommand {
         low_db: f32,
         mid_db: f32,
         high_db: f32,
+    },
+    /// One EQ band. The tone stage keeps the other two, so concurrent writers cannot
+    /// overwrite a band they did not change.
+    SetDeckEqBand {
+        deck: usize,
+        band: usize,
+        db: f32,
     },
     SetDeckFilter {
         deck: usize,
@@ -264,6 +284,12 @@ pub enum AudioCommand {
         deck: usize,
         pressed: bool,
     },
+    /// SHIFT+PLAY censor: while held, play backward. On release, the play-head returns to the
+    /// slip position (where playback would be had the reverse never happened).
+    SetCensor {
+        deck: usize,
+        active: bool,
+    },
     /// Set (and activate) a loop region in source frames.
     SetLoop {
         deck: usize,
@@ -299,6 +325,11 @@ pub enum AudioCommand {
     /// Drive the play-head from a jog-wheel/scratch gesture. While `active`, the deck
     /// reads at `speed` (1.0 = natural play rate; negative = reverse) regardless of the
     /// transport state, and the play-head clamps to the track instead of auto-stopping.
+    SetJogBend {
+        deck: usize,
+        multiplier: f64,
+        active: bool,
+    },
     SetScratch {
         deck: usize,
         active: bool,
@@ -412,7 +443,7 @@ pub struct DeckTelemetry {
     playhead_bits: [AtomicU64; NUM_DECKS],
     playing: [AtomicBool; NUM_DECKS],
     loaded: [AtomicBool; NUM_DECKS],
-    /// Per-deck output peak (pre-crossfader), f32 bits in an AtomicU64-as-u32 slot.
+    /// Per-deck peak after trim/tone/FX, before channel fader and crossfader.
     level_bits: [AtomicU64; NUM_DECKS],
     master_l_bits: AtomicU64,
     master_r_bits: AtomicU64,
@@ -433,6 +464,10 @@ pub struct DeckTelemetry {
     /// scratching backward, 0 when stopped). Lets the UI extrapolate the play-head smoothly between
     /// telemetry updates instead of stepping at the 30 Hz event rate.
     rate_bits: [AtomicU64; NUM_DECKS],
+    tempo_bits: [AtomicU64; NUM_DECKS],
+    tempo_only: [AtomicBool; NUM_DECKS],
+    /// True when the deck is parked on its cue point, or previewing from it.
+    at_cue: [AtomicBool; NUM_DECKS],
     /// Measured output (DAC) latency in seconds, so the UI can offset the visual play-head to match
     /// what's actually being heard.
     output_latency_bits: AtomicU64,
@@ -454,8 +489,21 @@ impl DeckTelemetry {
             cue_ring_drops: AtomicU64::new(0),
             reclaim_ring_full: AtomicU64::new(0),
             rate_bits: std::array::from_fn(|_| AtomicU64::new(0)),
+            tempo_only: std::array::from_fn(|_| AtomicBool::new(false)),
+            tempo_bits: std::array::from_fn(|_| AtomicU64::new(1.0_f64.to_bits())),
+            at_cue: std::array::from_fn(|_| AtomicBool::new(false)),
             output_latency_bits: AtomicU64::new(0),
         }
+    }
+
+    pub fn tempo_only(&self, deck: usize) -> bool {
+        self.tempo_only[deck].load(Ordering::Relaxed)
+    }
+    pub fn tempo_ratio(&self, deck: usize) -> f64 {
+        self.tempo_bits
+            .get(deck)
+            .map(|v| f64::from_bits(v.load(Ordering::Relaxed)))
+            .unwrap_or(1.0)
     }
 
     /// Per-deck effective advance in source frames/sec (signed; 0 when stopped).
@@ -542,6 +590,14 @@ impl DeckTelemetry {
             .map(|a| a.load(Ordering::Relaxed))
             .unwrap_or(false)
     }
+
+    /// Parked on the cue point, or holding a cue preview.
+    pub fn is_at_cue(&self, deck: usize) -> bool {
+        self.at_cue
+            .get(deck)
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
 }
 
 impl Default for DeckTelemetry {
@@ -556,6 +612,7 @@ impl Default for DeckTelemetry {
 struct ToneStage {
     eq_l: ThreeBandEq,
     eq_r: ThreeBandEq,
+    eq_db: [f32; 3],
     filter_l: Biquad,
     filter_r: Biquad,
     filter_active: bool,
@@ -567,6 +624,7 @@ impl ToneStage {
         ToneStage {
             eq_l: ThreeBandEq::new(device_rate),
             eq_r: ThreeBandEq::new(device_rate),
+            eq_db: [0.0; 3],
             filter_l: Biquad::new(BiquadCoeffs::IDENTITY),
             filter_r: Biquad::new(BiquadCoeffs::IDENTITY),
             filter_active: false,
@@ -589,6 +647,20 @@ impl ToneStage {
 
     /// Update the 3-band EQ gains (dB). Command-side; coefficient update only. RT-SAFE.
     fn set_eq(&mut self, low_db: f32, mid_db: f32, high_db: f32) {
+        self.eq_db = [low_db, mid_db, high_db];
+        self.apply_eq();
+    }
+
+    /// Update one EQ band and keep the other two. Command-side; coefficient update only. RT-SAFE.
+    fn set_eq_band(&mut self, band: usize, db: f32) {
+        if let Some(slot) = self.eq_db.get_mut(band) {
+            *slot = db;
+            self.apply_eq();
+        }
+    }
+
+    fn apply_eq(&mut self) {
+        let [low_db, mid_db, high_db] = self.eq_db;
         let sr = self.device_rate;
         self.eq_l.set_gains_db(sr, low_db, mid_db, high_db);
         self.eq_r.set_gains_db(sr, low_db, mid_db, high_db);
@@ -762,6 +834,12 @@ impl FaderStage {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct DeckFrame {
+    pre_fader: (f32, f32),
+    post_fader: (f32, f32),
+}
+
 /// Per-deck audio state living on the audio thread.
 struct DeckPlayer {
     buffer: Option<Arc<DeckBuffer>>,
@@ -776,12 +854,18 @@ struct DeckPlayer {
     /// `tempo`, and audio plays regardless of the transport state.
     scratching: bool,
     scratch_speed: f64,
+    scratch_rate: f64,
+    jog_bend: f64,
+    scratch_gain: f32,
+    scratch_smoothing: f64,
     /// Key-lock (master tempo) stage: per-deck WSOLA time-stretch for the mix buffer and stems.
     keylock: KeylockStage,
     /// Pregain stage: loudness normalization (ReplayGain) applied before the tone/FX stages.
     pregain: PregainStage,
     /// Output-level stage: the channel fader / deck gain, applied after FX.
     fader: FaderStage,
+    /// Independent input trim, before tone/FX and the PFL tap.
+    trim: FaderStage,
     /// Tonal-shaping stage: DJ filter → 3-band EQ, per channel.
     tone: ToneStage,
     /// Crossfader routing (4-deck assign matrix): A side, B side, or straight through.
@@ -821,6 +905,10 @@ struct DeckPlayer {
     cue_mode: CueMode,
     /// True while a CDJ-style preview (play-while-held) is active, so release snaps back.
     cue_previewing: bool,
+    /// SHIFT+PLAY censor. `slip_playhead` keeps the position playback would have reached.
+    censoring: bool,
+    /// Transport state to restore when censor is released.
+    censor_was_playing: bool,
 }
 
 impl DeckPlayer {
@@ -833,9 +921,14 @@ impl DeckPlayer {
             playing: false,
             scratching: false,
             scratch_speed: 0.0,
+            scratch_rate: 0.0,
+            jog_bend: 1.0,
+            scratch_gain: 0.0,
+            scratch_smoothing: 1.0 - (-1.0 / (0.002 * device_rate as f64)).exp(),
             keylock: KeylockStage::new(),
             pregain: PregainStage::new(),
             fader: FaderStage::new(device_rate),
+            trim: FaderStage::new(device_rate),
             tone: ToneStage::new(device_rate),
             xfader_assign: XfaderAssign::Thru,
             cue: false,
@@ -856,6 +949,31 @@ impl DeckPlayer {
             cue_point: 0.0,
             cue_mode: CueMode::Cdj,
             cue_previewing: false,
+            censoring: false,
+            censor_was_playing: false,
+        }
+    }
+
+    /// Engage or release slip-reverse. RT-SAFE.
+    fn set_censor(&mut self, active: bool) {
+        if active {
+            if self.censoring || self.buffer.is_none() {
+                return;
+            }
+            self.roll_active = false;
+            self.scratching = false;
+            self.scratch_speed = 0.0;
+            self.scratch_rate = 0.0;
+            self.jog_bend = 1.0;
+            self.slip_playhead = self.playhead;
+            self.censor_was_playing = self.playing;
+            self.censoring = true;
+            self.playing = true;
+        } else if self.censoring {
+            self.censoring = false;
+            self.playhead = self.slip_playhead;
+            self.playing = self.censor_was_playing;
+            self.keylock.mark_jumped();
         }
     }
 
@@ -926,27 +1044,28 @@ impl DeckPlayer {
 
     /// Pull and process one stereo frame. RT-SAFE.
     #[inline]
-    fn next_frame(&mut self) -> (f32, f32) {
+    fn next_channels(&mut self) -> DeckFrame {
+        self.trim.advance();
         self.fader.advance(); // advance gain smoother even when paused (click-free unpause)
 
         let Some(buf) = self.buffer.as_ref() else {
-            return (0.0, 0.0);
+            return DeckFrame::default();
         };
         let frames = buf.frames();
         if frames == 0 {
-            return (0.0, 0.0);
+            return DeckFrame::default();
         }
 
-        // Scratching overrides the transport: a jog gesture drives the play-head and
-        // produces audio whether or not the deck is "playing".
-        if !self.playing && !self.scratching {
-            return (0.0, 0.0);
+        // Scratching and censor override the transport: both produce audio whether or
+        // not the deck was already playing.
+        if !self.playing && !self.scratching && !self.censoring {
+            return DeckFrame::default();
         }
-        // End-of-track auto-stops normal playback, but never scratching (so you can
-        // scrub back from the end).
-        if !self.scratching && self.playhead >= frames as f64 {
+        // End-of-track auto-stops normal playback, but never scratching or censor
+        // (both need to move back from the end).
+        if !self.scratching && !self.censoring && self.playhead >= frames as f64 {
             self.playing = false;
-            return (0.0, 0.0);
+            return DeckFrame::default();
         }
 
         let max = frames as f64 - 1.0;
@@ -954,19 +1073,52 @@ impl DeckPlayer {
         // Source-read stage, then play-head advance: sample the mix buffer at the current play-head
         // (through the key-lock stretcher when engaged), then move the play-head for the next frame
         // (scratch / sync / tempo, loop-roll slip, beat-loop wrap).
-        let engaged = self.keylock.begin_frame(self.scratching);
-        let (l, r) = self.read_source_frame(engaged);
+        if self.scratching {
+            self.scratch_rate += self.scratch_smoothing * (self.scratch_speed - self.scratch_rate);
+            if self.scratch_rate.abs() < 1e-9 {
+                self.scratch_rate = 0.0;
+            }
+        }
+        let engaged = self.keylock.begin_frame(self.scratching || self.censoring);
+        let (mut l, mut r) = self.read_source_frame(engaged);
+        if self.censoring && self.playhead <= 0.0 {
+            l = 0.0;
+            r = 0.0;
+        }
+        if self.scratching {
+            // A stationary stylus must not emit a repeated sample (DC). Fade through
+            // reversals and track boundaries rather than abruptly chopping the waveform.
+            let outward = (self.playhead <= 0.0 && self.scratch_rate < 0.0)
+                || (self.playhead >= max && self.scratch_rate > 0.0);
+            let target = if outward {
+                0.0
+            } else {
+                (self.scratch_rate.abs() / 0.08).min(1.0) as f32
+            };
+            self.scratch_gain += self.scratch_smoothing as f32 * (target - self.scratch_gain);
+            l *= self.scratch_gain;
+            r *= self.scratch_gain;
+        }
         self.advance_playhead(max);
 
         // Pregain stage: loudness normalization (ReplayGain) before tone/FX, so EQ/filter and the
         // nonlinear bitcrusher see a predictable input level regardless of track loudness.
         let (l, r) = self.pregain.apply(l, r);
+        let (l, r) = self.trim.apply(l, r);
         // Tonal-shaping stage: DJ filter → 3-band EQ, per channel.
         let (l, r) = self.tone.process(l, r);
         // Per-deck FX chain (echo → reverb → flanger → bitcrusher by default), post-EQ.
         let (l, r) = self.fx.process(l, r);
         // Fader stage: the channel fader / deck gain (post-FX).
-        self.fader.apply(l, r)
+        DeckFrame {
+            pre_fader: (l, r),
+            post_fader: self.fader.apply(l, r),
+        }
+    }
+
+    #[cfg(test)]
+    fn next_frame(&mut self) -> (f32, f32) {
+        self.next_channels().post_fader
     }
 
     /// Source-read stage: sample the mix buffer at the current play-head and return one stereo
@@ -999,10 +1151,22 @@ impl DeckPlayer {
     fn advance_playhead(&mut self, max: f64) {
         if self.scratching {
             // Hand-driven read rate (can be negative); clamp to the track bounds.
-            self.playhead = (self.playhead + self.base_ratio * self.scratch_speed).clamp(0.0, max);
+            self.playhead = (self.playhead + self.base_ratio * self.scratch_rate).clamp(0.0, max);
+        } else if self.censoring {
+            let advance = self.base_ratio * self.sync_tempo.unwrap_or(self.tempo) * self.jog_bend;
+            self.playhead = (self.playhead - advance).max(0.0);
+            if self.censor_was_playing {
+                self.slip_playhead += advance;
+                if self.loop_active && self.loop_out > self.loop_in {
+                    let len = self.loop_out - self.loop_in;
+                    while self.slip_playhead >= self.loop_out {
+                        self.slip_playhead -= len;
+                    }
+                }
+            }
         } else {
             // Sync (when engaged) overrides the user tempo with the PLL's read rate.
-            let rate = self.sync_tempo.unwrap_or(self.tempo);
+            let rate = self.sync_tempo.unwrap_or(self.tempo) * self.jog_bend;
             let advance = self.base_ratio * rate;
             self.playhead += advance;
             // Loop-roll slip: the shadow play-head advances unlooped, so a release lands exactly
@@ -1141,13 +1305,20 @@ impl InternalClock {
     }
 }
 
+/// Output buses from one shared sample-clock render.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MixerBuses {
+    pub master: (f32, f32),
+    pub cue: (f32, f32),
+}
+
 pub struct Mixer {
     decks: [DeckPlayer; NUM_DECKS],
     crossfader: Crossfader,
     master: GainSmoother,
     commands: rtrb::Consumer<AudioCommand>,
-    reclaim: Producer<Arc<DeckBuffer>>,
-    pending_reclaim: [Option<Arc<DeckBuffer>>; PENDING_RECLAIM_CAP],
+    reclaim: Producer<RetiredResource>,
+    pending_reclaim: [Option<RetiredResource>; PENDING_RECLAIM_CAP],
     telemetry: Arc<DeckTelemetry>,
     device_rate: f32,
     // Per-block peak accumulators (reset on publish).
@@ -1177,7 +1348,7 @@ impl Mixer {
     pub fn new(
         device_rate: f32,
         commands: rtrb::Consumer<AudioCommand>,
-        reclaim: Producer<Arc<DeckBuffer>>,
+        reclaim: Producer<RetiredResource>,
         telemetry: Arc<DeckTelemetry>,
     ) -> Self {
         Mixer {
@@ -1268,35 +1439,33 @@ impl Mixer {
         }
     }
 
-    /// Park a retired buffer in a preallocated RT-side holding area when the reclaim ring is full.
-    /// RT-SAFE: bounded linear scan, no allocation, no locks.
+    /// One slot is reserved before popping each command. Every resource-bearing
+    /// command retires at most one object, including rejected incoming buffers.
     #[inline]
-    fn park_reclaim(&mut self, buffer: Arc<DeckBuffer>) {
-        self.telemetry.inc_reclaim_ring_full();
-        let mut pending = Some(buffer);
-        for slot in self.pending_reclaim.iter_mut() {
-            if slot.is_none() {
-                *slot = pending.take();
-                return;
-            }
-        }
-        // Pathological case: the control side has stopped draining and the bounded parking area is
-        // full. Leaking is preferable to dropping a large DeckBuffer on the callback path.
-        if let Some(buffer) = pending {
-            std::mem::forget(buffer);
+    fn retire_resource(&mut self, resource: RetiredResource) {
+        self.flush_pending_reclaim();
+        if let Err(PushError::Full(resource)) = self.reclaim.push(resource) {
+            self.telemetry.inc_reclaim_ring_full();
+            let slot = self
+                .pending_reclaim
+                .iter_mut()
+                .find(|slot| slot.is_none())
+                .expect("command drain reserves one retirement slot before popping");
+            *slot = Some(resource);
         }
     }
 
-    /// Retire a deck/sample buffer to the control thread for dropping. If the reclaim ring is full,
-    /// keep the buffer alive in the bounded parking area and retry on the next command drain.
     #[inline]
     fn retire(&mut self, buffer: Option<Arc<DeckBuffer>>) {
-        if let Some(b) = buffer {
-            self.flush_pending_reclaim();
-            match self.reclaim.push(b) {
-                Ok(()) => {}
-                Err(PushError::Full(b)) => self.park_reclaim(b),
-            }
+        if let Some(buffer) = buffer {
+            self.retire_resource(RetiredResource::Buffer(buffer));
+        }
+    }
+
+    #[inline]
+    fn retire_monitor(&mut self, sink: Option<Producer<f32>>) {
+        if let Some(sink) = sink {
+            self.retire_resource(RetiredResource::Monitor(sink));
         }
     }
 
@@ -1439,7 +1608,18 @@ impl Mixer {
     /// Apply all pending control commands. RT-SAFE (bounded by ring capacity).
     #[inline]
     pub fn drain_commands(&mut self) {
-        while let Ok(cmd) = self.commands.pop() {
+        self.flush_pending_reclaim();
+        // Do not remove another owning command when all retirement slots are occupied.
+        // The control side drains reclamation periodically; queued commands then resume.
+        // Bound work to the queue contents observed at entry even if the producer refills it.
+        let command_budget = self.commands.slots();
+        for _ in 0..command_budget {
+            if self.pending_reclaim.iter().all(Option::is_some) {
+                break;
+            }
+            let Ok(cmd) = self.commands.pop() else {
+                break;
+            };
             match cmd {
                 AudioCommand::SetCrossfader(p) => self.crossfader.set_position(p),
                 AudioCommand::SetCrossfaderConfig {
@@ -1457,6 +1637,13 @@ impl Mixer {
                         d.fader.set_gain_target(gain);
                     }
                 }
+                AudioCommand::SetDeckTrim { deck, gain } => {
+                    if let Some(d) = self.decks.get_mut(deck) {
+                        if gain.is_finite() {
+                            d.trim.set_gain_target(gain.clamp(0.0, 8.0));
+                        }
+                    }
+                }
                 AudioCommand::SetDeckReplayGain { deck, gain } => {
                     if let Some(d) = self.decks.get_mut(deck) {
                         d.pregain.set(gain.clamp(0.1, 8.0));
@@ -1469,7 +1656,20 @@ impl Mixer {
                     high_db,
                 } => {
                     if let Some(d) = self.decks.get_mut(deck) {
-                        d.tone.set_eq(low_db, mid_db, high_db);
+                        if low_db.is_finite() && mid_db.is_finite() && high_db.is_finite() {
+                            d.tone.set_eq(
+                                low_db.clamp(-26.0, 26.0),
+                                mid_db.clamp(-26.0, 26.0),
+                                high_db.clamp(-26.0, 26.0),
+                            );
+                        }
+                    }
+                }
+                AudioCommand::SetDeckEqBand { deck, band, db } => {
+                    if let Some(d) = self.decks.get_mut(deck) {
+                        if db.is_finite() && band < 3 {
+                            d.tone.set_eq_band(band, db.clamp(-26.0, 26.0));
+                        }
                     }
                 }
                 AudioCommand::SetDeckFilter {
@@ -1593,13 +1793,25 @@ impl Mixer {
                 }
                 AudioCommand::SetCueMix(m) => self.routing.cue.mix = m.clamp(0.0, 1.0),
                 AudioCommand::SetCueVolume(v) => self.routing.cue.volume.set_target(v.max(0.0)),
-                AudioCommand::StartCueOutput { sink } => self.routing.cue.sink = Some(sink),
-                AudioCommand::StopCueOutput => self.routing.cue.sink = None,
+                AudioCommand::StartCueOutput { sink } => {
+                    let old = self.routing.cue.sink.replace(sink);
+                    self.retire_monitor(old);
+                }
+                AudioCommand::StopCueOutput => {
+                    let old = self.routing.cue.sink.take();
+                    self.retire_monitor(old);
+                }
                 AudioCommand::SetBoothVolume(v) => {
                     self.routing.booth.volume.set_target(v.max(0.0));
                 }
-                AudioCommand::StartBoothOutput { sink } => self.routing.booth.sink = Some(sink),
-                AudioCommand::StopBoothOutput => self.routing.booth.sink = None,
+                AudioCommand::StartBoothOutput { sink } => {
+                    let old = self.routing.booth.sink.replace(sink);
+                    self.retire_monitor(old);
+                }
+                AudioCommand::StopBoothOutput => {
+                    let old = self.routing.booth.sink.take();
+                    self.retire_monitor(old);
+                }
                 AudioCommand::StartAuxInput { source } => {
                     self.aux.source = Some(source);
                     self.aux.primed = false;
@@ -1628,6 +1840,11 @@ impl Mixer {
                         d.cue_button(pressed);
                     }
                 }
+                AudioCommand::SetCensor { deck, active } => {
+                    if let Some(d) = self.decks.get_mut(deck) {
+                        d.set_censor(active);
+                    }
+                }
                 AudioCommand::LoadDeck {
                     deck,
                     buffer,
@@ -1641,12 +1858,18 @@ impl Mixer {
                         d.playing = false;
                         d.scratching = false;
                         d.scratch_speed = 0.0;
+                        d.scratch_rate = 0.0;
+                        d.jog_bend = 1.0;
+                        d.scratch_gain = 0.0;
                         d.keylock.set_active(false);
                         d.keylock.set_pitch_semitones(0.0);
                         d.fx.reset();
                         d.loop_active = false;
                         d.cue_point = 0.0;
                         d.cue_previewing = false;
+                        d.censoring = false;
+                        d.censor_was_playing = false;
+                        d.slip_playhead = 0.0;
                         d.pregain.set(1.0);
                         d.beat_offset = beat_offset;
                         d.beat_interval = beat_interval;
@@ -1654,6 +1877,8 @@ impl Mixer {
                         d.sync_tempo = None;
                         let old = d.buffer.replace(buffer);
                         self.retire(old);
+                    } else {
+                        self.retire(Some(buffer));
                     }
                 }
                 AudioCommand::SetBeatgrid {
@@ -1786,24 +2011,55 @@ impl Mixer {
                         }
                     }
                 }
+                AudioCommand::SetJogBend {
+                    deck,
+                    multiplier,
+                    active,
+                } => {
+                    if let Some(d) = self.decks.get_mut(deck) {
+                        d.scratching = false;
+                        d.jog_bend = if active && multiplier.is_finite() {
+                            multiplier.clamp(0.92, 1.08)
+                        } else {
+                            1.0
+                        };
+                        if active && d.playing {
+                            d.sync_mode = SyncMode::TempoOnly;
+                        }
+                    }
+                }
                 AudioCommand::SetScratch {
                     deck,
                     active,
                     speed,
                 } => {
                     if let Some(d) = self.decks.get_mut(deck) {
+                        d.jog_bend = 1.0;
+                        if active && !d.scratching {
+                            d.scratch_rate = if d.playing {
+                                d.sync_tempo.unwrap_or(d.tempo)
+                            } else {
+                                0.0
+                            };
+                            d.scratch_gain = if d.playing { 1.0 } else { 0.0 };
+                        }
                         d.scratching = active;
-                        d.scratch_speed = speed.clamp(-16.0, 16.0);
+                        d.scratch_speed = if speed.is_finite() {
+                            speed.clamp(-16.0, 16.0)
+                        } else {
+                            0.0
+                        };
                     }
                 }
                 AudioCommand::StartRecording { sink } => {
-                    self.routing.record_sink = Some(sink);
+                    let old = self.routing.record_sink.replace(sink);
+                    self.retire_monitor(old);
                 }
                 AudioCommand::StopRecording => {
-                    // Dropping the producer makes the writer thread see `is_abandoned`
-                    // and finalize the WAV. Drop happens here on the audio thread, but the
-                    // consumer is still alive so it only decrements a refcount (RT-safe).
-                    self.routing.record_sink = None;
+                    // Control-side destruction notifies the recorder without risking
+                    // final ring deallocation on the audio callback.
+                    let old = self.routing.record_sink.take();
+                    self.retire_monitor(old);
                 }
                 AudioCommand::NoteOn { note, velocity } => self.synth.note_on(note, velocity),
                 AudioCommand::NoteOff { note } => self.synth.note_off(note),
@@ -1813,8 +2069,11 @@ impl Mixer {
                 }
                 AudioCommand::SetSynthGain { gain } => self.synth.set_gain(gain),
                 AudioCommand::LoadSample { slot, buffer } => {
-                    if let Some(old) = self.sampler.set_slot(slot, Some(buffer)) {
-                        self.retire(Some(old));
+                    if slot < crate::sampler::NUM_PADS {
+                        let old = self.sampler.set_slot(slot, Some(buffer));
+                        self.retire(old);
+                    } else {
+                        self.retire(Some(buffer));
                     }
                 }
                 AudioCommand::ClearSample { slot } => {
@@ -1835,11 +2094,17 @@ impl Mixer {
                         d.playing = false;
                         d.scratching = false;
                         d.scratch_speed = 0.0;
+                        d.scratch_rate = 0.0;
+                        d.jog_bend = 1.0;
+                        d.scratch_gain = 0.0;
                         d.keylock.set_active(false);
                         d.keylock.set_pitch_semitones(0.0);
                         d.fx.reset();
                         d.playhead = 0.0;
                         d.loop_active = false;
+                        d.censoring = false;
+                        d.censor_was_playing = false;
+                        d.slip_playhead = 0.0;
                         d.sync_master = None;
                         d.sync_tempo = None;
                         d.beat_interval = 0.0;
@@ -1852,26 +2117,28 @@ impl Mixer {
         self.flush_pending_reclaim();
     }
 
-    /// Mix one stereo frame. RT-SAFE. Deck 0 → crossfader A, deck 1 → B; decks 2/3
-    /// sum through at unity (4-deck fader matrix is a P4 concern).
+    /// Render master and headphone buses on one sample clock. RT-SAFE.
+    /// Each deck advances exactly once; crossfader assignment applies to master only.
     #[inline]
-    pub fn next_frame(&mut self) -> (f32, f32) {
+    pub fn next_buses(&mut self) -> MixerBuses {
         self.update_sync();
         let (ga, gb) = self.crossfader.next_gains();
         let mut l = 0.0;
         let mut r = 0.0;
-        // Headphone cue (PFL) bus: cued decks summed pre-crossfader, pre-master.
+        // Headphone PFL: post-trim/tone/FX, before channel fader/crossfader/master.
         let mut cl = 0.0;
         let mut cr = 0.0;
         for (i, deck) in self.decks.iter_mut().enumerate() {
-            let (dl, dr) = deck.next_frame();
-            let deck_peak = dl.abs().max(dr.abs());
+            let rendered = deck.next_channels();
+            let (dl, dr) = rendered.post_fader;
+            let (pl, pr) = rendered.pre_fader;
+            let deck_peak = pl.abs().max(pr.abs());
             if deck_peak > self.peak_deck[i] {
                 self.peak_deck[i] = deck_peak;
             }
             if deck.cue {
-                cl += dl;
-                cr += dr;
+                cl += pl;
+                cr += pr;
             }
             let xf = match deck.xfader_assign {
                 XfaderAssign::A => ga,
@@ -1937,10 +2204,10 @@ impl Mixer {
         // level, and push for the 2nd output stream. Advance the smoother every frame
         // (click-free) whether or not the sink is connected. RT-safe.
         let cvol = self.routing.cue.volume.next_gain();
+        let mix = self.routing.cue.mix;
+        let hl = (cl * (1.0 - mix) + ol * mix) * cvol;
+        let hr = (cr * (1.0 - mix) + or * mix) * cvol;
         if let Some(sink) = self.routing.cue.sink.as_mut() {
-            let mix = self.routing.cue.mix;
-            let hl = (cl * (1.0 - mix) + ol * mix) * cvol;
-            let hr = (cr * (1.0 - mix) + or * mix) * cvol;
             if sink.slots() >= 2 {
                 let _ = sink.push(hl);
                 let _ = sink.push(hr);
@@ -1950,7 +2217,16 @@ impl Mixer {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        (ol, or)
+        MixerBuses {
+            master: (ol, or),
+            cue: (hl, hr),
+        }
+    }
+
+    /// Compatibility master render; advances all buses exactly once.
+    #[inline]
+    pub fn next_frame(&mut self) -> (f32, f32) {
+        self.next_buses().master
     }
 
     /// Publish per-deck position/state to shared telemetry. Call once per audio block.
@@ -1960,19 +2236,37 @@ impl Mixer {
         for (i, d) in self.decks.iter().enumerate() {
             self.telemetry.playhead_bits[i].store(d.playhead.to_bits(), Ordering::Relaxed);
             self.telemetry.playing[i].store(d.playing, Ordering::Relaxed);
+            self.telemetry.tempo_only[i].store(
+                matches!(d.sync_mode, SyncMode::TempoOnly),
+                Ordering::Relaxed,
+            );
+            self.telemetry.tempo_bits[i]
+                .store(d.sync_tempo.unwrap_or(d.tempo).to_bits(), Ordering::Relaxed);
             self.telemetry.loaded[i].store(d.buffer.is_some(), Ordering::Relaxed);
             self.telemetry.level_bits[i]
                 .store((self.peak_deck[i] as f64).to_bits(), Ordering::Relaxed);
             // Effective advance in source frames/sec for UI play-head extrapolation.
             // base_ratio * device_rate == source_rate, so this is source_rate * effective_rate.
             let rate_fps = if d.scratching {
-                d.base_ratio * d.scratch_speed * self.device_rate as f64
+                d.base_ratio * d.scratch_rate * self.device_rate as f64
+            } else if d.censoring {
+                -(d.base_ratio
+                    * d.sync_tempo.unwrap_or(d.tempo)
+                    * d.jog_bend
+                    * self.device_rate as f64)
             } else if d.playing {
-                d.base_ratio * d.sync_tempo.unwrap_or(d.tempo) * self.device_rate as f64
+                d.base_ratio
+                    * d.sync_tempo.unwrap_or(d.tempo)
+                    * d.jog_bend
+                    * self.device_rate as f64
             } else {
                 0.0
             };
             self.telemetry.rate_bits[i].store(rate_fps.to_bits(), Ordering::Relaxed);
+            let at_cue = d.buffer.is_some()
+                && (d.cue_previewing
+                    || (!d.playing && !d.censoring && (d.playhead - d.cue_point).abs() < 1.0));
+            self.telemetry.at_cue[i].store(at_cue, Ordering::Relaxed);
         }
         self.telemetry
             .master_l_bits
@@ -1991,6 +2285,89 @@ impl Mixer {
 mod tests {
     use super::*;
 
+    #[test]
+    fn crossfader_changes_master_but_never_headphone_preview() {
+        let (mut tx, mut m) = mixer_with_commands();
+        for i in 0..2 {
+            m.decks[i].buffer = Some(Arc::new(DeckBuffer::new(
+                vec![0.2 + i as f32 * 0.2; 2 * 48000],
+                48000,
+            )));
+            m.decks[i].playing = true;
+            m.decks[i].cue = true;
+        }
+        tx.push(AudioCommand::SetCrossfader(0.0)).unwrap();
+        m.drain_commands();
+        let mut left = m.next_buses();
+        for _ in 0..8000 {
+            left = m.next_buses();
+        }
+        tx.push(AudioCommand::SetCrossfader(1.0)).unwrap();
+        m.drain_commands();
+        let mut right = m.next_buses();
+        for _ in 0..8000 {
+            right = m.next_buses();
+        }
+        assert!(
+            right.master.0 > left.master.0 * 1.8,
+            "crossfader must switch between different source levels"
+        );
+        assert!(
+            (right.cue.0 - left.cue.0).abs() < 0.001,
+            "PFL must ignore the crossfader"
+        );
+    }
+
+    #[test]
+    fn rim_bend_preserves_keylock_and_manual_phase_then_restores_normal_rate() {
+        let (mut tx, mut m) = mixer_with_commands();
+        arm_sync_decks(&mut m);
+        m.decks[1].sync_master = Some(0);
+        m.decks[1].keylock.set_active(true);
+        tx.push(AudioCommand::SetJogBend {
+            deck: 1,
+            multiplier: 1.08,
+            active: true,
+        })
+        .unwrap();
+        m.drain_commands();
+        assert!(!m.decks[1].scratching);
+        assert!(m.decks[1].keylock.active);
+        assert!(matches!(m.decks[1].sync_mode, SyncMode::TempoOnly));
+        for _ in 0..4800 {
+            m.next_buses();
+        }
+        let phase = m.decks[1].playhead - m.decks[0].playhead;
+        assert!(
+            phase > 300.0,
+            "rim should move phase without seeking: {phase}"
+        );
+        tx.push(AudioCommand::SetJogBend {
+            deck: 1,
+            multiplier: 1.0,
+            active: false,
+        })
+        .unwrap();
+        m.drain_commands();
+        for _ in 0..4800 {
+            m.next_buses();
+        }
+        assert!(((m.decks[1].playhead - m.decks[0].playhead) - phase).abs() < 1.0);
+        m.decks[1].playing = false;
+        let stopped = m.decks[1].playhead;
+        tx.push(AudioCommand::SetJogBend {
+            deck: 1,
+            multiplier: 0.92,
+            active: true,
+        })
+        .unwrap();
+        m.drain_commands();
+        for _ in 0..100 {
+            m.next_buses();
+        }
+        assert_eq!(stopped, m.decks[1].playhead);
+        assert!(!m.decks[1].scratching);
+    }
     #[test]
     fn hermite_passes_through_control_points() {
         // At t=0 the result is p1; at t=1 it is p2.
@@ -2158,6 +2535,7 @@ mod tests {
         d.playhead = 1.0;
         d.scratching = true;
         d.scratch_speed = -10.0; // pulled backward past the start
+        d.scratch_rate = -10.0;
         d.advance_playhead(99.0);
         assert_eq!(d.playhead, 0.0, "reverse scratch clamps at the start");
     }
@@ -2196,7 +2574,7 @@ mod tests {
 
     fn mixer_with_commands() -> (Producer<AudioCommand>, Mixer) {
         let (ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(16);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         (
             ctx,
             Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new())),
@@ -2213,6 +2591,54 @@ mod tests {
             d.beat_offset = 0.0;
             d.beat_interval = 24_000.0; // 120 BPM @ 48 kHz
         }
+    }
+
+    #[test]
+    fn scratch_stationary_and_outward_boundary_settle_to_silence() {
+        for (position, speed) in [(40.0, 0.0), (0.0, -1.0), (99.0, 1.0)] {
+            let mut d = ramp_deck();
+            d.buffer = Some(Arc::new(DeckBuffer::new(vec![0.5; 200], 48_000)));
+            d.playhead = position;
+            d.scratching = true;
+            d.scratch_speed = speed;
+            d.scratch_rate = speed;
+            d.scratch_gain = 1.0;
+            let mut out = (0.0, 0.0);
+            for _ in 0..4096 {
+                out = d.next_frame();
+            }
+            assert!(
+                out.0.abs() < 1e-5 && out.1.abs() < 1e-5,
+                "{position}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scratch_velocity_smoothing_tracks_sample_rate_and_reverses_continuously() {
+        let mut rates = Vec::new();
+        for sr in [48_000, 96_000] {
+            let mut d = DeckPlayer::new(sr as f32);
+            d.buffer = Some(Arc::new(DeckBuffer::new(vec![0.0; sr * 2], sr as u32)));
+            d.playhead = (sr / 2) as f64;
+            d.scratching = true;
+            d.scratch_speed = 1.0;
+            for _ in 0..sr / 500 {
+                d.next_frame();
+            }
+            rates.push(d.scratch_rate);
+            assert!((d.scratch_rate - (1.0 - (-1.0f64).exp())).abs() < 1e-6);
+            d.scratch_speed = -1.0;
+            let before = d.scratch_rate;
+            d.next_frame();
+            assert!(d.scratch_rate < before && d.scratch_rate > 0.0);
+            for _ in 0..sr / 50 {
+                d.next_frame();
+            }
+            assert!((d.scratch_rate + 1.0).abs() < 0.001);
+            assert!(d.playhead.is_finite() && d.playhead >= 0.0);
+        }
+        assert!((rates[0] - rates[1]).abs() < 1e-6);
     }
 
     #[test]
@@ -2252,7 +2678,7 @@ mod tests {
     #[test]
     fn sync_locks_follower_phase_to_master() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
         let buf = Arc::new(DeckBuffer::new(vec![0.0; 2 * 480_000], 48_000));
         let interval = 24_000.0; // 0.5 s/beat = 120 BPM @ 48 kHz
@@ -2279,7 +2705,7 @@ mod tests {
     #[test]
     fn pick_leader_prefers_explicit_then_lowest_index() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
         let buf = Arc::new(DeckBuffer::new(vec![0.0; 2 * 1000], 48_000));
         for i in [1usize, 2] {
@@ -2302,7 +2728,7 @@ mod tests {
     #[test]
     fn tempo_only_sync_rate_matches_without_pulling_phase() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
         let buf = Arc::new(DeckBuffer::new(vec![0.0; 2 * 480_000], 48_000));
         let interval = 24_000.0;
@@ -2617,7 +3043,7 @@ mod tests {
     #[test]
     fn loop_roll_slips_and_catches_up_on_release() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
         let buf = Arc::new(DeckBuffer::new(vec![0.2; 2 * 10_000], 48_000));
         let d = &mut mixer.decks[0];
@@ -2651,10 +3077,115 @@ mod tests {
         assert!((mixer.decks[0].playhead - slip).abs() < 1e-9);
     }
 
+    fn pfl_fixture() -> (Producer<AudioCommand>, Mixer) {
+        let (tx, mut mixer) = mixer_with_commands();
+        let d = &mut mixer.decks[0];
+        d.buffer = Some(Arc::new(DeckBuffer::new(vec![0.25; 2 * 48_000], 48_000)));
+        d.playing = true;
+        d.cue = true;
+        d.xfader_assign = XfaderAssign::Thru;
+        mixer.routing.cue.volume = GainSmoother::new(1.0, 48_000.0, 10.0);
+        (tx, mixer)
+    }
+
+    #[test]
+    fn pfl_survives_channel_and_master_faders_but_obeys_trim() {
+        let (mut tx, mut mixer) = pfl_fixture();
+        tx.push(AudioCommand::SetDeckGain { deck: 0, gain: 0.0 })
+            .ok();
+        tx.push(AudioCommand::SetMasterGain(0.0)).ok();
+        mixer.drain_commands();
+        let mut buses = MixerBuses::default();
+        for _ in 0..8192 {
+            buses = mixer.next_buses();
+        }
+        assert!(buses.master.0.abs() < 1e-5);
+        assert!((buses.cue.0 - 0.25).abs() < 1e-5);
+        assert!((buses.cue.1 - 0.25).abs() < 1e-5);
+        assert!(mixer.peak_deck[0] >= 0.25, "channel meter is before fader");
+        tx.push(AudioCommand::SetDeckTrim { deck: 0, gain: 0.0 })
+            .ok();
+        mixer.drain_commands();
+        for _ in 0..8192 {
+            buses = mixer.next_buses();
+        }
+        assert!(buses.cue.0.abs() < 1e-5 && buses.cue.1.abs() < 1e-5);
+    }
+
+    #[test]
+    fn full_trim_drives_a_replaygain_level_into_the_channel_redline() {
+        let (mut tx, mut mixer) = pfl_fixture();
+        mixer.decks[0].buffer = Some(Arc::new(DeckBuffer::new(vec![0.125; 2 * 48_000], 48_000)));
+        tx.push(AudioCommand::SetDeckTrim {
+            deck: 0,
+            gain: compas_core::control::TRIM_MAX_GAIN as f32,
+        })
+        .ok();
+        mixer.drain_commands();
+        for _ in 0..8192 {
+            mixer.next_buses();
+        }
+        assert!(
+            mixer.peak_deck[0] > 0.999,
+            "full trim must reach 0 dBFS from the −18 dBFS normalization target, peak {}",
+            mixer.peak_deck[0]
+        );
+    }
+
+    #[test]
+    fn input_trim_attenuates_both_buses_without_changing_channel_fader() {
+        let (mut tx, mut mixer) = pfl_fixture();
+        let before = mixer.next_buses();
+        tx.push(AudioCommand::SetDeckTrim { deck: 0, gain: 0.5 })
+            .ok();
+        mixer.drain_commands();
+        let mut after = MixerBuses::default();
+        for _ in 0..8192 {
+            after = mixer.next_buses();
+        }
+        assert!((after.master.0 - before.master.0 * 0.5).abs() < 1e-5);
+        assert!((after.cue.0 - before.cue.0 * 0.5).abs() < 1e-5);
+        assert_eq!(mixer.decks[0].fader.current, 1.0);
+    }
+
+    #[test]
+    fn pfl_mix_volume_toggle_and_render_clock_are_independent() {
+        let (_tx, mut mixer) = pfl_fixture();
+        let initial = mixer.decks[0].playhead;
+        let on = mixer.next_buses();
+        assert_eq!(mixer.decks[0].playhead, initial + 1.0);
+        assert!(on.cue.0 > 0.0);
+        mixer.decks[0].cue = false;
+        let off = mixer.next_buses();
+        assert_eq!(off.master, on.master, "cue toggle cannot alter master");
+        assert_eq!(off.cue, (0.0, 0.0));
+        mixer.routing.cue.mix = 1.0;
+        let master_mix = mixer.next_buses();
+        assert_eq!(master_mix.cue, master_mix.master);
+        mixer.routing.cue.volume = GainSmoother::new(0.0, 48_000.0, 10.0);
+        let muted = mixer.next_buses();
+        assert_eq!(muted.cue, (0.0, 0.0));
+        assert_eq!(muted.master, on.master);
+    }
+
+    #[test]
+    fn pfl_paused_unloaded_and_ring_output_do_not_leak_stale_audio() {
+        let (_tx, mut mixer) = pfl_fixture();
+        let (cue_tx, mut cue_rx) = rtrb::RingBuffer::<f32>::new(16);
+        mixer.routing.cue.sink = Some(cue_tx);
+        let buses = mixer.next_buses();
+        assert_eq!((cue_rx.pop().unwrap(), cue_rx.pop().unwrap()), buses.cue);
+        mixer.decks[0].playing = false;
+        assert_eq!(mixer.next_buses().cue, (0.0, 0.0));
+        mixer.decks[0].playing = true;
+        mixer.decks[0].buffer = None;
+        assert_eq!(mixer.next_buses().cue, (0.0, 0.0));
+    }
+
     #[test]
     fn cue_bus_sums_only_cued_decks_into_the_sink() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
         // Two decks playing a DC ramp so each yields nonzero audio.
         let buf = Arc::new(DeckBuffer::new(vec![0.5; 2 * 1000], 48_000));
@@ -2682,7 +3213,7 @@ mod tests {
     #[test]
     fn no_cue_sink_means_no_push_but_still_advances() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
         // With no cue sink installed, next_frame must not panic and the master still mixes.
         let buf = Arc::new(DeckBuffer::new(vec![0.3; 2 * 100], 48_000));
@@ -2695,7 +3226,7 @@ mod tests {
     #[test]
     fn booth_output_follows_post_master_with_independent_gain() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
         let buf = Arc::new(DeckBuffer::new(vec![0.5; 2 * 100], 48_000));
         mixer.decks[0].buffer = Some(buf);
@@ -2717,7 +3248,7 @@ mod tests {
     #[test]
     fn aux_input_sums_into_master_with_gain() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
         // No decks/synth/sampler active, so the master is exactly the aux contribution scaled by
         // the aux gain and the default master gain (the smoother starts at its 0.85 target).
@@ -2743,7 +3274,7 @@ mod tests {
     #[test]
     fn aux_stays_silent_until_primed() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
         // A couple of samples is far below AUX_PRIME_SAMPLES, so the mixer must not drain yet.
         let (mut aux_tx, aux_rx) = rtrb::RingBuffer::<f32>::new(8);
@@ -2758,7 +3289,7 @@ mod tests {
     #[test]
     fn record_and_cue_ring_drops_are_counted() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, _rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
         let telemetry = Arc::new(DeckTelemetry::new());
         let mut mixer = Mixer::new(48_000.0, crx, rtx, telemetry.clone());
         let (record_tx, _record_rx) = rtrb::RingBuffer::<f32>::new(2);
@@ -2774,9 +3305,85 @@ mod tests {
     }
 
     #[test]
+    fn cue_producers_retire_after_consumers_are_gone() {
+        let (mut ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
+        let (rtx, mut rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
+        let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
+        let (first, consumer) = rtrb::RingBuffer::<f32>::new(16);
+        drop(consumer);
+        ctx.push(AudioCommand::StartCueOutput { sink: first })
+            .unwrap();
+        mixer.drain_commands();
+        assert!(rrx.pop().is_err());
+        let (second, consumer) = rtrb::RingBuffer::<f32>::new(32);
+        drop(consumer);
+        ctx.push(AudioCommand::StartCueOutput { sink: second })
+            .unwrap();
+        mixer.drain_commands();
+        match rrx.pop().unwrap() {
+            RetiredResource::Monitor(sink) => {
+                assert_eq!(sink.buffer().capacity(), 16);
+                assert!(sink.is_abandoned());
+                drop(sink); // final ring destruction here, on the control/test thread
+            }
+            _ => panic!("expected retired monitor"),
+        }
+        ctx.push(AudioCommand::StopCueOutput).unwrap();
+        mixer.drain_commands();
+        assert!(mixer.routing.cue.sink.is_none());
+        match rrx.pop().unwrap() {
+            RetiredResource::Monitor(sink) => assert_eq!(sink.buffer().capacity(), 32),
+            _ => panic!("expected retired monitor"),
+        }
+    }
+
+    #[test]
+    fn saturated_reclamation_keeps_owning_commands_queued_then_resumes() {
+        let count = PENDING_RECLAIM_CAP + 3;
+        let (mut ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(count);
+        let (rtx, mut rrx) = rtrb::RingBuffer::<RetiredResource>::new(1);
+        let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
+        for _ in 0..count {
+            let (sink, consumer) = rtrb::RingBuffer::<f32>::new(2);
+            drop(consumer);
+            ctx.push(AudioCommand::StartCueOutput { sink }).unwrap();
+        }
+        mixer.drain_commands();
+        assert!(mixer.pending_reclaim.iter().all(Option::is_some));
+        assert_eq!(
+            mixer.commands.slots(),
+            1,
+            "last owning command was not popped"
+        );
+        mixer.drain_commands();
+        assert_eq!(
+            mixer.commands.slots(),
+            1,
+            "no control-side progress, no unsafe pop"
+        );
+        let mut retired = 0;
+        for _ in 0..count {
+            while rrx.pop().is_ok() {
+                retired += 1;
+            }
+            mixer.drain_commands();
+        }
+        while rrx.pop().is_ok() {
+            retired += 1;
+        }
+        assert_eq!(mixer.commands.slots(), 0);
+        assert!(mixer.pending_reclaim.iter().all(Option::is_none));
+        assert_eq!(
+            retired,
+            count - 1,
+            "all replaced resources reclaimed without leaks"
+        );
+    }
+
+    #[test]
     fn retired_deck_buffers_are_parked_when_reclaim_ring_is_full() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, mut rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(1);
+        let (rtx, mut rrx) = rtrb::RingBuffer::<RetiredResource>::new(1);
         let telemetry = Arc::new(DeckTelemetry::new());
         let mut mixer = Mixer::new(48_000.0, crx, rtx, telemetry.clone());
 
@@ -2812,7 +3419,7 @@ mod tests {
     #[test]
     fn replaced_sample_buffers_are_parked_when_reclaim_ring_is_full() {
         let (mut ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
-        let (rtx, mut rrx) = rtrb::RingBuffer::<Arc<DeckBuffer>>::new(1);
+        let (rtx, mut rrx) = rtrb::RingBuffer::<RetiredResource>::new(1);
         let telemetry = Arc::new(DeckTelemetry::new());
         let mut mixer = Mixer::new(48_000.0, crx, rtx, telemetry.clone());
 
@@ -2850,6 +3457,41 @@ mod tests {
                 .expect("old sample buffer flushes after reclaim drains"),
         );
         assert!(old_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn censor_reverses_then_returns_to_the_slipped_position() {
+        let mut d = ramp_deck();
+        d.playhead = 1000.0;
+        d.playing = true;
+        d.tempo = 1.0;
+        d.set_censor(true);
+        for _ in 0..100 {
+            d.advance_playhead(10_000.0);
+        }
+        assert!(d.playhead < 1000.0, "censor plays backward");
+        assert!(d.slip_playhead > 1000.0, "slip keeps moving forward");
+        let landed = d.slip_playhead;
+        d.set_censor(false);
+        assert!((d.playhead - landed).abs() < 1e-6);
+        assert!(d.playing);
+    }
+
+    #[test]
+    fn censor_from_pause_returns_to_the_start_and_stays_paused() {
+        let mut d = ramp_deck();
+        d.playhead = 400.0;
+        d.playing = false;
+        d.set_censor(true);
+        assert!(d.playing, "the reverse is audible while held");
+        for _ in 0..50 {
+            d.advance_playhead(10_000.0);
+        }
+        assert!(d.playhead < 400.0);
+        assert!((d.slip_playhead - 400.0).abs() < 1e-6);
+        d.set_censor(false);
+        assert!((d.playhead - 400.0).abs() < 1e-6);
+        assert!(!d.playing);
     }
 
     #[test]

@@ -1,56 +1,112 @@
-import { useCallback, useEffect, useState } from "react";
-import { inTauri, midiConnect, midiDisconnect, midiListPorts } from "../lib/ipc";
+import { useSyncExternalStore } from "react";
+import {
+  controllerSession, inTauri, midiConnect, midiDisconnect, midiListPorts,
+  onControllerSession, type ControllerSession,
+} from "../lib/ipc";
 
-/**
- * Owns the single app-wide MIDI input connection. Both the synth (instrument panel) and the
- * control-mapping layer share it: raw notes/CCs arrive as the global `midi:note`/`midi:cc`
- * Tauri events regardless of who opened the port, so consumers just subscribe.
- */
+/** One native MIDI session shared by every panel. React never opens ports automatically. */
 export interface MidiApi {
   ports: string[];
-  /** Connected port name, or null when no port is open. */
   connected: string | null;
-  /** Index into `ports` selected for the next connect. */
   portIdx: number;
   setPortIdx: (i: number) => void;
   rescan: () => void;
-  /** Connect the selected port, or disconnect if already connected. */
   toggle: () => Promise<void>;
 }
 
-export function useMidi(): MidiApi {
-  const [ports, setPorts] = useState<string[]>([]);
-  const [portIdx, setPortIdx] = useState(0);
-  const [connected, setConnected] = useState<string | null>(null);
+type MidiSnapshot = Pick<MidiApi, "ports" | "connected" | "portIdx">;
+let snapshot: MidiSnapshot = { ports: [], connected: null, portIdx: 0 };
+let selectedName: string | null = null;
+const subscribers = new Set<() => void>();
+let started = false;
+let sessionVersion = 0;
+let snapshotRequest = 0;
+let portsRequest = 0;
+let toggling = false;
 
-  const rescan = useCallback(() => {
-    if (!inTauri()) return;
-    midiListPorts()
-      .then((p) => {
-        setPorts(p);
-        setPortIdx((i) => (i < p.length ? i : 0));
-      })
-      .catch(() => {});
-  }, []);
+function publish(ports: string[], connected = snapshot.connected) {
+  // A session event can precede enumeration. Never display an unrelated keyboard as connected.
+  const visible = connected && !ports.includes(connected) ? [...ports, connected] : ports;
+  const desired = connected ?? selectedName;
+  const index = desired ? visible.indexOf(desired) : -1;
+  snapshot = { ports: visible, connected, portIdx: index >= 0 ? index : 0 };
+  subscribers.forEach((notify) => notify());
+}
 
-  useEffect(() => {
-    rescan();
-  }, [rescan]);
+async function refreshPorts() {
+  if (!inTauri()) return;
+  const request = ++portsRequest;
+  try {
+    const ports = await midiListPorts();
+    if (request === portsRequest) publish(ports);
+  } catch { /* Retain the last authoritative connection when enumeration fails. */ }
+}
 
-  const toggle = useCallback(async () => {
-    try {
-      if (connected) {
-        await midiDisconnect();
-        setConnected(null);
-      } else if (ports.length) {
-        setConnected(await midiConnect(portIdx));
-      } else {
-        rescan();
-      }
-    } catch {
-      setConnected(null);
+function applySession(session: ControllerSession) {
+  if (session.connected) selectedName = session.connected;
+  publish(snapshot.ports, session.connected);
+  void refreshPorts();
+}
+
+async function refreshSession() {
+  if (!inTauri()) return;
+  const version = sessionVersion;
+  const request = ++snapshotRequest;
+  try {
+    const session = await controllerSession();
+    // A later event or request always wins over an older in-flight command result.
+    if (version === sessionVersion && request === snapshotRequest) applySession(session);
+  } catch { /* A failed read is not evidence that the physical session disconnected. */ }
+}
+
+function startSession() {
+  if (started || !inTauri()) return;
+  started = true;
+  // This single listener intentionally lives for the app lifetime, shared by all hook instances.
+  void onControllerSession((session) => {
+    sessionVersion++;
+    applySession(session);
+  }).then(() => refreshSession()).catch(() => {
+    started = false;
+    void refreshSession();
+  });
+  void refreshPorts();
+}
+
+function subscribe(notify: () => void) {
+  subscribers.add(notify);
+  startSession();
+  return () => { subscribers.delete(notify); };
+}
+const getSnapshot = () => snapshot;
+const setPortIdx = (index: number) => {
+  if (snapshot.connected || !Number.isInteger(index) || index < 0 || index >= snapshot.ports.length) return;
+  selectedName = snapshot.ports[index];
+  publish(snapshot.ports);
+};
+const rescan = () => { void refreshPorts(); void refreshSession(); };
+const toggle = async () => {
+  if (!inTauri() || toggling) return;
+  toggling = true;
+  try {
+    if (snapshot.connected) {
+      await midiDisconnect();
+    } else {
+      const name = snapshot.ports[snapshot.portIdx];
+      if (!name) return;
+      // Resolve the selection by name against fresh enumeration, not an obsolete port index.
+      const ports = await midiListPorts();
+      const index = ports.indexOf(name);
+      if (index >= 0) await midiConnect(index);
     }
-  }, [connected, ports.length, portIdx, rescan]);
+  } catch { /* Read native state below; do not manufacture a disconnected session on failure. */ }
+  finally {
+    await refreshSession();
+    toggling = false;
+  }
+};
 
-  return { ports, connected, portIdx, setPortIdx, rescan, toggle };
+export function useMidi(): MidiApi {
+  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  return { ...state, setPortIdx, rescan, toggle };
 }

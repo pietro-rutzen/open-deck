@@ -1,12 +1,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use compas_core::{CompasError, DeckBuffer, Result};
+use compas_core::{CompasError, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use crate::mixer::{AudioCommand, DeckTelemetry, Mixer};
+use crate::mixer::{AudioCommand, DeckTelemetry, Mixer, RetiredResource};
 
 /// Engine configuration.
 #[derive(Debug, Clone, Copy)]
@@ -33,9 +33,10 @@ impl Default for EngineConfig {
 pub struct AudioEngine {
     _stream: cpal::Stream,
     commands: Producer<AudioCommand>,
-    reclaim: Consumer<Arc<DeckBuffer>>,
+    reclaim: Consumer<RetiredResource>,
     telemetry: Arc<DeckTelemetry>,
     sample_rate: u32,
+    device_name: String,
     stream_failed: Arc<AtomicBool>,
     last_stream_error: Arc<Mutex<Option<String>>>,
 }
@@ -57,7 +58,7 @@ impl AudioEngine {
         let stream_config: cpal::StreamConfig = supported.into();
 
         let (cmd_tx, cmd_rx) = RingBuffer::<AudioCommand>::new(config.command_capacity);
-        let (reclaim_tx, reclaim_rx) = RingBuffer::<Arc<DeckBuffer>>::new(config.reclaim_capacity);
+        let (reclaim_tx, reclaim_rx) = RingBuffer::<RetiredResource>::new(config.reclaim_capacity);
         let mixer = Mixer::new(sample_rate as f32, cmd_rx, reclaim_tx, telemetry.clone());
         let stream_failed = Arc::new(AtomicBool::new(false));
         let last_stream_error = Arc::new(Mutex::new(None));
@@ -99,9 +100,14 @@ impl AudioEngine {
             reclaim: reclaim_rx,
             telemetry,
             sample_rate,
+            device_name: device.name().unwrap_or_else(|_| "Unknown output".into()),
             stream_failed,
             last_stream_error,
         })
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.device_name
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -126,7 +132,12 @@ impl AudioEngine {
     /// Drop any buffers the audio thread has retired (call periodically / after sends so
     /// freeing never happens on the RT path).
     pub fn drain_reclaimed(&mut self) {
-        while self.reclaim.pop().is_ok() {}
+        while let Ok(resource) = self.reclaim.pop() {
+            match resource {
+                RetiredResource::Buffer(buffer) => drop(buffer),
+                RetiredResource::Monitor(sink) => drop(sink),
+            }
+        }
     }
 
     /// Send a control command to the audio thread. Errors if the ring is full (the UI

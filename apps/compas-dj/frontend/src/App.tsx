@@ -1,17 +1,19 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TitleBar } from "./components/TitleBar";
 import { StatusBar } from "./components/StatusBar";
 import { WaveformZone } from "./components/WaveformZone";
 import { Deck } from "./components/Deck";
 import { Mixer } from "./components/Mixer";
 import { Library } from "./components/Library";
+import { MixerFrame, WorkspaceSplit } from "./components/WorkspaceSplit";
 import { Instrument } from "./components/Instrument";
 import { MidiMap } from "./components/MidiMap";
 import { ControllerMap } from "./components/ControllerMap";
 import { Sampler } from "./components/Sampler";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ProfilePanel } from "./components/ProfilePanel";
-import { useDeck, type DeckController } from "./hooks/useDeck";
+import { isNativeDeckControl, useDeck, type DeckController } from "./hooks/useDeck";
+import { BEAT_FX_LABELS, useBeatFx } from "./hooks/useBeatFx";
 import { useAutoMix } from "./hooks/useAutoMix";
 import { useCue } from "./hooks/useCue";
 import { useBooth } from "./hooks/useBooth";
@@ -20,10 +22,16 @@ import { useInternalClock } from "./hooks/useInternalClock";
 import { useMidi } from "./hooks/useMidi";
 import { useMidiMap } from "./hooks/useMidiMap";
 import { useSampler } from "./hooks/useSampler";
-import { controllerFeedback, engineStatus, inTauri, onControllerUpdate, onEngineLoad, onMasterMeter, pickRecordingPath, pitchClassOf, setCrossfader, setCrossfaderConfig, setDeckFxMacro, setMasterGain, startRecording, stopRecording, type ControllerUpdate, type EngineLoad, type EngineStatus, type KeyNotation, type MasterMeter } from "./lib/ipc";
+import { controllerLearn, controllerSession, onControllerSession, controllerFeedback, engineStatus, inTauri, onControllerBatch, onControllerUpdate, pickRecordingPath, pitchClassOf, setCrossfader, setCrossfaderConfig, setDeckFxMacro, setMasterGain, startRecording, stopRecording, type ControllerUpdate, type EngineStatus, type KeyNotation } from "./lib/ipc";
 
 const DECK_COLORS = ["var(--deck-a)", "var(--deck-b)", "var(--deck-c)", "var(--deck-d)"];
 const DECK_LETTERS = ["A", "B", "C", "D"];
+const BEAT_LOOP_PADS = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
+const BEAT_JUMP_PADS = [-1, 1, -2, 2, -4, 4, -8, 8];
+/** Pioneer key-shift pad layout: absolute semitones; pads 1 and 8 reset. */
+const KEY_SHIFT_PADS = [0, 1, 2, 3, -3, -2, -1, 0];
+/** SHIFT + key-shift pads: relative semitone steps. */
+const KEY_SHIFT_STEP_PADS = [1, 2, 3, 4, -1, -2, -3, -4];
 
 export function App() {
   // Four local/full-DSP decks; only two deck panels are shown at a time (switching slots),
@@ -39,15 +47,6 @@ export function App() {
 
   const [sampleRate, setSampleRate] = useState<number | null>(null);
   const [audioStatus, setAudioStatus] = useState<Pick<EngineStatus, "audio_online" | "audio_restarting" | "audio_restarts" | "audio_error" | "cue_device_latency_secs" | "cue_prime_latency_secs" | "booth_device_latency_secs" | "booth_prime_latency_secs"> | null>(null);
-  const [master, setMaster] = useState<MasterMeter>({ l: 0, r: 0 });
-  const [load, setLoad] = useState<EngineLoad>({
-    load: 0,
-    xruns: 0,
-    command_ring_full: 0,
-    record_ring_drops: 0,
-    cue_ring_drops: 0,
-    reclaim_ring_full: 0,
-  });
   const [xfade, setXfade] = useState(0.5);
   const [showKeys, setShowKeys] = useState(false);
   const [showMap, setShowMap] = useState(false);
@@ -62,6 +61,10 @@ export function App() {
   useEffect(() => {
     localStorage.setItem("compas.keyNotation", keyNotation);
   }, [keyNotation]);
+  useEffect(() => {
+    if (!inTauri()) return;
+    controllerLearn(false).catch(() => {});
+  }, []);
   const [deckCount, setDeckCount] = useState<2 | 4>(() =>
     localStorage.getItem("compas.deckCount") === "4" ? 4 : 2,
   );
@@ -139,18 +142,18 @@ export function App() {
     };
     refreshStatus();
     const statusTimer = window.setInterval(refreshStatus, 2000);
-    const unMeter = onMasterMeter(setMaster);
-    const unLoad = onEngineLoad(setLoad);
     return () => {
       alive = false;
       window.clearInterval(statusTimer);
-      unMeter.then((u) => u());
-      unLoad.then((u) => u());
     };
   }, []);
 
   const masterBpm = leftDeck.state.meta ? leftDeck.state.meta.bpm * leftDeck.state.tempo : null;
-  const loadedPaths = decks.map((d) => d.state.meta?.path);
+  const [loadedPathA, loadedPathB, loadedPathC, loadedPathD] = decks.map((d) => d.state.meta?.path);
+  const loadedPaths = useMemo(
+    () => [loadedPathA, loadedPathB, loadedPathC, loadedPathD],
+    [loadedPathA, loadedPathB, loadedPathC, loadedPathD],
+  );
   const profileInitial = profileName.trim().charAt(0).toUpperCase() || "M";
 
   useEffect(() => {
@@ -195,6 +198,7 @@ export function App() {
       return;
     }
     if (!target.state.meta || !source.state.meta || target.state.meta.bpm <= 0 || source.state.meta.bpm <= 0) return;
+    target.actions.setSyncMode(0);
     target.actions.setTempo((source.state.meta.bpm * source.state.tempo) / target.state.meta.bpm);
     target.actions.sync(source.deck);
   };
@@ -224,12 +228,30 @@ export function App() {
     samplerPad: sampler.trigger,
   });
 
+  const beatFx = useBeatFx();
+
+  // Native controller thread already applied these to the engine; UI state only reflects them.
+  const reflectRef = useRef<(u: ControllerUpdate) => void>(() => {});
+  reflectRef.current = ({ control, value }: ControllerUpdate) => {
+    if (!Number.isFinite(value)) return;
+    if (control === "mixer.crossfader") return setXfade(value);
+    const deckMatch = control.match(/^deck\.(\d+)\.(.+)$/);
+    const deckController = deckMatch ? decks[Number(deckMatch[1])] : undefined;
+    if (deckController && deckMatch && isNativeDeckControl(deckMatch[2])) {
+      deckController.actions.reflectController(deckMatch[2], value);
+    }
+  };
+
   // Controller bus: apply resolved controller:update events through the existing setters. A ref
   // keeps the handler current without re-subscribing the listener on every render.
   const dispatchRef = useRef<(u: ControllerUpdate) => void>(() => {});
   dispatchRef.current = (u: ControllerUpdate) => {
     const { control, value } = u;
-    if (control === "mixer.crossfader") return applyCrossfade(value);
+    if (!Number.isFinite(value)) return;
+    if (beatFx.handle(control, value, decks)) return;
+    if (control === "mixer.crossfader") return setXfade(value); // Native controller path already applied audio.
+    if (control === "mixer.cue_mix") return cue.setMix(Math.max(0, Math.min(1, value)));
+    if (control === "mixer.cue_volume") return cue.setVolume(Math.max(0, Math.min(1, value)));
     if (control === "mixer.master_gain") {
       setMasterGain(value).catch(() => {});
       return;
@@ -238,9 +260,11 @@ export function App() {
       sampler.setGain(value);
       return;
     }
-    const sm = control.match(/^sampler\.(\d+)\.trigger$/);
+    const sm = control.match(/^sampler\.(\d+)\.(trigger|stop)$/);
     if (sm) {
-      if (value >= 0.5) sampler.trigger(parseInt(sm[1], 10));
+      if (value < 0.5) return;
+      if (sm[2] === "trigger") sampler.trigger(parseInt(sm[1], 10));
+      else sampler.stop(parseInt(sm[1], 10));
       return;
     }
     const m = control.match(/^deck\.(\d+)\.(.+)$/);
@@ -248,8 +272,39 @@ export function App() {
     const d = decks[parseInt(m[1], 10)];
     if (!d) return;
     const { actions: a, state: s } = d;
+    const pad = m[2].match(/^(hotcue|clear_hotcue|beatloop|beatjump|key_shift|key_shift_step)\.(\d)$/);
+    if (pad) {
+      if (value >= 0.5) {
+        const padIndex = Number(pad[2]);
+        if (pad[1] === "hotcue") a.setHotCue(padIndex, u.heard_frame);
+        else if (pad[1] === "clear_hotcue") a.clearHotCue(padIndex);
+        else if (pad[1] === "beatloop") a.beatLoop(BEAT_LOOP_PADS[padIndex], u.heard_frame);
+        else if (pad[1] === "beatjump") a.beatJump(BEAT_JUMP_PADS[padIndex], u.frame);
+        else if (pad[1] === "key_shift") a.setPitchShift(KEY_SHIFT_PADS[padIndex]);
+        else a.shiftPitchBy(KEY_SHIFT_STEP_PADS[padIndex]);
+      }
+      return;
+    }
     switch (m[2]) {
-      case "gain": a.setGain(value); break;
+      case "loop.in": if (value >= 0.5) a.loopIn(u.heard_frame); break;
+      case "loop.out": if (value >= 0.5) a.loopOut(u.heard_frame); break;
+      case "loop.toggle": if (value >= 0.5) a.toggleLoop(); break;
+      case "loop.reloop_stop": if (value >= 0.5) a.reloopAndStop(); break;
+      case "loop.half": if (value >= 0.5) a.scaleLoop(0.5); break;
+      case "loop.double": if (value >= 0.5) a.scaleLoop(2); break;
+      case "jump.back": if (value >= 0.5) a.beatJump(-4, u.frame); break;
+      case "jump.forward": if (value >= 0.5) a.beatJump(4, u.frame); break;
+      case "beatjump.scale_down": if (value >= 0.5) a.scaleBeatJump(1 / 16); break;
+      case "beatjump.scale_up": if (value >= 0.5) a.scaleBeatJump(16); break;
+      case "loop.nudge_in": a.nudgeLoopEdge("in", value); break;
+      case "loop.nudge_out": a.nudgeLoopEdge("out", value); break;
+      case "tempo_range": a.setTempoRange(value); break;
+      case "sync_leader": if (value >= 0.5 && !s.isLeader) a.toggleLeader(); break;
+      case "start": if (value >= 0.5) a.seekFrac(0); break;
+      case "quantize": if (value >= 0.5) a.toggleQuantize(); break;
+      case "gain": a.setGain(value); break; // legacy absolute effective gain
+      case "trim": a.setTrim(value); break;
+      case "volume": a.setVolume(value); break;
       case "filter": a.setFilter(value); break;
       case "tempo": a.setTempo(1 + value / 100); break;
       case "eq.low": a.setEq({ ...s.eq, low: value }); break;
@@ -264,8 +319,13 @@ export function App() {
   useEffect(() => {
     if (!inTauri()) return;
     const un = onControllerUpdate((u) => dispatchRef.current(u));
+    const unBatch = onControllerBatch(({ mirror, updates }) => {
+      mirror.forEach((update) => reflectRef.current(update));
+      updates.forEach((update) => dispatchRef.current(update));
+    });
     return () => {
       un.then((u) => u());
+      unBatch.then((u) => u());
     };
   }, []);
 
@@ -274,37 +334,71 @@ export function App() {
   // controller's own moves. The engine no-ops without an active profile/output and dedups
   // redundant resends. Tempo state is a ratio; the control bus speaks ±percent. (Master gain has
   // no UI control, so it rides the controller-echo path only.)
-  const pushFeedback = useCallback(() => {
-    if (!inTauri()) return;
-    for (const d of decks) {
+  const feedbackValues: [string, number][] = [
+    ...decks.flatMap((d): [string, number][] => {
       const s = d.state;
-      controllerFeedback(`deck.${d.deck}.gain`, s.gain).catch(() => {});
-      controllerFeedback(`deck.${d.deck}.filter`, s.filter).catch(() => {});
-      controllerFeedback(`deck.${d.deck}.eq.low`, s.eq.low).catch(() => {});
-      controllerFeedback(`deck.${d.deck}.eq.mid`, s.eq.mid).catch(() => {});
-      controllerFeedback(`deck.${d.deck}.eq.high`, s.eq.hi).catch(() => {});
-      controllerFeedback(`deck.${d.deck}.tempo`, (s.tempo - 1) * 100).catch(() => {});
-      controllerFeedback(`deck.${d.deck}.play`, s.playing ? 1 : 0).catch(() => {});
-      controllerFeedback(`deck.${d.deck}.keylock`, s.keylock ? 1 : 0).catch(() => {});
-      controllerFeedback(`deck.${d.deck}.sync`, s.synced ? 1 : 0).catch(() => {});
-    }
-    controllerFeedback("mixer.crossfader", xfade).catch(() => {});
-    controllerFeedback("sampler.gain", sampler.gain).catch(() => {});
-    // Depend on the mapped scalars only (not the `decks` array, which is a new identity each
-    // render, nor frame/level which tick at 30 Hz) so this re-runs only on real control changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    deckA.state.gain, deckA.state.filter, deckA.state.eq.low, deckA.state.eq.mid, deckA.state.eq.hi, deckA.state.tempo, deckA.state.playing, deckA.state.keylock, deckA.state.synced,
-    deckB.state.gain, deckB.state.filter, deckB.state.eq.low, deckB.state.eq.mid, deckB.state.eq.hi, deckB.state.tempo, deckB.state.playing, deckB.state.keylock, deckB.state.synced,
-    deckC.state.gain, deckC.state.filter, deckC.state.eq.low, deckC.state.eq.mid, deckC.state.eq.hi, deckC.state.tempo, deckC.state.playing, deckC.state.keylock, deckC.state.synced,
-    deckD.state.gain, deckD.state.filter, deckD.state.eq.low, deckD.state.eq.mid, deckD.state.eq.hi, deckD.state.tempo, deckD.state.playing, deckD.state.keylock, deckD.state.synced,
-    xfade, sampler.gain,
-  ]);
-
-  // Re-push on any mapped value change…
+      const prefix = `deck.${d.deck}`;
+      return [
+        ...s.hotCues.map((hotCue, i): [string, number] => [`${prefix}.hotcue.${i}`, hotCue == null ? 0 : 1]),
+        ...BEAT_LOOP_PADS.map((beats, i): [string, number] => [`${prefix}.beatloop.${i}`, s.loop.active && s.loop.beats === beats ? 1 : 0]),
+        ...BEAT_JUMP_PADS.map((_, i): [string, number] => [`${prefix}.beatjump.${i}`, s.meta ? 1 : 0]),
+        ...KEY_SHIFT_PADS.map((semitones, i): [string, number] => [`${prefix}.key_shift.${i}`, s.meta && s.pitchShift === semitones ? 1 : 0]),
+        [`${prefix}.loop.in`, s.loop.active || s.loop.armed ? 1 : 0],
+        [`${prefix}.loop.out`, s.loop.active ? 1 : 0],
+        [`${prefix}.loop.toggle`, s.loop.active ? 1 : 0],
+        [`${prefix}.gain`, s.gain],
+        [`${prefix}.trim`, s.trim],
+        [`${prefix}.volume`, s.volume],
+        [`${prefix}.headphone_cue`, cue.cued.has(d.deck) ? 1 : 0],
+        [`${prefix}.filter`, s.filter],
+        [`${prefix}.eq.low`, s.eq.low],
+        [`${prefix}.eq.mid`, s.eq.mid],
+        [`${prefix}.eq.high`, s.eq.hi],
+        [`${prefix}.tempo`, (s.tempo - 1) * 100],
+        [`${prefix}.play`, s.playing ? 1 : 0],
+        [`${prefix}.keylock`, s.keylock ? 1 : 0],
+        [`${prefix}.sync`, s.synced ? 1 : 0],
+        [`fx.toggle.${d.deck}`, beatFx.isOn(d) ? 1 : 0],
+      ];
+    }),
+    ...sampler.pads.map((pad, i): [string, number] => [`sampler.${i}.trigger`, pad.name ? 1 : 0]),
+    ["mixer.crossfader", xfade],
+    ["mixer.cue_mix", cue.mix],
+    ["mixer.cue_volume", cue.volume],
+    ["sampler.gain", sampler.gain],
+  ];
+  // Only changed values cross IPC; the native side keeps the desired state for reconnects.
+  const sentFeedbackRef = useRef(new Map<string, number>());
+  const sendFeedback = useCallback((values: [string, number][], force: boolean) => {
+    if (!inTauri()) return;
+    values
+      .filter(([control, value]) => force || sentFeedbackRef.current.get(control) !== value)
+      .forEach(([control, value]) => {
+        sentFeedbackRef.current.set(control, value);
+        controllerFeedback(control, value).catch(() => {});
+      });
+  }, []);
   useEffect(() => {
-    pushFeedback();
-  }, [pushFeedback]);
+    sendFeedback(feedbackValues, false);
+  });
+  const feedbackValuesRef = useRef(feedbackValues);
+  feedbackValuesRef.current = feedbackValues;
+  const pushFeedback = useCallback(() => sendFeedback(feedbackValuesRef.current, true), [sendFeedback]);
+  // Native discovery may connect before React mounts. Reconcile both the initial
+  // session and later reconnects so controller LEDs reflect current software state.
+  const feedbackRef = useRef(pushFeedback);
+  feedbackRef.current = pushFeedback;
+  useEffect(() => {
+    if (!inTauri()) return;
+    let live = true;
+    const un = onControllerSession((session) => {
+      if (live && session.connected && session.profile) feedbackRef.current();
+    });
+    un.then(() => controllerSession()).then((session) => {
+      if (live && session.connected && session.profile) feedbackRef.current();
+    }).catch(() => {});
+    return () => { live = false; un.then((stop) => stop()).catch(() => {}); };
+  }, []);
   // …and on demand when a profile is (re)activated, to sync the device to current state at connect.
   useEffect(() => {
     const onResync = () => pushFeedback();
@@ -347,15 +441,16 @@ export function App() {
     onFxMacro: applyFxMacro,
     auto: { enabled: auto.enabled, transitioning: auto.transitioning, onToggle: auto.toggle, onMixNow: auto.mixNow },
     cue,
+    loadedPaths,
   };
   const channelOf = (d: DeckController) => ({ ctrl: d, letter: DECK_LETTERS[d.deck], color: DECK_COLORS[d.deck] });
 
   return (
     <div className="app" data-contrast={contrast ? "high" : "standard"}>
-      <TitleBar masterBpm={masterBpm} master={master} load={load} syncEnabled={pairReady} syncActive={rightDeck.state.synced} onSync={() => toggleSync(rightDeck, leftDeck)} keysOpen={showKeys} onToggleKeys={() => setShowKeys((v) => !v)} mapOpen={showMap} onToggleMap={() => setShowMap((v) => !v)} padsOpen={showPads} onTogglePads={() => setShowPads((v) => !v)} controllersOpen={showControllers} onToggleControllers={() => setShowControllers((v) => !v)} recording={recording} recBusy={recBusy} onToggleRecord={toggleRecord} onOpenSettings={() => setShowSettings(true)} onOpenProfile={() => setShowProfile(true)} profileInitial={profileInitial} contrast={contrast} onToggleContrast={() => setContrast((v) => !v)} />
+      <TitleBar masterBpm={masterBpm} syncEnabled={pairReady} syncActive={rightDeck.state.synced} onSync={() => toggleSync(rightDeck, leftDeck)} keysOpen={showKeys} onToggleKeys={() => setShowKeys((v) => !v)} mapOpen={showMap} onToggleMap={() => setShowMap((v) => !v)} padsOpen={showPads} onTogglePads={() => setShowPads((v) => !v)} controllersOpen={showControllers} onToggleControllers={() => setShowControllers((v) => !v)} recording={recording} recBusy={recBusy} onToggleRecord={toggleRecord} onOpenSettings={() => setShowSettings(true)} onOpenProfile={() => setShowProfile(true)} profileInitial={profileInitial} contrast={contrast} onToggleContrast={() => setContrast((v) => !v)} />
       <div className="body">
         <div className="content">
-          {quad ? (
+          <WorkspaceSplit upper={quad ? (
             <>
               <WaveformZone lanes={[slotLane(deckA), slotLane(deckB), slotLane(deckC), slotLane(deckD)]} />
               <div className="deck-row deck-row--quad">
@@ -363,7 +458,9 @@ export function App() {
                   <Deck {...fourDeckProps(deckA)} mirror />
                   <Deck {...fourDeckProps(deckC)} mirror />
                 </div>
-                <Mixer channels={decks.map(channelOf)} {...mixerCommon} quad />
+                <MixerFrame>
+                  <Mixer channels={decks.map(channelOf)} {...mixerCommon} quad />
+                </MixerFrame>
                 <div className="deck-col">
                   <Deck {...fourDeckProps(deckB)} />
                   <Deck {...fourDeckProps(deckD)} />
@@ -389,7 +486,9 @@ export function App() {
                     { label: "C", active: leftSel === 2, onSelect: () => setLeftSel(2) },
                   ]}
                 />
-                <Mixer channels={[leftDeck, rightDeck].map(channelOf)} {...mixerCommon} />
+                <MixerFrame>
+                  <Mixer channels={[leftDeck, rightDeck].map(channelOf)} {...mixerCommon} />
+                </MixerFrame>
                 <Deck
                   ctrl={rightDeck}
                   color={DECK_COLORS[rightDeck.deck]}
@@ -406,11 +505,14 @@ export function App() {
                 />
               </div>
             </>
-          )}
-          <Library loadedPaths={loadedPaths} keyNotation={keyNotation} />
+          )} lower={<Library loadedPaths={loadedPaths} keyNotation={keyNotation} />} />
         </div>
       </div>
-      <StatusBar sampleRate={sampleRate} audioStatus={audioStatus} />
+      <StatusBar
+        sampleRate={sampleRate}
+        audioStatus={audioStatus}
+        beatFxLabel={`${BEAT_FX_LABELS[beatFx.selection.effect]} · ${DECK_LETTERS[beatFx.selection.deck]}`}
+      />
       {showKeys && <Instrument midi={midi} onClose={() => setShowKeys(false)} />}
       {showMap && <MidiMap midi={midi} map={midiMap} onClose={() => setShowMap(false)} />}
       {showPads && <Sampler sampler={sampler} onClose={() => setShowPads(false)} />}

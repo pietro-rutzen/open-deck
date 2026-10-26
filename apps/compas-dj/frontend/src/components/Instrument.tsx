@@ -66,7 +66,9 @@ export function Instrument({ midi, onClose }: { midi: MidiApi; onClose: () => vo
   // feedback. Release everything (and stop synth routing) on unmount.
   useEffect(() => {
     setMidiSynth(true).catch(() => {});
-    const un = onMidiCc(setCc);
+    const un = onMidiCc((event) => {
+      if (!event.consumed) setCc(event);
+    });
     return () => {
       un.then((u) => u());
       setMidiSynth(false).catch(() => {});

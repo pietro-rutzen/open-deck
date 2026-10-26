@@ -13,6 +13,7 @@ import {
   onDeckError,
   onDeckLoaded,
   onDeckLoading,
+  onLibraryPathsMoved,
   onDeckPosition,
   pickAudioFile,
   setBeatgrid,
@@ -25,8 +26,10 @@ import {
   setDeckFlanger,
   setDeckCrusher,
   setDeckEq,
+  setDeckEqBand,
   setDeckFilter,
   setDeckGain,
+  setDeckTrim,
   setDeckTempo,
   setLoop as setLoopCmd,
   setLoopActive as setLoopActiveCmd,
@@ -49,6 +52,8 @@ import {
   type DeckLoaded,
   type FilterMode,
 } from "../lib/ipc";
+import { listeningModeActive } from "../lib/listeningMode";
+import { TRIM_MAX } from "../lib/trim";
 
 export interface LoopState {
   active: boolean;
@@ -59,6 +64,14 @@ export interface LoopState {
   /** Manual loop-in set and waiting for OUT (no active loop yet) — for IN/OUT button feedback. */
   armed?: boolean;
 }
+
+/** Deck controls the native controller thread applies directly to the engine. */
+export const NATIVE_DECK_CONTROLS = ["volume", "trim", "eq.low", "eq.mid", "eq.high", "filter", "tempo"] as const;
+export type NativeDeckControl = (typeof NATIVE_DECK_CONTROLS)[number];
+export const isNativeDeckControl = (control: string): control is NativeDeckControl =>
+  (NATIVE_DECK_CONTROLS as readonly string[]).includes(control);
+
+const TRIM_PERSIST_DELAY_MS = 250;
 
 /** Tempo step per −/+ trim click (0.1%). */
 const TEMPO_TRIM = 0.001;
@@ -119,6 +132,10 @@ export interface DeckState {
   /** `performance.now()` when `frame` was last sampled. */
   frameAt: number;
   tempo: number;
+  /** Hardware tempo-fader span in percent. SHIFT+SYNC cycles 8, 6, 10, 16, and 100. */
+  tempoRange: number;
+  /** Multiplier for beat-jump pads. SHIFT beat-jump pads scale it by 16, clamped to 1/16…16. */
+  beatJumpScale: number;
   /** Key-lock (master tempo): tempo changes preserve pitch. */
   keylock: boolean;
   /** Key shift in semitones (± ), pitch-shifting the deck without changing tempo. */
@@ -143,7 +160,12 @@ export interface DeckState {
   xfaderAssign: number;
   eq: Eq;
   filter: number;
+  /** Effective engine gain, always trim × volume. */
   gain: number;
+  /** Input trim, separate from the performance channel fader. */
+  trim: number;
+  /** Channel fader: 0 = silent, 1 = unity. */
+  volume: number;
   hotCues: (number | null)[];
   loop: LoopState;
   echo: EchoState;
@@ -174,6 +196,9 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
   const [latencySecs, setLatencySecs] = useState(0);
   const [frameAt, setFrameAt] = useState(0);
   const [tempo, setTempo] = useState(1);
+  const [tempoRange, setTempoRangeState] = useState(8);
+  const [beatJumpScale, setBeatJumpScale] = useState(1);
+  const beatJumpScaleRef = useRef(1);
   const [keylock, setKeylockState] = useState(false);
   const [pitchShift, setPitchShiftState] = useState(0);
   const [gridOffset, setGridOffset] = useState(0);
@@ -188,8 +213,16 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
   // Default routing: deck 0 → A, deck 1 → B, decks C/D → through.
   const [xfaderAssign, setXfaderAssignState] = useState(deck === 0 ? 0 : deck === 1 ? 2 : 1);
   const [eq, setEqState] = useState<Eq>({ hi: 0, mid: 0, low: 0 });
+  const eqRef = useRef<Eq>({ hi: 0, mid: 0, low: 0 });
   const [filter, setFilterState] = useState(0);
   const [gain, setGainState] = useState(1);
+  const [trim, setTrimState] = useState(1);
+  const [volume, setVolumeState] = useState(1);
+  // Update synchronously in actions: multiple MIDI messages can arrive before React renders.
+  const trimRef = useRef(1);
+  const volumeRef = useRef(1);
+  const gainEditRef = useRef(0);
+  const gainLoadRef = useRef(0);
   const [hotCues, setHotCues] = useState<(number | null)[]>(Array(8).fill(null));
   const [loop, setLoopState] = useState<LoopState>({ active: false, beats: null, inFrame: 0, outFrame: 0 });
   const [echo, setEchoState] = useState<EchoState>({ active: false, beats: 0.5, depth: 0.5 });
@@ -199,6 +232,8 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const frameRef = useRef(0);
+  const framePaintAt = useRef(0);
+  const ratePaintRef = useRef(0);
   const tempoRef = useRef(tempo);
   tempoRef.current = tempo;
   const keylockRef = useRef(keylock);
@@ -259,6 +294,19 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
   const playedRef = useRef(false);
   const quantizeRef = useRef(quantize);
   quantizeRef.current = quantize;
+  const pitchShiftRef = useRef(pitchShift);
+  pitchShiftRef.current = pitchShift;
+  const trimPersistTimerRef = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(trimPersistTimerRef.current), []);
+
+  // Engine telemetry is the transport truth for UI, keyboard and native controller playback alike.
+  useEffect(() => {
+    const loadedPath = pathRef.current;
+    if (!playing || !dsp || !loadedPath || playedRef.current) return;
+    playedRef.current = true;
+    if (listeningModeActive()) return;
+    dbRecordPlay(loadedPath).catch(() => {});
+  }, [playing, dsp]);
 
   useEffect(() => {
     if (!inTauri()) return;
@@ -276,6 +324,8 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
     track(
       onDeckLoaded((e) => {
         if (e.deck !== deck) return;
+        const gainLoad = ++gainLoadRef.current;
+        const gainEdit = gainEditRef.current;
         setMeta(e);
         setFrame(0);
         frameRef.current = 0;
@@ -314,9 +364,18 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
                   ).catch(() => {});
                 }
               }
-              if (st.gain !== 1) {
-                setGainState(st.gain);
-                setDeckGain(deck, st.gain).catch(() => {});
+              // The saved legacy scalar is treated as input trim going forward; this is not
+              // a data migration. Never restore track gain into the channel volume fader.
+              if (gainLoadRef.current === gainLoad && gainEditRef.current === gainEdit) {
+                const savedTrim = Number.isFinite(st.gain) ? Math.max(0, Math.min(TRIM_MAX, st.gain)) : 1;
+                trimRef.current = savedTrim;
+                setTrimState(savedTrim);
+              }
+              if (gainLoadRef.current === gainLoad) {
+                const effective = trimRef.current * volumeRef.current;
+                setGainState(effective);
+                setDeckTrim(deck, trimRef.current).catch(() => {});
+                setDeckGain(deck, volumeRef.current).catch(() => {});
               }
               if (st.cues.length) {
                 const arr: (number | null)[] = Array(8).fill(null);
@@ -334,20 +393,42 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
                 });
               }
             })
-            .catch(() => {});
+            .catch(() => {
+              if (pathRef.current !== e.path || gainLoadRef.current !== gainLoad) return;
+              const effective = trimRef.current * volumeRef.current;
+              setGainState(effective);
+              setDeckTrim(deck, trimRef.current).catch(() => {});
+                setDeckGain(deck, volumeRef.current).catch(() => {});
+            });
         }
       }),
     );
     track(
       onDeckPosition((e) => {
         if (e.deck !== deck) return;
-        setFrame(e.frame);
+        const previousFrame = frameRef.current;
         frameRef.current = e.frame;
-        setPlaying(e.playing);
-        setLevel(e.level);
-        setRate(e.rate ?? 0);
-        setLatencySecs(e.latency_secs ?? 0);
-        setFrameAt(performance.now());
+        const rate = e.rate ?? 0;
+        const latency = e.latency_secs ?? 0;
+        const syncMode = e.tempo_only ? 1 : 0;
+        const now = performance.now();
+        const previousRate = ratePaintRef.current;
+        const jumped = Math.abs(e.frame - previousFrame) > Math.max(Math.abs(rate) * 0.2, 4410);
+        const rateChanged = Math.abs(previousRate - rate) >= 1e-4;
+        const moving = e.playing || Math.abs(rate) > 1e-3;
+        setSyncModeState((current) => (current === syncMode ? current : syncMode));
+        setPlaying((current) => (current === e.playing ? current : e.playing));
+        setLevel((current) => (meterStep(current) === meterStep(e.level) ? current : e.level));
+        setLatencySecs((current) => (Math.abs(current - latency) < 5e-4 ? current : latency));
+        // Frame, timestamp, and rate stay one sample. A fresh scratch rate applied
+        // across a stale elapsed interval throws the waveform backward, then the next packet snaps it forward.
+        if (moving || rateChanged || jumped || now - framePaintAt.current >= 90) {
+          ratePaintRef.current = rate;
+          framePaintAt.current = now;
+          setRate((current) => (Math.abs(current - rate) < 1e-4 ? current : rate));
+          setFrame(e.frame);
+          setFrameAt(now);
+        }
       }),
     );
     track(
@@ -355,6 +436,15 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         if (e.deck !== deck) return;
         setError(e.message);
         setLoading(false);
+      }),
+    );
+    track(
+      onLibraryPathsMoved((moves) => {
+        const current = pathRef.current;
+        const next = current ? moves.find((move) => move.from === current)?.to : undefined;
+        if (!current || !next) return;
+        pathRef.current = next;
+        setMeta((loaded) => (loaded && loaded.path === current ? { ...loaded, path: next } : loaded));
       }),
     );
 
@@ -369,13 +459,6 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
     // Per-track persistence is keyed by file path and only for local (DSP) decks.
     const path = meta?.path ?? null;
     const canPersist = dsp && !!path;
-    // Record a play once, the first time this loaded track starts.
-    const markPlayed = () => {
-      if (canPersist && !playedRef.current) {
-        playedRef.current = true;
-        dbRecordPlay(path as string).catch(swallow);
-      }
-    };
     // Beat-synced echo/flanger pushes are defined at component scope (they track the internal
     // clock via `fxBeatSec` and re-push on tempo change); alias them here for the setters below.
     const pushEcho = applyEcho;
@@ -420,17 +503,13 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
       },
       eject: () => {
         deckUnload(deck).catch(swallow);
+        pathRef.current = null;
+        gainLoadRef.current++;
         setMeta(null);
         setPlaying(false);
       },
-      togglePlay: () => {
-        if (!playing) markPlayed();
-        return (playing ? deckPause(deck) : deckPlay(deck)).catch(swallow);
-      },
-      play: () => {
-        markPlayed();
-        return deckPlay(deck).catch(swallow);
-      },
+      togglePlay: () => (playing ? deckPause(deck) : deckPlay(deck)).catch(swallow),
+      play: () => deckPlay(deck).catch(swallow),
       pause: () => deckPause(deck).catch(swallow),
       cue: () => deckSeek(deck, 0).catch(swallow),
       seekFrac: (f: number) => {
@@ -451,6 +530,14 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
       // Key shift: transpose ± semitones without changing tempo (runs through the key-lock WSOLA).
       setPitchShift: (semitones: number) => {
         const s = Math.max(-12, Math.min(12, Math.round(semitones)));
+        pitchShiftRef.current = s;
+        setPitchShiftState(s);
+        setDeckPitchShift(deck, s).catch(swallow);
+      },
+      // Relative key shift reads the ref so rapid pad presses accumulate before React renders.
+      shiftPitchBy: (semitones: number) => {
+        const s = Math.max(-12, Math.min(12, Math.round(pitchShiftRef.current + semitones)));
+        pitchShiftRef.current = s;
         setPitchShiftState(s);
         setDeckPitchShift(deck, s).catch(swallow);
       },
@@ -511,26 +598,127 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         setDeckTempo(deck, next).catch(swallow);
       },
       setEq: (next: Eq) => {
+        const previous = eqRef.current;
+        eqRef.current = next;
         setEqState(next);
-        setDeckEq(deck, next.low, next.mid, next.hi).catch(swallow);
+        const changedBands = (
+          [
+            [0, previous.low, next.low],
+            [1, previous.mid, next.mid],
+            [2, previous.hi, next.hi],
+          ] as const
+        ).filter(([, before, after]) => before !== after);
+        if (changedBands.length === 1) {
+          const [band, , value] = changedBands[0];
+          setDeckEqBand(deck, band, value).catch(swallow);
+        } else if (changedBands.length > 1) {
+          setDeckEq(deck, next.low, next.mid, next.hi).catch(swallow);
+        }
       },
       setFilter: (x: number) => {
         setFilterState(x);
         const p = filterParams(x);
         setDeckFilter(deck, p.mode, p.cutoff, p.resonance).catch(swallow);
       },
-      setGain: (g: number) => {
-        setGainState(g);
-        setDeckGain(deck, g).catch(swallow);
-        if (canPersist) dbSetGain(path as string, g).catch(swallow);
+      setTrim: (value: number) => {
+        if (!Number.isFinite(value)) return;
+        const next = Math.max(0, Math.min(TRIM_MAX, value));
+        trimRef.current = next;
+        gainEditRef.current++;
+        setTrimState(next);
+        const effective = next * volumeRef.current;
+        setGainState(effective);
+        setDeckTrim(deck, trimRef.current).catch(swallow);
+        setDeckGain(deck, volumeRef.current).catch(swallow);
+        if (canPersist) dbSetGain(path as string, next).catch(swallow);
       },
-      setHotCue: (i: number) => {
+      setVolume: (value: number) => {
+        if (!Number.isFinite(value)) return;
+        const next = Math.max(0, Math.min(1, value));
+        volumeRef.current = next;
+        setVolumeState(next);
+        const effective = trimRef.current * next;
+        setGainState(effective);
+        setDeckTrim(deck, trimRef.current).catch(swallow);
+        setDeckGain(deck, volumeRef.current).catch(swallow);
+      },
+      // Legacy mappings request absolute effective gain, not a channel-volume adjustment.
+      // Normalize the decomposition to trim=g, volume=1, including when the fader was zero.
+      setGain: (value: number) => {
+        if (!Number.isFinite(value)) return;
+        const next = Math.max(0, Math.min(1.5, value));
+        trimRef.current = next;
+        volumeRef.current = 1;
+        gainEditRef.current++;
+        setTrimState(next);
+        setVolumeState(1);
+        setGainState(next);
+        setDeckTrim(deck, next).catch(swallow);
+        setDeckGain(deck, 1).catch(swallow);
+        if (canPersist) dbSetGain(path as string, next).catch(swallow);
+      },
+      // Native controller path already applied these to the engine; only UI state follows.
+      reflectController: (control: NativeDeckControl, value: number) => {
+        if (!Number.isFinite(value)) return;
+        switch (control) {
+          case "volume": {
+            const next = Math.max(0, Math.min(1, value));
+            volumeRef.current = next;
+            setVolumeState(next);
+            setGainState(trimRef.current * next);
+            return;
+          }
+          case "trim": {
+            const next = Math.max(0, Math.min(TRIM_MAX, value));
+            trimRef.current = next;
+            gainEditRef.current++;
+            setTrimState(next);
+            setGainState(next * volumeRef.current);
+            if (!canPersist) return;
+            window.clearTimeout(trimPersistTimerRef.current);
+            trimPersistTimerRef.current = window.setTimeout(
+              () => dbSetGain(path as string, next).catch(swallow),
+              TRIM_PERSIST_DELAY_MS,
+            );
+            return;
+          }
+          case "eq.low": {
+            const next = { ...eqRef.current, low: value };
+            eqRef.current = next;
+            setEqState(next);
+            return;
+          }
+          case "eq.mid": {
+            const next = { ...eqRef.current, mid: value };
+            eqRef.current = next;
+            setEqState(next);
+            return;
+          }
+          case "eq.high": {
+            const next = { ...eqRef.current, hi: value };
+            eqRef.current = next;
+            setEqState(next);
+            return;
+          }
+            return;
+          case "filter":
+            setFilterState(value);
+            return;
+          case "tempo": {
+            const ratio = 1 + value / 100;
+            tempoRef.current = ratio;
+            setTempo(ratio);
+            return;
+          }
+        }
+      },
+      setHotCue: (i: number, atFrame = frameRef.current) => {
         setHotCues((cur) => {
           const next = [...cur];
           // Set if empty, else jump to it.
           if (next[i] == null) {
-            next[i] = frameRef.current;
-            if (canPersist) dbSetCue(path as string, i, frameRef.current).catch(swallow);
+            next[i] = atFrame;
+            if (canPersist) dbSetCue(path as string, i, atFrame).catch(swallow);
           } else {
             const target = quantizeRef.current ? snapBeat(next[i] as number) : (next[i] as number);
             deckSeek(deck, target).catch(swallow);
@@ -546,12 +734,12 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         });
         if (canPersist) dbClearCue(path as string, i).catch(swallow);
       },
-      beatLoop: (beats: number) => {
+      beatLoop: (beats: number, atFrame = frameRef.current) => {
         if (!meta || (meta.beat_interval_sec ?? 0) <= 0) return;
         const sr = meta.source_rate;
         const interval = meta.beat_interval_sec * sr;
         const offset = (meta.first_beat_sec + gridOffsetRef.current) * sr;
-        const k = Math.round((frameRef.current - offset) / interval);
+        const k = Math.round((atFrame - offset) / interval);
         const inFrame = Math.max(0, offset + k * interval);
         const outFrame = inFrame + beats * interval;
         const cur = loopRef.current;
@@ -565,15 +753,30 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         }
       },
       // Arm the loop: store the in-point and light IN until OUT lands (no engine loop yet).
-      loopIn: () => setLoopState((l) => ({ ...l, inFrame: frameRef.current, beats: null, armed: true })),
-      loopOut: () => {
-        const out = frameRef.current;
+      loopIn: (atFrame = frameRef.current) => setLoopState((l) => ({ ...l, inFrame: atFrame, beats: null, armed: true })),
+      loopOut: (atFrame = frameRef.current) => {
+        const out = atFrame;
         const l = loopRef.current;
         if (out > l.inFrame) {
           setLoopCmd(deck, l.inFrame, out, true).catch(swallow);
           setLoopState({ active: true, beats: null, inFrame: l.inFrame, outFrame: out, armed: false });
           if (canPersist) dbSetLoop(path as string, 0, l.inFrame, out, null).catch(swallow);
         }
+      },
+      toggleLoop: () => {
+        const l = loopRef.current;
+        if (l.outFrame <= l.inFrame) return;
+        setLoopCmd(deck, l.inFrame, l.outFrame, !l.active).catch(swallow);
+        setLoopState({ ...l, active: !l.active, armed: false });
+      },
+      // Pioneer SHIFT+RELOOP: return to the stored loop, engage it and stop on its in-point.
+      reloopAndStop: () => {
+        const l = loopRef.current;
+        if (l.outFrame <= l.inFrame) return;
+        deckPause(deck).catch(swallow);
+        setLoopCmd(deck, l.inFrame, l.outFrame, true).catch(swallow);
+        deckSeek(deck, l.inFrame).catch(swallow);
+        setLoopState({ ...l, active: true, armed: false });
       },
       clearLoop: () => {
         setLoopActiveCmd(deck, false).catch(swallow);
@@ -622,11 +825,48 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
       toggleQuantize: () => setQuantize((q) => !q),
       // Jump the play-head by whole beats (negative = back). When quantize is on, the jump
       // starts from the nearest beat so repeated jumps stay grid-aligned.
-      beatJump: (beats: number) => {
+      beatJump: (beats: number, fromFrame = frameRef.current) => {
         const g = grid();
         if (!g) return;
-        const base = quantizeRef.current ? snapBeat(frameRef.current) : frameRef.current;
-        deckSeek(deck, Math.max(0, base + beats * g.interval)).catch(swallow);
+        const scaled = beats * beatJumpScaleRef.current;
+        const base = quantizeRef.current ? snapBeat(fromFrame) : fromFrame;
+        deckSeek(deck, Math.max(0, base + scaled * g.interval)).catch(swallow);
+      },
+      scaleBeatJump: (factor: number) => {
+        if (!Number.isFinite(factor) || factor <= 0) return;
+        const next = Math.min(16, Math.max(1 / 16, beatJumpScaleRef.current * factor));
+        beatJumpScaleRef.current = next;
+        setBeatJumpScale(next);
+      },
+      setTempoRange: (percent: number) => {
+        const allowed = [6, 8, 10, 16, 100];
+        const match = allowed.find((range) => Math.abs(range - percent) < 0.01);
+        if (match != null) setTempoRangeState(match);
+      },
+      nudgeLoopEdge: (edge: "in" | "out", counts: number) => {
+        if (!Number.isFinite(counts) || counts === 0) return;
+        const current = loopRef.current;
+        if (current.outFrame <= current.inFrame) return;
+        const sourceRate = meta?.source_rate ?? 0;
+        if (sourceRate <= 0) return;
+        const delta = counts * sourceRate * 0.01;
+        const minimum = 8;
+        const next =
+          edge === "in"
+            ? {
+                ...current,
+                beats: null,
+                inFrame: Math.min(current.outFrame - minimum, Math.max(0, current.inFrame + delta)),
+              }
+            : {
+                ...current,
+                beats: null,
+                outFrame: Math.max(current.inFrame + minimum, current.outFrame + delta),
+              };
+        if (next.inFrame === current.inFrame && next.outFrame === current.outFrame) return;
+        loopRef.current = next;
+        setLoopState(next);
+        setLoopCmd(deck, next.inFrame, next.outFrame, next.active).catch(swallow);
       },
       // Momentary loop-roll with slip. Engaging loops the sub-beat region at the play-head;
       // releasing drops back in where the track would be (the engine tracks the shadow head).
@@ -704,8 +944,15 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
     };
   }, [deck, playing, tempo, meta, isLeader, syncLive, syncInternal, applyEcho, applyFlanger]);
 
-  const state: DeckState = { meta, frame, playing, level, rate, latencySecs, frameAt, tempo, keylock, pitchShift, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, hotCues, loop, echo, reverb, flanger, crusher, error, loading, dsp };
-  return { state, actions, deck };
+  const state: DeckState = useMemo(() => ({ meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, echo, reverb, flanger, crusher, error, loading, dsp }), [meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, echo, reverb, flanger, crusher, error, loading, dsp]);
+  return useMemo(() => ({ state, actions, deck }), [state, actions, deck]);
+}
+
+const METER_STEPS = [1, 0.5011872, 0.25118864, 0.06309573, 0.015848932];
+function meterStep(level: number) {
+  const peak = Number.isFinite(level) ? Math.max(0, level) : 0;
+  const step = METER_STEPS.findIndex((threshold) => peak >= threshold);
+  return step < 0 ? METER_STEPS.length : step;
 }
 
 export type DeckController = ReturnType<typeof useDeck>;

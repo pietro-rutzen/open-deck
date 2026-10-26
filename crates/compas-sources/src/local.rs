@@ -7,7 +7,7 @@ use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
+use symphonia::core::meta::{Limit, MetadataOptions, MetadataRevision, StandardTagKey};
 use symphonia::core::probe::Hint;
 
 use crate::{AudioSource, PcmSource};
@@ -34,7 +34,7 @@ impl LocalFileSource {
             hint.with_extension(ext);
         }
 
-        let probed = symphonia::default::get_probe()
+        let mut probed = symphonia::default::get_probe()
             .format(
                 &hint,
                 mss,
@@ -42,11 +42,23 @@ impl LocalFileSource {
                     enable_gapless: true,
                     ..Default::default()
                 },
-                &MetadataOptions::default(),
+                &MetadataOptions {
+                    limit_metadata_bytes: Limit::Maximum(64 * 1024),
+                    limit_visual_bytes: Limit::Maximum(2 * 1024 * 1024),
+                },
             )
             .map_err(|e| CompasError::UnsupportedFormat(e.to_string()))?;
 
-        let format = probed.format;
+        let mut tags = TextTags::default();
+        if let Some(metadata) = probed.metadata.get() {
+            if let Some(revision) = metadata.current() {
+                tags.absorb(revision);
+            }
+        }
+        let mut format = probed.format;
+        if let Some(revision) = format.metadata().current() {
+            tags.absorb(revision);
+        }
         let track = format
             .tracks()
             .iter()
@@ -73,19 +85,23 @@ impl LocalFileSource {
             .make(&track.codec_params, &DecoderOptions::default())
             .map_err(|e| CompasError::Decode(e.to_string()))?;
 
-        let title = path
+        let fallback_title = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("Unknown")
             .to_string();
 
         let metadata = TrackMetadata {
-            id: title.clone(), // TODO(P1): assign a real UUID at import time.
+            id: fallback_title.clone(), // Preserve the existing source identity.
+            // TODO(P1): assign a real UUID at import time.
             provider: MusicProvider::Local,
             provider_id: path.to_string_lossy().into_owned(),
-            title,
-            artist: "Unknown".to_string(),
-            album: None,
+            title: tags.title.unwrap_or(fallback_title),
+            artist: tags
+                .artist
+                .or(tags.album_artist)
+                .unwrap_or_else(|| "Unknown".to_string()),
+            album: tags.album,
             artwork_url: None,
             duration_ms,
             bpm: None,
@@ -161,6 +177,41 @@ impl PcmSource for LocalFileSource {
     }
 }
 
+/// Text-only metadata, resolved on the file worker before decoding/playback.
+#[derive(Default)]
+struct TextTags {
+    title: Option<String>,
+    artist: Option<String>,
+    album_artist: Option<String>,
+    album: Option<String>,
+}
+impl TextTags {
+    fn absorb(&mut self, revision: &MetadataRevision) {
+        for tag in revision.tags() {
+            let target = match tag.std_key {
+                Some(StandardTagKey::TrackTitle) => &mut self.title,
+                Some(StandardTagKey::Artist) => &mut self.artist,
+                Some(StandardTagKey::AlbumArtist) => &mut self.album_artist,
+                Some(StandardTagKey::Album) => &mut self.album,
+                _ => continue,
+            };
+            if target.is_none() {
+                let text: String = tag
+                    .value
+                    .to_string()
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(1024)
+                    .collect();
+                let text = text.trim();
+                if !text.is_empty() {
+                    *target = Some(text.to_owned());
+                }
+            }
+        }
+    }
+}
+
 /// Convert an interleaved buffer with `src_channels` channels to interleaved stereo.
 fn to_stereo(samples: &[f32], src_channels: usize) -> Vec<f32> {
     match src_channels {
@@ -190,6 +241,96 @@ fn to_stereo(samples: &[f32], src_channels: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tagged_flac(tags: &[&str]) -> PathBuf {
+        static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("opendeck-tags-{}-{id}.flac", std::process::id()));
+        let mut bytes = b"fLaC".to_vec();
+        bytes.extend_from_slice(&[0, 0, 0, 34]);
+        let mut stream = [0u8; 34];
+        stream[..4].copy_from_slice(&[0, 16, 0, 16]);
+        let info = (48_000u64 << 44) | (1 << 41) | (15 << 36) | 16;
+        stream[10..18].copy_from_slice(&info.to_be_bytes());
+        bytes.extend_from_slice(&stream);
+        let mut comments = vec![0u8; 4]; // empty vendor
+        comments.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+        for tag in tags {
+            comments.extend_from_slice(&(tag.len() as u32).to_le_bytes());
+            comments.extend_from_slice(tag.as_bytes());
+        }
+        let size = comments.len() as u32;
+        bytes.push(0x84); // final metadata block, Vorbis comments
+        bytes.extend_from_slice(&size.to_be_bytes()[1..]);
+        bytes.extend_from_slice(&comments);
+        // A valid16-sample stereo constant frame, including header/frame CRCs.
+        let mut frame = vec![0xff, 0xf8, 0x6a, 0x18, 0, 15];
+        let mut crc8 = 0u8;
+        for byte in &frame {
+            crc8 ^= byte;
+            for _ in 0..8 {
+                crc8 = if crc8 & 0x80 != 0 {
+                    (crc8 << 1) ^ 0x07
+                } else {
+                    crc8 << 1
+                };
+            }
+        }
+        frame.push(crc8);
+        frame.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let mut crc16 = 0u16;
+        for byte in &frame {
+            crc16 ^= u16::from(*byte) << 8;
+            for _ in 0..8 {
+                crc16 = if crc16 & 0x8000 != 0 {
+                    (crc16 << 1) ^ 0x8005
+                } else {
+                    crc16 << 1
+                };
+            }
+        }
+        frame.extend_from_slice(&crc16.to_be_bytes());
+        bytes.extend_from_slice(&frame);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn local_probe_reads_embedded_flac_tags_and_preserves_identity() {
+        let path = tagged_flac(&[
+            "TITLE=  Mon Amour  ",
+            "ARTIST=Jessie Ware",
+            "ALBUM=Superbloom",
+        ]);
+        let mut source = LocalFileSource::open(&path).unwrap();
+        let m = source.metadata();
+        assert_eq!(m.title, "Mon Amour");
+        assert_eq!(m.artist, "Jessie Ware");
+        assert_eq!(m.album.as_deref(), Some("Superbloom"));
+        assert_eq!(m.id, path.file_stem().unwrap().to_str().unwrap());
+        assert_eq!(m.provider_id, path.to_string_lossy());
+        let samples = source.next_chunk().unwrap().unwrap();
+        assert_eq!(samples.len(), 32);
+        assert!(samples.iter().all(|sample| *sample == 0.0));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn local_probe_falls_back_only_for_missing_tags() {
+        let path = tagged_flac(&["TITLE=   ", "ARTIST=", "ALBUMARTIST=Album Artist"]);
+        let source = LocalFileSource::open(&path).unwrap();
+        assert_eq!(
+            source.metadata().title,
+            path.file_stem().unwrap().to_str().unwrap()
+        );
+        assert_eq!(source.metadata().artist, "Album Artist");
+        std::fs::remove_file(path).unwrap();
+        let path = tagged_flac(&[]);
+        let source = LocalFileSource::open(&path).unwrap();
+        assert_eq!(source.metadata().artist, "Unknown");
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn to_stereo_duplicates_mono() {

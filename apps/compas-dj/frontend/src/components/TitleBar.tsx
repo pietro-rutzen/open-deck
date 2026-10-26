@@ -1,13 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Logo } from "./Logo";
 import { Icon } from "./icons";
-import { buildInfo, checkForUpdate, inTauri, type BuildInfo, type EngineLoad, type MasterMeter } from "../lib/ipc";
+import { buildInfo, checkForUpdate, inTauri, onEngineLoad, onMasterMeter, type BuildInfo, type EngineLoad, type MasterMeter } from "../lib/ipc";
 
 export function TitleBar({
   masterBpm,
-  master,
-  load,
   syncEnabled = false,
   syncActive = false,
   onSync,
@@ -29,8 +25,6 @@ export function TitleBar({
   onToggleContrast,
 }: {
   masterBpm: number | null;
-  master: MasterMeter;
-  load?: EngineLoad;
   syncEnabled?: boolean;
   syncActive?: boolean;
   onSync?: () => void;
@@ -52,15 +46,25 @@ export function TitleBar({
   onToggleContrast?: () => void;
 }) {
   const bar = (v: number) => `${Math.min(100, Math.sqrt(Math.max(0, v)) * 100)}%`;
-  const win = () => (inTauri() ? getCurrentWindow() : null);
 
   const [build, setBuild] = useState<BuildInfo | null>(null);
   const [updBusy, setUpdBusy] = useState(false);
   const [metronomeOn, setMetronomeOn] = useState(false);
   const metronomeBeat = useRef(0);
+  const [master, setMaster] = useState<MasterMeter>({ l: 0, r: 0 });
+  const [load, setLoad] = useState<EngineLoad | null>(null);
   useEffect(() => {
     if (!inTauri()) return;
     buildInfo().then(setBuild).catch(() => setBuild(null));
+  }, []);
+  useEffect(() => {
+    if (!inTauri()) return;
+    const unMeter = onMasterMeter(setMaster);
+    const unLoad = onEngineLoad(setLoad);
+    return () => {
+      unMeter.then((u) => u());
+      unLoad.then((u) => u());
+    };
   }, []);
   useEffect(() => {
     if (!metronomeOn) return;
@@ -100,30 +104,16 @@ export function TitleBar({
   };
   return (
     <header className="titlebar" data-tauri-drag-region>
-      {/* macOS-style controls: close / minimize / zoom */}
-      <div className="lights">
-        <button className="light" style={{ background: "#ff5f57" }} title="Close" onClick={() => win()?.close()} />
-        <button className="light" style={{ background: "#febc2e" }} title="Minimize" onClick={() => win()?.minimize()} />
-        <button className="light" style={{ background: "#28c840" }} title="Maximize" onClick={() => win()?.toggleMaximize()} />
-      </div>
       <div className="brand" data-tauri-drag-region>
-        <Logo size={22} />
-        <span className="brand-word display">compás</span>
-        <span
-          className="display"
-          style={{ fontSize: 11, opacity: 0.55, letterSpacing: "0.14em", marginLeft: 2 }}
-          title="Compás DJ — the DJ/performance product in the Compás family"
-        >
-          DJ
-        </span>
+        <span className="brand-mark" aria-hidden="true">◧</span>
+        <span className="brand-word">OpenDeck</span>
       </div>
-
       <div className="master-cluster" data-tauri-drag-region>
         <div className="master-pill">
           <div className="master-bpm">
             <span className="overline">MASTER</span>
             <span className="mono master-bpm-val">
-              {masterBpm ? masterBpm.toFixed(1) : "—"}
+              {masterBpm ? masterBpm.toFixed(2) : "—"}
               <small>BPM</small>
             </span>
           </div>
@@ -211,11 +201,11 @@ export function TitleBar({
             className="mono build-chip"
             onClick={onCheckUpdate}
             disabled={updBusy}
-            title={`Compás DJ ${build.version} · ${build.sha}${
+            title={`OpenDeck ${build.version} · ${build.sha}${
               build.built_at ? ` · built ${new Date(Number(build.built_at) * 1000).toISOString().slice(0, 16).replace("T", " ")} UTC` : ""
-            } · click to check for updates`}
+            } · local prototype information`}
           >
-            {updBusy ? "…" : `v${build.version} · ${build.sha}`}
+            {updBusy ? "…" : `v${build.version}`}
           </button>
         )}
         <button

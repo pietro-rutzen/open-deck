@@ -2,9 +2,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { ask, message, open, save } from "@tauri-apps/plugin-dialog";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check as checkUpdate } from "@tauri-apps/plugin-updater";
+import { message, open, save } from "@tauri-apps/plugin-dialog";
 
 /** True when running inside the Tauri webview (vs. a plain browser dev tab). */
 export function inTauri(): boolean {
@@ -34,14 +32,14 @@ export interface DeckLoaded {
   replay_gain: number;
 }
 
-/** Convert a `[low, mid, high]` band-energy triple into a CSS rgb() string for waveform coloring
- *  (low→red, mid→green, high→blue), brightened so quiet bins stay visible. */
+/** Frequency colors are independent of deck identity: blue lows, amber mids, pale highs. */
 export const bandColor = ([low, mid, high]: [number, number, number]): string => {
-  const max = Math.max(low, mid, high, 1e-4);
-  const r = Math.round((low / max) * 255);
-  const g = Math.round((mid / max) * 255);
-  const b = Math.round((high / max) * 255);
-  return `rgb(${r}, ${g}, ${b})`;
+  const weights = [low, mid, high].map((v) => Number.isFinite(v) ? Math.max(0, v) : 0);
+  const sum = weights.reduce((a, b) => a + b, 0);
+  if (sum <= 1e-8) return "rgb(92, 110, 130)";
+  const palette = [[67, 151, 239], [244, 173, 66], [242, 244, 248]];
+  const dominant = weights[0] >= weights[1] && weights[0] >= weights[2] ? 0 : weights[1] >= weights[2] ? 1 : 2;
+  return `rgb(${palette[dominant].join(", ")})`;
 };
 
 /** How a musical key is displayed: Camelot wheel codes (8A/7B) or standard names (C#m/D). */
@@ -107,6 +105,7 @@ export const transposeKey = (
 };
 
 export interface DeckPosition {
+  tempo_only: boolean;
   deck: number;
   frame: number;
   playing: boolean;
@@ -203,43 +202,12 @@ export async function exportDiagnostics(settings: Record<string, unknown> = {}):
   return true;
 }
 
-/**
- * Manual update check (fired from the title-bar version chip). Talks to the configured
- * GitHub Releases `latest.json` endpoint; if a newer signed build exists, prompts the
- * user before downloading, then offers to restart. Silent + safe to call repeatedly.
- *
- * Returns `true` only when an update was applied and the relaunch was queued — callers
- * use this to put the chip into a "restarting…" state. Any failure is surfaced via a
- * dialog and the function resolves to `false` so the chip returns to idle.
- */
+/** Explain the local source-update workflow; this fork never installs upstream releases. */
 export async function checkForUpdate(): Promise<boolean> {
-  try {
-    const upd = await checkUpdate();
-    if (!upd) {
-      await message("You're on the latest version.", { title: "compas — up to date", kind: "info" });
-      return false;
-    }
-    const ok = await ask(
-      `compas ${upd.version} is available (you're on ${upd.currentVersion}).\n\nDownload and install now? The app will restart.`,
-      { title: "Update available", kind: "info", okLabel: "Update", cancelLabel: "Later" },
-    );
-    if (!ok) return false;
-    await upd.downloadAndInstall();
-    await relaunch();
-    return true;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    // Before the first published release (or if the release feed is briefly unreachable),
-    // the updater can't fetch/parse `latest.json` and throws a parse/404/network error.
-    // That isn't a real failure — there's simply nothing newer — so present it as "up to date"
-    // rather than a scary raw error. Genuine unexpected errors still surface.
-    const benign = /expected value|expected ident|EOF|decoding response|invalid|json|404|not found|could not fetch|fetch|network|dns|timed out|timeout|connection/i.test(msg);
-    await message(
-      benign ? "You're on the latest version." : `Update check failed:\n\n${msg}`,
-      { title: benign ? "compas — up to date" : "compas — update check", kind: benign ? "info" : "error" },
-    );
-    return false;
-  }
+  await message("This local OpenDeck prototype is updated from its source checkout.", {
+    title: "OpenDeck prototype", kind: "info",
+  });
+  return false;
 }
 
 const AUDIO_FILTERS = [
@@ -341,6 +309,21 @@ export const rescanWatchFolders = () => invoke<number>("rescan_watch_folders");
 /** Fires after a watched-folder scan imports tracks — refresh the library view. */
 export const onLibraryChanged = (cb: () => void): Promise<UnlistenFn> =>
   listen("library:changed", () => cb());
+
+export interface PathMove {
+  from: string;
+  to: string;
+}
+
+/** Rename the files in one folder so Finder's name order matches `paths`. */
+export const reorderFolderTracks = (paths: string[]) => invoke<PathMove[]>("reorder_folder_tracks", { paths });
+
+/** Move audio files from elsewhere on the computer into a library folder that is open. */
+export const moveIntoFolder = (folder: string, paths: string[]) =>
+  invoke("move_into_open_folder", { folder, paths });
+
+export const onLibraryPathsMoved = (cb: (moves: PathMove[]) => void): Promise<UnlistenFn> =>
+  listen<PathMove[]>("library:paths-moved", (event) => cb(event.payload));
 export const dbTrackState = (path: string) => invoke<DbTrackState>("db_track_state", { path });
 export const dbSetCue = (path: string, slot: number, frame: number) =>
   invoke("db_set_cue", { path, slot, frame });
@@ -367,6 +350,8 @@ export const dbUpsertAnalysis = (t: DeckLoaded) =>
     keyName: t.key_name,
   });
 export const dbRecordPlay = (path: string) => invoke("db_record_play", { path });
+export const dbResetPlayCounts = (folder: string | null) =>
+  invoke<number>("db_reset_play_counts", { folder });
 export const dbHistory = (limit: number) => invoke<DbHistory[]>("db_history", { limit });
 // ---- Library: search + crates/playlists -------------------------------------------
 export interface DbCrate {
@@ -451,6 +436,17 @@ export interface ControllerProfile {
   bindings: ControllerBinding[];
   script?: string | null;
 }
+/** Authoritative native controller connection and active profile snapshot. */
+export interface ControllerSession {
+  connected: string | null;
+  profile: ControllerProfile | null;
+  auto_paused: boolean;
+  error: string | null;
+}
+export const controllerSession = () => invoke<ControllerSession>("controller_session");
+export const onControllerSession = (cb: (session: ControllerSession) => void): Promise<UnlistenFn> =>
+  listen<ControllerSession>("controller:session", (event) => cb(event.payload));
+
 /** A mappable control from the engine's control-bus registry (for the learn editor). */
 export interface ControlSpec {
   id: string;
@@ -496,13 +492,44 @@ export const controllerDeactivate = () => invoke("controller_deactivate");
 export const controllerFeedback = (control: string, value: number) =>
   invoke("controller_feedback", { control, value });
 
+/** While learning, the native controller thread republishes profile-bound MIDI as raw input. */
+export const controllerLearn = (active: boolean) => invoke("controller_learn", { active });
+
+let rawMidiHolders = 0;
+/** Keeps raw MIDI flowing to the UI until every holder has released. */
+export const holdRawMidi = (): (() => void) => {
+  rawMidiHolders += 1;
+  if (rawMidiHolders === 1 && inTauri()) controllerLearn(true).catch(() => {});
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    rawMidiHolders -= 1;
+    if (rawMidiHolders === 0 && inTauri()) controllerLearn(false).catch(() => {});
+  };
+};
+
 /** A resolved control change from the active controller profile: control-bus id + engine value. */
 export interface ControllerUpdate {
   control: string;
   value: number;
+  /** Engine read position captured natively when the message arrived (deck actions only). */
+  frame?: number;
+  /** Audible position captured natively when the message arrived (deck actions only). */
+  heard_frame?: number;
 }
 export const onControllerUpdate = (cb: (u: ControllerUpdate) => void): Promise<UnlistenFn> =>
   listen<ControllerUpdate>("controller:update", (e) => cb(e.payload));
+
+/** Continuous controller changes coalesced natively to display rate. */
+export interface ControllerBatch {
+  /** Already applied to the engine natively; reflect in UI state without re-sending. */
+  mirror: ControllerUpdate[];
+  /** Continuous controls the UI applies through its setters. */
+  updates: ControllerUpdate[];
+}
+export const onControllerBatch = (cb: (batch: ControllerBatch) => void): Promise<UnlistenFn> =>
+  listen<ControllerBatch>("controller:batch", (e) => cb(e.payload));
 
 // ---- HID controllers (non-class-compliant: NI Traktor, etc.) ---------------------
 export interface HidDeviceInfo {
@@ -566,6 +593,8 @@ export const setDeckXfaderAssign = (deck: number, assign: number) =>
 export const setDeckGain = (deck: number, gain: number) => invoke("set_deck_gain", { deck, gain });
 export const setDeckEq = (deck: number, low: number, mid: number, high: number) =>
   invoke("set_deck_eq", { deck, low, mid, high });
+export const setDeckEqBand = (deck: number, band: number, db: number) =>
+  invoke("set_deck_eq_band", { deck, band, db });
 export const setDeckFilter = (deck: number, mode: FilterMode, cutoff: number, resonance: number) =>
   invoke("set_deck_filter", { deck, mode, cutoff, resonance });
 /** Echo/delay insert. `timeSec` is the delay time (UI beat-syncs it); feedback 0..0.95, mix 0..1. */
@@ -672,6 +701,7 @@ export interface MidiCc {
   channel: number;
   controller: number;
   value: number;
+  consumed: boolean;
 }
 export const onMidiCc = (cb: (e: MidiCc) => void): Promise<UnlistenFn> =>
   listen<MidiCc>("midi:cc", (e) => cb(e.payload));
@@ -681,6 +711,7 @@ export interface MidiNote {
   note: number;
   velocity: number;
   on: boolean;
+  consumed: boolean;
 }
 export const onMidiNote = (cb: (e: MidiNote) => void): Promise<UnlistenFn> =>
   listen<MidiNote>("midi:note", (e) => cb(e.payload));
@@ -703,9 +734,32 @@ export async function pickRecordingPath(): Promise<string | null> {
 
 // ---- Headphone / cue monitoring ---------------------------------------------------
 
+export interface OutputDeviceInfo {
+  name: string;
+  channels: number;
+  sample_rate: number;
+}
+export interface CueSession {
+  enabled: boolean;
+  device: string | null;
+  /** Zero-based first channel of the configured stereo headphone pair. */
+  first_channel: number;
+  connected_name: string | null;
+  mix: number;
+  volume: number;
+  cued: number[];
+  error: string | null;
+}
+export const cueSession = () => invoke<CueSession>("cue_session");
+export const listOutputDeviceDetails = () => invoke<OutputDeviceInfo[]>("list_output_device_details");
+export const configureCueOutput = (device: string | null, firstChannel: number) =>
+  invoke<CueSession>("configure_cue_output", { device, firstChannel });
+export const onCueSession = (cb: (session: CueSession) => void): Promise<UnlistenFn> =>
+  listen<CueSession>("cue:session", (event) => cb(event.payload));
+
 /** List output devices the headphone cue can target (first is usually the system default). */
 export const listOutputDevices = () => invoke<string[]>("list_output_devices");
-/** Start cue monitoring on `device` (omit for the default output); returns the device name. */
+/** Start the validated configured cue route (or an explicit device); returns the device name. */
 export const startCueOutput = (device?: string) =>
   invoke<string>("start_cue_output", { device: device ?? null });
 export const stopCueOutput = () => invoke("stop_cue_output");
@@ -770,3 +824,8 @@ export const onMasterMeter = (cb: (e: MasterMeter) => void): Promise<UnlistenFn>
   listen<MasterMeter>("master:level", (e) => cb(e.payload));
 export const onEngineLoad = (cb: (e: EngineLoad) => void): Promise<UnlistenFn> =>
   listen<EngineLoad>("engine:load", (e) => cb(e.payload));
+
+/** Prioritize the selected library track without launching another analysis worker. */
+export const prioritizeAnalysis = (path: string) => invoke<void>("prioritize_analysis", { path });
+
+export const setDeckTrim = (deck: number, gain: number) => invoke<void>("set_deck_trim", { deck, gain });

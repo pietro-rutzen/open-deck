@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   dbAddTrack,
   dbListTracks,
@@ -33,14 +33,16 @@ async function migrateLegacy(): Promise<void> {
 }
 
 /** Local track library, persisted in SQLite. Tracks are probed (cheap header read) on add;
- *  full BPM/key analysis is cached when a track is loaded onto a deck. */
+ *  BPM/key analysis arrives from the background worker and is also cached on deck load. */
 export function useLibrary() {
   const [tracks, setTracks] = useState<DbTrack[]>([]);
   const [busy, setBusy] = useState(false);
 
+  const refreshGeneration = useRef(0);
   const refresh = useCallback(() => {
     if (!inTauri()) return;
-    dbListTracks().then(setTracks).catch(() => {});
+    const generation = ++refreshGeneration.current;
+    dbListTracks().then((rows) => { if (generation === refreshGeneration.current) setTracks(rows); }).catch(() => {});
   }, []);
 
   useEffect(() => {

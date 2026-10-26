@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS tracks (
     gain              REAL NOT NULL DEFAULT 1.0,
     added_at          INTEGER NOT NULL,
     last_played_at    INTEGER,
-    play_count        INTEGER NOT NULL DEFAULT 0
+    play_count        INTEGER NOT NULL DEFAULT 0,
+    analysis_rev      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS cues (
@@ -93,6 +94,19 @@ CREATE TABLE IF NOT EXISTS watch_folders (
     path     TEXT PRIMARY KEY,
     added_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS track_visuals (
+    path          TEXT PRIMARY KEY REFERENCES tracks(path) ON DELETE CASCADE,
+    file_size     INTEGER NOT NULL,
+    modified_ms   INTEGER NOT NULL,
+    peaks         BLOB NOT NULL,
+    band_peaks    BLOB NOT NULL,
+    artwork       BLOB,
+    artwork_mime  TEXT,
+    title         TEXT,
+    artist        TEXT,
+    album         TEXT
+);
 ";
 
 /// SQL fragment selecting a comma-joined `tags` column for a track. `path_expr` is how the track's
@@ -108,8 +122,15 @@ pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Db> {
     // Idempotent migration for DBs created before smart crates: add the column if missing.
     // (Errors — i.e. "duplicate column" — are expected and ignored.)
     let _ = conn.execute("ALTER TABLE crates ADD COLUMN query TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE tracks ADD COLUMN analysis_rev INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     Ok(Db(Mutex::new(conn)))
 }
+
+/// Bump when the offline tempo/key estimator changes so existing rows are analyzed again.
+pub const ANALYSIS_REVISION: i64 = 4;
 
 /// A fresh in-memory connection with the schema applied — shared by unit tests across modules
 /// (e.g. the `export` round-trip tests) so the schema lives in exactly one place.
@@ -229,6 +250,45 @@ pub fn add_track(
     )
 }
 
+/// Repair only importer placeholders; leave saved edits, cues and analysis intact.
+pub fn fill_missing_metadata(
+    c: &Connection,
+    path: &str,
+    title: Option<&str>,
+    artist: Option<&str>,
+) -> rusqlite::Result<usize> {
+    let existing: Option<(String, String)> = c
+        .query_row(
+            "SELECT title, artist FROM tracks WHERE path = ?1",
+            params![path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((old_title, old_artist)) = existing else {
+        return Ok(0);
+    };
+    let stem = Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let placeholder = |s: &str| s.trim().is_empty() || s.trim().eq_ignore_ascii_case("unknown");
+    let new_title = title
+        .filter(|s| !s.trim().is_empty())
+        .filter(|_| placeholder(&old_title) || old_title == stem)
+        .unwrap_or(&old_title);
+    let new_artist = artist
+        .filter(|s| !s.trim().is_empty())
+        .filter(|_| placeholder(&old_artist))
+        .unwrap_or(&old_artist);
+    if new_title == old_title && new_artist == old_artist {
+        return Ok(0);
+    }
+    c.execute(
+        "UPDATE tracks SET title = ?2, artist = ?3 WHERE path = ?1",
+        params![path, new_title, new_artist],
+    )
+}
+
 /// Normalize a tag: trimmed, lowercased, commas (the GROUP_CONCAT separator) removed.
 fn clean_tag(tag: &str) -> String {
     tag.trim().to_ascii_lowercase().replace(',', "")
@@ -293,6 +353,85 @@ pub fn remove_track(c: &Connection, path: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Drop library rows under `roots` whose files are gone. A root that is not a directory
+/// (unmounted volume, renamed folder) is ignored so a missing disk cannot empty the library.
+pub fn forget_tracks_missing_under(c: &Connection, roots: &[String]) -> rusqlite::Result<usize> {
+    let roots: Vec<String> = roots
+        .iter()
+        .map(|root| root.trim_end_matches(['/', '\\']).to_string())
+        .filter(|root| !root.is_empty() && Path::new(root).is_dir())
+        .collect();
+    if roots.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = c.prepare("SELECT path FROM tracks")?;
+    let paths: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let mut removed = 0usize;
+    for path in paths {
+        let inside = roots.iter().any(|root| {
+            path == *root
+                || path.starts_with(&format!("{root}/"))
+                || path.starts_with(&format!("{root}\\"))
+        });
+        if !inside || Path::new(&path).is_file() {
+            continue;
+        }
+        remove_track(c, &path)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// Point every row that identifies a track at its new file path. Cues, loops, tags, visuals,
+/// crates and play history move with it. Foreign keys are off for this transaction because the
+/// path is the primary key and the swap goes through a temporary key.
+pub fn relocate_tracks(c: &Connection, moves: &[(String, String)]) -> rusqlite::Result<()> {
+    let changed: Vec<&(String, String)> = moves.iter().filter(|(from, to)| from != to).collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    c.execute_batch("PRAGMA foreign_keys = OFF")?;
+    let outcome = relocate_tracks_unlocked(c, &changed);
+    c.execute_batch("PRAGMA foreign_keys = ON")?;
+    outcome
+}
+
+fn relocate_tracks_unlocked(c: &Connection, moves: &[&(String, String)]) -> rusqlite::Result<()> {
+    let tx = c.unchecked_transaction()?;
+    for (index, (from, _)) in moves.iter().enumerate() {
+        point_track(&tx, from, &format!("\u{1}opendeck-reorder:{index}"))?;
+    }
+    for (index, (_, to)) in moves.iter().enumerate() {
+        point_track(&tx, &format!("\u{1}opendeck-reorder:{index}"), to)?;
+    }
+    tx.commit()
+}
+
+fn point_track(c: &Connection, from: &str, to: &str) -> rusqlite::Result<()> {
+    for statement in [
+        "UPDATE cues SET track_path = ?2 WHERE track_path = ?1",
+        "UPDATE loops SET track_path = ?2 WHERE track_path = ?1",
+        "UPDATE history SET track_path = ?2 WHERE track_path = ?1",
+        "UPDATE crate_tracks SET track_path = ?2 WHERE track_path = ?1",
+        "UPDATE track_tags SET track_path = ?2 WHERE track_path = ?1",
+        "UPDATE track_visuals SET path = ?2 WHERE path = ?1",
+    ] {
+        c.execute(statement, params![from, to])?;
+    }
+    let updated = c.execute(
+        "UPDATE tracks SET path = ?2 WHERE path = ?1",
+        params![from, to],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::QueryReturnedNoRows)
+    }
+}
+
 /// Cache analysis results onto an existing track row (no-op if the track isn't in the library).
 #[allow(clippy::too_many_arguments)]
 pub fn upsert_analysis(
@@ -307,7 +446,8 @@ pub fn upsert_analysis(
 ) -> rusqlite::Result<()> {
     c.execute(
         "UPDATE tracks SET bpm = ?2, bpm_confidence = ?3, first_beat_sec = ?4,
-                beat_interval_sec = ?5, key_camelot = ?6, key_name = ?7
+                beat_interval_sec = ?5, key_camelot = ?6, key_name = ?7,
+                analysis_rev = ?8
          WHERE path = ?1",
         params![
             path,
@@ -316,18 +456,22 @@ pub fn upsert_analysis(
             first_beat_sec,
             beat_interval_sec,
             key_camelot,
-            key_name
+            key_name,
+            ANALYSIS_REVISION
         ],
     )?;
     Ok(())
 }
 
-/// Paths of library tracks that have never been analyzed (no BPM cached yet), newest first. The
-/// background analyzer drains this: on success it writes a real BPM, on decode failure a 0 sentinel,
-/// so a row goes NULL → non-NULL exactly once and is never reprocessed in a loop.
+/// Paths still needing analysis: no BPM yet, or a successful read from an older estimator.
+/// A decode failure stores BPM 0 at the current revision and is not retried.
 pub fn list_unanalyzed(c: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = c.prepare("SELECT path FROM tracks WHERE bpm IS NULL ORDER BY added_at DESC")?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut stmt = c.prepare(
+        "SELECT path FROM tracks
+         WHERE bpm IS NULL OR (bpm > 0 AND analysis_rev < ?1)
+         ORDER BY added_at DESC",
+    )?;
+    let rows = stmt.query_map(params![ANALYSIS_REVISION], |r| r.get::<_, String>(0))?;
     rows.collect()
 }
 
@@ -430,6 +574,40 @@ pub fn set_gain(c: &Connection, path: &str, gain: f64) -> rusqlite::Result<()> {
         params![path, gain],
     )?;
     Ok(())
+}
+
+fn folder_like_prefix(folder: &str) -> String {
+    let trimmed = folder.trim_end_matches(['/', '\\']);
+    let slash = if trimmed.contains('\\') && !trimmed.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    let mut escaped = String::new();
+    for ch in trimmed.chars() {
+        if ch == '\\' || ch == '%' || ch == '_' {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped.push(slash);
+    escaped.push('%');
+    escaped
+}
+
+/// Clear played marks. `folder` limits the reset to files inside that directory.
+pub fn reset_play_counts(c: &Connection, folder: Option<&str>) -> rusqlite::Result<usize> {
+    match folder {
+        None => c.execute(
+            "UPDATE tracks SET play_count = 0, last_played_at = NULL WHERE play_count > 0",
+            [],
+        ),
+        Some(folder) => c.execute(
+            "UPDATE tracks SET play_count = 0, last_played_at = NULL
+             WHERE play_count > 0 AND path LIKE ?1 ESCAPE '\\'",
+            params![folder_like_prefix(folder)],
+        ),
+    }
 }
 
 /// Bump play count + last-played and append to the history log.
@@ -696,6 +874,139 @@ pub fn crate_tracks(c: &Connection, crate_id: i64) -> rusqlite::Result<Vec<Track
     rows.collect()
 }
 
+pub struct CachedVisual {
+    pub peaks: Vec<f32>,
+    pub band_peaks: Vec<[f32; 3]>,
+    pub artwork: Option<Vec<u8>>,
+    pub artwork_mime: Option<String>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+}
+
+fn pack_f32(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn unpack_f32(bytes: &[u8]) -> Option<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
+    )
+}
+
+fn unpack_bands(bytes: &[u8]) -> Option<Vec<[f32; 3]>> {
+    let values = unpack_f32(bytes)?;
+    if !values.len().is_multiple_of(3) {
+        return None;
+    }
+    Some(
+        values
+            .chunks_exact(3)
+            .map(|band| [band[0], band[1], band[2]])
+            .collect(),
+    )
+}
+
+pub fn load_track_visual(
+    c: &Connection,
+    path: &str,
+    file_size: i64,
+    modified_ms: i64,
+) -> rusqlite::Result<Option<CachedVisual>> {
+    let row = c
+        .query_row(
+            "SELECT peaks, band_peaks, artwork, artwork_mime, title, artist, album
+             FROM track_visuals WHERE path = ?1 AND file_size = ?2 AND modified_ms = ?3",
+            params![path, file_size, modified_ms],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((peaks, bands, artwork, artwork_mime, title, artist, album)) = row else {
+        return Ok(None);
+    };
+    let Some(peaks) = unpack_f32(&peaks).filter(|values| values.len() == 128) else {
+        return Ok(None);
+    };
+    let Some(band_peaks) = unpack_bands(&bands).filter(|values| values.len() == 128) else {
+        return Ok(None);
+    };
+    Ok(Some(CachedVisual {
+        peaks,
+        band_peaks,
+        artwork,
+        artwork_mime,
+        title,
+        artist,
+        album,
+    }))
+}
+
+pub fn save_track_visual(
+    c: &Connection,
+    path: &str,
+    file_size: i64,
+    modified_ms: i64,
+    peaks: &[f32],
+    band_peaks: &[[f32; 3]],
+    artwork: Option<&[u8]>,
+    artwork_mime: Option<&str>,
+    title: Option<&str>,
+    artist: Option<&str>,
+    album: Option<&str>,
+) -> rusqlite::Result<()> {
+    if peaks.len() != 128 || band_peaks.len() != 128 {
+        return Ok(());
+    }
+    let flat_bands: Vec<f32> = band_peaks.iter().flatten().copied().collect();
+    c.execute(
+        "INSERT INTO track_visuals (path, file_size, modified_ms, peaks, band_peaks, artwork, artwork_mime, title, artist, album)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(path) DO UPDATE SET
+            file_size = excluded.file_size,
+            modified_ms = excluded.modified_ms,
+            peaks = excluded.peaks,
+            band_peaks = excluded.band_peaks,
+            artwork = excluded.artwork,
+            artwork_mime = excluded.artwork_mime,
+            title = excluded.title,
+            artist = excluded.artist,
+            album = excluded.album",
+        params![
+            path,
+            file_size,
+            modified_ms,
+            pack_f32(peaks),
+            pack_f32(&flat_bands),
+            artwork,
+            artwork_mime,
+            title,
+            artist,
+            album,
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,6 +1015,32 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch(SCHEMA).unwrap();
         c
+    }
+
+    #[test]
+    fn metadata_repair_preserves_saved_state_and_explicit_text() {
+        let c = open_in_memory();
+        let path = "/tmp/track.flac";
+        add_track(&c, path, "track", "Unknown", 1000).unwrap();
+        set_gain(&c, path, 0.7).unwrap();
+        set_cue(&c, path, 0, 123.0).unwrap();
+        add_tag(&c, path, "favorite").unwrap();
+        record_play(&c, path).unwrap();
+        assert_eq!(
+            fill_missing_metadata(&c, path, Some("Real title"), Some("Real artist")).unwrap(),
+            1
+        );
+        assert_eq!(
+            fill_missing_metadata(&c, path, Some("Other"), Some("Other")).unwrap(),
+            0
+        );
+        let row = list_tracks(&c).unwrap().remove(0);
+        assert_eq!(row.title, "Real title");
+        assert_eq!(row.artist, "Real artist");
+        assert_eq!(row.gain, 0.7);
+        assert_eq!(row.play_count, 1);
+        assert_eq!(row.tags, vec!["favorite"]);
+        assert_eq!(track_state(&c, path).unwrap().cues[0].frame, 123.0);
     }
 
     #[test]
@@ -764,6 +1101,39 @@ mod tests {
         assert_eq!(rows[0].play_count, 2);
         assert!(rows[0].last_played_at.is_some());
         assert_eq!(history(&c, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reset_play_counts_can_clear_one_folder_or_the_library() {
+        let c = mem();
+        add_track(&c, "/music/br/a.mp3", "A", "Ar", 1).unwrap();
+        add_track(&c, "/music/br/deep/b.mp3", "B", "Ar", 1).unwrap();
+        add_track(&c, "/music/br2/c.mp3", "C", "Ar", 1).unwrap();
+        add_track(&c, "/music/house/d.mp3", "D", "Ar", 1).unwrap();
+        for path in [
+            "/music/br/a.mp3",
+            "/music/br/deep/b.mp3",
+            "/music/br2/c.mp3",
+            "/music/house/d.mp3",
+        ] {
+            record_play(&c, path).unwrap();
+        }
+        assert_eq!(reset_play_counts(&c, Some("/music/br")).unwrap(), 2);
+        let played = |path: &str| {
+            list_tracks(&c)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.path == path)
+                .unwrap()
+                .play_count
+        };
+        assert_eq!(played("/music/br/a.mp3"), 0);
+        assert_eq!(played("/music/br/deep/b.mp3"), 0);
+        assert_eq!(played("/music/br2/c.mp3"), 1);
+        assert_eq!(played("/music/house/d.mp3"), 1);
+        assert_eq!(reset_play_counts(&c, None).unwrap(), 2);
+        assert_eq!(played("/music/house/d.mp3"), 0);
+        assert_eq!(history(&c, 10).unwrap().len(), 4);
     }
 
     #[test]
@@ -974,5 +1344,87 @@ mod tests {
         // A 0-BPM sentinel (decode failure / no beat) still counts as attempted → not retried.
         upsert_analysis(&c, "/b.mp3", 0.0, 0.0, 0.0, 0.0, "", "").unwrap();
         assert!(list_unanalyzed(&c).unwrap().is_empty());
+    }
+
+    #[test]
+    fn track_visual_cache_matches_file_stamp_and_discards_a_changed_file() {
+        let c = mem();
+        add_track(&c, "/music/a.mp3", "A", "Ar", 1).unwrap();
+        let peaks = vec![0.25_f32; 128];
+        let bands = vec![[0.1_f32, 0.2, 0.3]; 128];
+        save_track_visual(
+            &c,
+            "/music/a.mp3",
+            100,
+            50,
+            &peaks,
+            &bands,
+            Some(&[0xff, 0xd8, 0xff]),
+            Some("image/jpeg"),
+            Some("Title"),
+            Some("Artist"),
+            Some("Album"),
+        )
+        .unwrap();
+        let hit = load_track_visual(&c, "/music/a.mp3", 100, 50)
+            .unwrap()
+            .expect("cached preview");
+        assert_eq!(hit.peaks, peaks);
+        assert_eq!(hit.band_peaks, bands);
+        assert_eq!(hit.artwork.as_deref(), Some(&[0xff, 0xd8, 0xff][..]));
+        assert_eq!(hit.title.as_deref(), Some("Title"));
+        assert!(load_track_visual(&c, "/music/a.mp3", 101, 50)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn relocating_a_track_keeps_its_cue_on_the_new_path() {
+        let c = mem();
+        add_track(&c, "/music/a.mp3", "A", "Ar", 1).unwrap();
+        set_cue(&c, "/music/a.mp3", 0, 42.0).unwrap();
+        relocate_tracks(
+            &c,
+            &[("/music/a.mp3".to_string(), "/music/01 - a.mp3".to_string())],
+        )
+        .unwrap();
+        assert!(!track_exists(&c, "/music/a.mp3").unwrap());
+        assert!(track_exists(&c, "/music/01 - a.mp3").unwrap());
+        let state = track_state(&c, "/music/01 - a.mp3").unwrap();
+        assert_eq!(state.cues.len(), 1);
+        assert_eq!(state.cues[0].slot, 0);
+        assert_eq!(state.cues[0].frame, 42.0);
+    }
+
+    #[test]
+    fn a_deleted_file_inside_a_watched_folder_leaves_the_library() {
+        let dir = std::env::temp_dir().join(format!(
+            "opendeck-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kept = dir.join("kept.mp3");
+        std::fs::write(&kept, b"a").unwrap();
+        let deleted = dir.join("20 - Music.mp3");
+        let outside = "/other/stay.mp3";
+        let c = mem();
+        add_track(&c, kept.to_str().unwrap(), "Kept", "A", 1).unwrap();
+        add_track(&c, deleted.to_str().unwrap(), "Gone", "A", 1).unwrap();
+        add_track(&c, outside, "Stay", "A", 1).unwrap();
+        let root = dir.to_str().unwrap().to_string();
+        assert_eq!(forget_tracks_missing_under(&c, &[root]).unwrap(), 1);
+        assert!(track_exists(&c, kept.to_str().unwrap()).unwrap());
+        assert!(!track_exists(&c, deleted.to_str().unwrap()).unwrap());
+        assert!(track_exists(&c, outside).unwrap());
+        assert_eq!(
+            forget_tracks_missing_under(&c, &["/no/such/opendeck-folder".to_string()]).unwrap(),
+            0
+        );
+        assert!(track_exists(&c, kept.to_str().unwrap()).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

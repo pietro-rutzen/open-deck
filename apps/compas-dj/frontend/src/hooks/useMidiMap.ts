@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { inTauri, onMidiCc, onMidiNote } from "../lib/ipc";
+import { holdRawMidi, inTauri, onMidiCc, onMidiNote } from "../lib/ipc";
 import type { DeckController } from "./useDeck";
 import {
   ccKey,
@@ -123,6 +123,7 @@ export function useMidiMap(decks: DeckController[], extra: MidiMapExtras): MidiM
   bindingsRef.current = bindings;
   const learningRef = useRef(learning);
   learningRef.current = learning;
+  useEffect(() => (learning ? holdRawMidi() : undefined), [learning]);
   // Last CC value per source, for rising-edge detection when a knob drives a trigger.
   const lastCc = useRef<Map<MidiSourceKey, number>>(new Map());
 
@@ -170,6 +171,7 @@ export function useMidiMap(decks: DeckController[], extra: MidiMapExtras): MidiM
 
     track(
       onMidiCc((e) => {
+        if (e.consumed && !learningRef.current) return;
         const key = ccKey(e.controller);
         setLastSource(key);
         if (learningRef.current) {
@@ -191,6 +193,7 @@ export function useMidiMap(decks: DeckController[], extra: MidiMapExtras): MidiM
     track(
       onMidiNote((e) => {
         if (!e.on) return; // act on press, ignore release
+        if (e.consumed && !learningRef.current) return;
         const key = noteKey(e.note);
         setLastSource(key);
         if (learningRef.current) {

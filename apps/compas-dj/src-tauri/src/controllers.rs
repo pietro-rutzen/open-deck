@@ -8,12 +8,64 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 
-use compas_core::{ControllerProfile, InputKind, Mapping, Registry};
+use compas_audio::DeckTelemetry;
+use compas_core::{Behavior, ControllerProfile, InputKind, Mapping, Registry};
 use compas_script::ScriptRuntime;
 use midir::{MidiOutput, MidiOutputConnection};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, Manager};
+
+/// Extend the original built-in snapshot without replacing user-remapped addresses.
+pub(crate) fn upgrade_flx4_profile(mut profile: ControllerProfile) -> ControllerProfile {
+    if profile.id == "pioneer-ddj-flx4" && profile.script.is_none() {
+        if let Ok(bundled) = serde_json::from_str::<ControllerProfile>(include_str!(
+            "../resources/controllers/pioneer-ddj-flx4.json"
+        )) {
+            for binding in bundled.bindings {
+                if !profile
+                    .bindings
+                    .iter()
+                    .any(|old| old.channel == binding.channel && old.input == binding.input)
+                {
+                    profile.bindings.push(binding);
+                }
+            }
+        }
+    }
+    profile
+}
+
+fn flx4_cc_pair(
+    state: &mut [[u16; 32]; 16],
+    status: u8,
+    number: u8,
+    value: u8,
+) -> Option<(u8, u8, f64)> {
+    if status & 0xf0 != 0xb0 || value > 127 {
+        return None;
+    }
+    let ch = status & 15;
+    let base = number & 31;
+    let paired = number < 64
+        && ((ch < 2 && matches!(base, 0 | 4 | 7 | 11 | 15 | 19))
+            || (ch == 4 && base == 2)
+            || (ch == 6 && matches!(base, 8 | 12 | 13 | 23 | 24 | 31)));
+    if !paired {
+        return None;
+    }
+    let completing = number >= 32;
+    let slot = &mut state[ch as usize][base as usize];
+    *slot = if completing {
+        (*slot & 16256) | value as u16
+    } else {
+        ((value as u16) << 7) | (*slot & 127)
+    };
+    // MSB only stores the high bits. Applying it before the LSB arrives jumps by up to one coarse step.
+    completing.then_some((ch, base, *slot as f64 / 16383.0))
+}
 
 /// Number of decks the control registry is built for (matches the engine).
 const DECK_COUNT: usize = 4;
@@ -142,6 +194,218 @@ pub struct ControllerUpdateEvent {
     pub control: String,
     /// Engine-domain value (the unit the matching UI setter expects).
     pub value: f64,
+    /// Engine read position when the controller message arrived (deck-scoped actions only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<f64>,
+    /// Audible position when the controller message arrived (read position minus output latency).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heard_frame: Option<f64>,
+}
+
+impl ControllerUpdateEvent {
+    fn new(control: impl Into<String>, value: f64) -> Self {
+        Self {
+            control: control.into(),
+            value,
+            frame: None,
+            heard_frame: None,
+        }
+    }
+}
+
+/// Continuous controller changes coalesced to display rate.
+#[derive(Serialize, Clone, Default)]
+struct ControllerBatchEvent {
+    /// Already applied to the engine natively; the UI reflects them without re-sending.
+    mirror: Vec<ControllerUpdateEvent>,
+    /// Continuous controls the UI still applies through its setters.
+    updates: Vec<ControllerUpdateEvent>,
+}
+
+fn upsert_latest(pending: &mut Vec<ControllerUpdateEvent>, update: ControllerUpdateEvent) {
+    match pending
+        .iter_mut()
+        .find(|queued| queued.control == update.control)
+    {
+        Some(queued) => queued.value = update.value,
+        None => pending.push(update),
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct MidiCcEvent {
+    channel: u8,
+    controller: u8,
+    value: u8,
+    consumed: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct MidiNoteEvent {
+    channel: u8,
+    note: u8,
+    velocity: u8,
+    on: bool,
+    consumed: bool,
+}
+
+/// Raw input for MIDI learn and the legacy mapping layer.
+fn emit_raw_midi(app: &AppHandle, status: u8, data1: u8, data2: u8, consumed: bool) {
+    let channel = status & 0x0F;
+    match status & 0xF0 {
+        0x90 | 0x80 => {
+            let velocity = if status & 0xF0 == 0x90 { data2 } else { 0 };
+            let _ = app.emit(
+                "midi:note",
+                MidiNoteEvent {
+                    channel,
+                    note: data1,
+                    velocity,
+                    on: velocity > 0,
+                    consumed,
+                },
+            );
+        }
+        0xB0 => {
+            let _ = app.emit(
+                "midi:cc",
+                MidiCcEvent {
+                    channel,
+                    controller: data1,
+                    value: data2,
+                    consumed,
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Display-rate flush period for coalesced continuous controller changes.
+const UI_FLUSH: Duration = Duration::from_millis(16);
+const METER_PERIOD: Duration = Duration::from_millis(33);
+const KEEP_ALIVE: Duration = Duration::from_millis(200);
+/// Holding FLX4 LOOP IN this long engages a four-beat loop (the "4 BEAT" hardware label).
+const LOOP_IN_HOLD: Duration = Duration::from_millis(500);
+const FOUR_BEAT_LOOP_PAD: usize = 4;
+const TRANSPORT_BLINK_MS: u128 = 500;
+const FLX4_PLAY_NOTE: u8 = 0x0B;
+const FLX4_CUE_NOTE: u8 = 0x0C;
+const FLX4_LOOP_IN_NOTE: u8 = 0x10;
+const FLX4_SHIFT_NOTE: u8 = 0x3F;
+const FLX4_LOOP_IN_ADJUST_NOTE: u8 = 0x4C;
+const FLX4_LOOP_OUT_ADJUST_NOTE: u8 = 0x4E;
+const FLX4_TEMPO_RANGE_NOTE: u8 = 0x60;
+const FLX4_TRACK_LOADED_NOTES: [u8; 2] = [0x26, 0x27];
+/// Hardware tempo-fader spans. ±8% is the control-bus default, so it stays first until SHIFT+SYNC.
+const FLX4_TEMPO_RANGES: [f64; 5] = [8.0, 6.0, 10.0, 16.0, 100.0];
+/// Hot cue, beat jump, sampler, beat loop and key shift pad-mode buttons.
+const FLX4_PAD_MODE_NOTES: [u8; 5] = [0x1B, 0x20, 0x22, 0x6D, 0x6F];
+const FLX4_BROWSE_CC: u8 = 0x40;
+const FLX4_ZOOM_CC: u8 = 0x64;
+const FLX4_BROWSE_PRESS_NOTES: [u8; 2] = [0x41, 0x42];
+const FLX4_LOAD_NOTES: [u8; 2] = [0x46, 0x47];
+
+struct LoopInHold {
+    since: Instant,
+    heard_frame: Option<f64>,
+    fired: bool,
+}
+
+/// Routes resolved controller updates: natively owned controls go straight to the engine queue,
+/// continuous UI-owned controls are coalesced, discrete actions are delivered immediately.
+struct Router {
+    app: AppHandle,
+    telemetry: Arc<DeckTelemetry>,
+    batch: ControllerBatchEvent,
+    tempo_range: [f64; 2],
+}
+
+impl Router {
+    fn route(&mut self, registry: &Registry, mut update: ControllerUpdateEvent) {
+        if let Some(deck) = tempo_deck(&update.control) {
+            if let Some(range) = self.tempo_range.get(deck).copied() {
+                update.value = scale_tempo_percent(update.value, range);
+            }
+        }
+        if update.control == "mixer.crossfader" {
+            let _ = self
+                .app
+                .state::<crate::EngineHandle>()
+                .send(crate::EngineMsg::SetCrossfader(update.value as f32));
+            upsert_latest(&mut self.batch.mirror, update);
+            return;
+        }
+        if super::headphone::controller_update(&self.app, &update.control, update.value) {
+            return;
+        }
+        let eq = self.app.state::<crate::native_controls::DeckEqState>();
+        if let Some(action) =
+            crate::native_controls::resolve(&update.control, update.value, &self.telemetry, &eq)
+        {
+            if let Some(message) = action.message {
+                let _ = self.app.state::<crate::EngineHandle>().send(message);
+            }
+            if action.mirror {
+                upsert_latest(&mut self.batch.mirror, update);
+            }
+            return;
+        }
+        let continuous = registry
+            .get_str(&update.control)
+            .is_some_and(|spec| spec.behavior != Behavior::Toggle);
+        if continuous {
+            upsert_latest(&mut self.batch.updates, update);
+        } else {
+            self.emit_now(update);
+        }
+    }
+
+    fn emit_now(&mut self, mut update: ControllerUpdateEvent) {
+        if let Some(position) =
+            crate::native_controls::capture_position(&update.control, &self.telemetry)
+        {
+            update.frame.get_or_insert(position.frame);
+            update.heard_frame.get_or_insert(position.heard_frame);
+        }
+        self.flush();
+        let _ = self.app.emit("controller:update", update);
+    }
+
+    fn flush(&mut self) {
+        if self.batch.mirror.is_empty() && self.batch.updates.is_empty() {
+            return;
+        }
+        let _ = self
+            .app
+            .emit("controller:batch", std::mem::take(&mut self.batch));
+    }
+}
+
+/// Note LEDs for these controls show application state (pushed via `Feedback`), not the physical
+/// button position, so a press must not be echoed back as a momentary light.
+fn has_state_led(control: &str) -> bool {
+    control.ends_with(".headphone_cue")
+        || control.ends_with(".play")
+        || control.ends_with(".cue")
+        || control.ends_with(".sync")
+        || (control.starts_with("sampler.") && control.ends_with(".trigger"))
+        || [
+            ".hotcue.",
+            ".clear_hotcue.",
+            ".loop.",
+            ".beatloop.",
+            ".beatjump.",
+            ".key_shift.",
+        ]
+        .iter()
+        .any(|part| control.contains(part))
+        || control.starts_with("fx.toggle.")
+}
+
+/// FLX4 transport LEDs follow engine telemetry (including the paused blink) instead of UI feedback.
+fn is_native_transport_led(control: &str) -> bool {
+    control.ends_with(".play")
 }
 
 /// Messages to the controller engine thread.
@@ -162,6 +426,8 @@ pub enum ControllerMsg {
     /// Driven by the frontend whenever a control changes — from the UI *or* the controller — so the
     /// hardware tracks software state, not just controller-originated moves.
     Feedback { control: String, value: f64 },
+    /// Republish every MIDI message as raw input while a mapping is being learned.
+    Learn(bool),
 }
 
 /// Handle to the controller engine thread. The thread owns the (`!Send`) script runtime, so all it
@@ -205,14 +471,168 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
     // Last MIDI value sent per output address (status+data1), to skip redundant resends.
     let mut fb_last: HashMap<[u8; 2], u8> = HashMap::new();
 
-    for msg in rx {
+    let telemetry = app.state::<crate::EngineHandle>().telemetry.clone();
+    let mut router = Router {
+        app: app.clone(),
+        telemetry: telemetry.clone(),
+        batch: ControllerBatchEvent::default(),
+        tempo_range: [FLX4_TEMPO_RANGES[0], FLX4_TEMPO_RANGES[0]],
+    };
+    let mut flx4_profile = false;
+    let mut flx4_port = false;
+    let mut learning = false;
+    let mut desired_feedback: HashMap<String, f64> = HashMap::new();
+    let mut next_keep_alive = Instant::now();
+    let mut high_resolution = [[0_u16; 32]; 16];
+    let mut next_meter = Instant::now();
+    let mut next_flush = Instant::now();
+    let mut meter_last = [255_u8; 2];
+    let mut loop_in_holds: [Option<LoopInHold>; 2] = [None, None];
+    let mut pad_mode: [Option<u8>; 2] = [None, None];
+    let blink_epoch = Instant::now();
+    loop {
+        let now = Instant::now();
+        if flx4_profile && flx4_port && now >= next_keep_alive {
+            next_keep_alive = now + KEEP_ALIVE;
+            if let Some(port) = out.as_mut() {
+                // Mixxx FLX4 driver: hardware status query / keep-alive (not firmware update).
+                let _ = port.send(&[
+                    0xf0, 0x00, 0x40, 0x05, 0x00, 0x00, 0x04, 0x05, 0x00, 0x50, 0x02, 0xf7,
+                ]);
+            }
+            for (control, value) in &desired_feedback {
+                if is_native_transport_led(control) {
+                    continue;
+                }
+                if let Some(spec) = registry.get_str(control) {
+                    for b in &mapping.bindings {
+                        if b.control.as_str() == control {
+                            send_bound_feedback(
+                                &mut out,
+                                &mut fb_last,
+                                b.control.as_str(),
+                                b.channel,
+                                b.input,
+                                spec.behavior.to_midi(*value),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if now >= next_meter {
+            next_meter = now + METER_PERIOD;
+            if flx4_profile && flx4_port {
+                let blink_lit = blink_epoch.elapsed().as_millis() / TRANSPORT_BLINK_MS % 2 == 0;
+                for (deck, last_meter) in meter_last.iter_mut().enumerate() {
+                    let value = flx4_meter_value(telemetry.deck_level(deck));
+                    if value != *last_meter {
+                        if let Some(port) = out.as_mut() {
+                            if port.send(&[0xb0 | deck as u8, 0x02, value]).is_ok() {
+                                *last_meter = value;
+                            }
+                        }
+                    }
+                    // Engine truth: lit while playing, blinking while a loaded deck is paused.
+                    let transport_lit =
+                        telemetry.is_playing(deck) || (telemetry.is_loaded(deck) && blink_lit);
+                    send_feedback(
+                        &mut out,
+                        &mut fb_last,
+                        deck as u8,
+                        InputKind::Note {
+                            note: FLX4_PLAY_NOTE,
+                        },
+                        if transport_lit { 127 } else { 0 },
+                    );
+                    send_feedback(
+                        &mut out,
+                        &mut fb_last,
+                        deck as u8,
+                        InputKind::Note {
+                            note: FLX4_CUE_NOTE,
+                        },
+                        if telemetry.is_at_cue(deck) { 127 } else { 0 },
+                    );
+                    let loaded_value = if telemetry.is_loaded(deck) { 127 } else { 0 };
+                    let shift_channel = 8 + deck as u8 * 2;
+                    for note in FLX4_TRACK_LOADED_NOTES {
+                        send_feedback(
+                            &mut out,
+                            &mut fb_last,
+                            shift_channel,
+                            InputKind::Note { note },
+                            loaded_value,
+                        );
+                    }
+                }
+            }
+        }
+        if flx4_profile {
+            for (deck, hold) in loop_in_holds.iter_mut().enumerate() {
+                let Some(hold) = hold
+                    .as_mut()
+                    .filter(|hold| !hold.fired && now.duration_since(hold.since) >= LOOP_IN_HOLD)
+                else {
+                    continue;
+                };
+                hold.fired = true;
+                router.emit_now(ControllerUpdateEvent {
+                    heard_frame: hold.heard_frame,
+                    ..ControllerUpdateEvent::new(
+                        format!("deck.{deck}.beatloop.{FOUR_BEAT_LOOP_PAD}"),
+                        1.0,
+                    )
+                });
+            }
+        }
+        if flx4_profile {
+            let nudges = app
+                .state::<crate::flx4_runtime::JogRuntime>()
+                .take_loop_nudges();
+            for (deck, (nudge_in, nudge_out)) in nudges.into_iter().enumerate() {
+                if nudge_in != 0 {
+                    router.emit_now(ControllerUpdateEvent::new(
+                        format!("deck.{deck}.loop.nudge_in"),
+                        f64::from(nudge_in),
+                    ));
+                }
+                if nudge_out != 0 {
+                    router.emit_now(ControllerUpdateEvent::new(
+                        format!("deck.{deck}.loop.nudge_out"),
+                        f64::from(nudge_out),
+                    ));
+                }
+            }
+        }
+        if now >= next_flush {
+            next_flush = now + UI_FLUSH;
+            router.flush();
+        }
+        let wake = next_meter.min(next_flush);
+        let msg = match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+            Ok(msg) => msg,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match msg {
+            ControllerMsg::Learn(active) => learning = active,
             ControllerMsg::SetOutputPort(name) => {
+                if flx4_port {
+                    clear_flx4_deck_lights(&mut out, &mut fb_last, &mut pad_mode);
+                }
+                pad_mode = [None, None];
+                flx4_port = name.as_ref().is_some_and(|n| n.contains("DDJ-FLX4"));
+                meter_last = [255; 2];
                 out = name.and_then(|name| open_output(&name));
                 fb_last.clear(); // a fresh port's LED/fader state is unknown
             }
             ControllerMsg::Feedback { control, value } => {
-                if out.is_none() {
+                if registry.get_str(&control).is_some() && value.is_finite() {
+                    desired_feedback.insert(control.clone(), value);
+                }
+                if out.is_none() || (flx4_profile && flx4_port && is_native_transport_led(&control))
+                {
                     continue;
                 }
                 // Engine value → MIDI via the control's behavior, sent to every input bound to it.
@@ -220,12 +640,29 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                     let mv = spec.behavior.to_midi(value);
                     for b in &mapping.bindings {
                         if b.control.as_str() == control {
-                            send_feedback(&mut out, &mut fb_last, b.channel, b.input, mv);
+                            send_bound_feedback(
+                                &mut out,
+                                &mut fb_last,
+                                b.control.as_str(),
+                                b.channel,
+                                b.input,
+                                mv,
+                            );
                         }
                     }
                 }
             }
             ControllerMsg::Activate(profile) => {
+                if flx4_profile && flx4_port {
+                    clear_flx4_deck_lights(&mut out, &mut fb_last, &mut pad_mode);
+                }
+                pad_mode = [None, None];
+                flx4_profile = profile.id == "pioneer-ddj-flx4";
+                meter_last = [255; 2];
+                router.tempo_range = [FLX4_TEMPO_RANGES[0], FLX4_TEMPO_RANGES[0]];
+                clear_loop_adjust(&app);
+                loop_in_holds = [None, None];
+                high_resolution = [[0; 32]; 16];
                 mapping = profile.mapping();
                 script = profile
                     .script
@@ -246,61 +683,183 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 fb_last.clear(); // re-send feedback for the new mapping's addresses
             }
             ControllerMsg::Deactivate => {
+                if flx4_profile && flx4_port {
+                    clear_flx4_deck_lights(&mut out, &mut fb_last, &mut pad_mode);
+                }
+                pad_mode = [None, None];
+                flx4_profile = false;
+                router.tempo_range = [FLX4_TEMPO_RANGES[0], FLX4_TEMPO_RANGES[0]];
+                clear_loop_adjust(&app);
+                loop_in_holds = [None, None];
                 mapping = Mapping::default();
                 script = None;
                 current.clear();
                 fb_last.clear();
             }
-            ControllerMsg::Midi(status, d1, d2) => {
-                let channel = status & 0x0F;
-                let input = match status & 0xF0 {
-                    0xB0 => Some(InputKind::Cc { cc: d1 }),
-                    0x90 | 0x80 => Some(InputKind::Note { note: d1 }),
-                    _ => None,
-                };
-                let mut updates: Vec<ControllerUpdateEvent> = Vec::new();
-
-                if let Some(inp) = input {
-                    if let Some(u) = resolve_binding(
+            ControllerMsg::Midi(status, d1, raw_d2) => {
+                let consumed = 'resolve: {
+                    if flx4_profile {
+                        if matches!(status, 0x90 | 0x91) && d1 == FLX4_SHIFT_NOTE {
+                            send_feedback(
+                                &mut out,
+                                &mut fb_last,
+                                status & 15,
+                                InputKind::Note { note: d1 },
+                                if raw_d2 > 0 { 127 } else { 0 },
+                            );
+                            break 'resolve true;
+                        }
+                        if matches!(status, 0x90 | 0x91)
+                            && matches!(d1, FLX4_LOOP_IN_ADJUST_NOTE | FLX4_LOOP_OUT_ADJUST_NOTE)
+                        {
+                            let deck = usize::from(status & 15);
+                            let pressed = raw_d2 > 0;
+                            let edge = if !pressed {
+                                0
+                            } else if d1 == FLX4_LOOP_IN_ADJUST_NOTE {
+                                1
+                            } else {
+                                2
+                            };
+                            app.state::<crate::flx4_runtime::JogRuntime>()
+                                .set_loop_adjust(deck, edge);
+                            send_feedback(
+                                &mut out,
+                                &mut fb_last,
+                                status & 15,
+                                InputKind::Note { note: d1 },
+                                if pressed { 127 } else { 0 },
+                            );
+                            break 'resolve true;
+                        }
+                        if matches!(status, 0x90 | 0x91)
+                            && d1 == FLX4_TEMPO_RANGE_NOTE
+                            && raw_d2 > 0
+                        {
+                            let deck = usize::from(status & 15);
+                            if let Some(range) = router.tempo_range.get_mut(deck) {
+                                *range = next_tempo_range(*range);
+                                let selected = *range;
+                                if let Some(norm) =
+                                    current.get(&format!("deck.{deck}.tempo")).copied()
+                                {
+                                    router.route(
+                                        &registry,
+                                        ControllerUpdateEvent::new(
+                                            format!("deck.{deck}.tempo"),
+                                            tempo_percent_from_normalized(norm),
+                                        ),
+                                    );
+                                }
+                                router.emit_now(ControllerUpdateEvent::new(
+                                    format!("deck.{deck}.tempo_range"),
+                                    selected,
+                                ));
+                            }
+                            break 'resolve true;
+                        }
+                        if matches!(status, 0x90 | 0x91) && d1 == FLX4_LOOP_IN_NOTE {
+                            let deck = usize::from(status & 15);
+                            loop_in_holds[deck] = (raw_d2 > 0).then(|| LoopInHold {
+                                since: Instant::now(),
+                                heard_frame: crate::native_controls::capture_position(
+                                    &format!("deck.{deck}.loop.in"),
+                                    &telemetry,
+                                )
+                                .map(|position| position.heard_frame),
+                                fired: false,
+                            });
+                        }
+                        if matches!(status, 0x90 | 0x91) && FLX4_PAD_MODE_NOTES.contains(&d1) {
+                            if raw_d2 > 0 {
+                                if let Some(leds) =
+                                    flx4_pad_mode_press(&mut pad_mode, usize::from(status & 15), d1)
+                                {
+                                    if let Some(previous) = leds.clear {
+                                        send_feedback(
+                                            &mut out,
+                                            &mut fb_last,
+                                            status & 15,
+                                            InputKind::Note { note: previous },
+                                            0,
+                                        );
+                                    }
+                                    send_feedback(
+                                        &mut out,
+                                        &mut fb_last,
+                                        status & 15,
+                                        InputKind::Note { note: leds.lit },
+                                        127,
+                                    );
+                                }
+                            }
+                            break 'resolve true;
+                        }
+                        // FLX4 mixer and tempo controls transmit 14-bit MSB/LSB pairs.
+                        if let Some((ch, base, norm)) =
+                            flx4_cc_pair(&mut high_resolution, status, d1, raw_d2)
+                        {
+                            if let Some(binding) = mapping.find(ch, InputKind::Cc { cc: base }) {
+                                if let Some(spec) = registry.get(&binding.control) {
+                                    let update = ControllerUpdateEvent::new(
+                                        binding.control.as_str(),
+                                        spec.behavior.from_normalized(norm),
+                                    );
+                                    current.insert(update.control.clone(), norm);
+                                    router.route(&registry, update);
+                                }
+                            }
+                            break 'resolve true;
+                        }
+                        if status == 0xb6 && matches!(d1, FLX4_BROWSE_CC | FLX4_ZOOM_CC) {
+                            let steps = if raw_d2 < 64 {
+                                f64::from(raw_d2)
+                            } else {
+                                f64::from(raw_d2) - 128.0
+                            };
+                            let control = if d1 == FLX4_BROWSE_CC {
+                                "library.browse"
+                            } else {
+                                "waveform.zoom"
+                            };
+                            router.emit_now(ControllerUpdateEvent::new(control, steps));
+                            break 'resolve true;
+                        }
+                        if status == 0x96 && FLX4_BROWSE_PRESS_NOTES.contains(&d1) {
+                            if raw_d2 > 0 {
+                                router.emit_now(ControllerUpdateEvent::new("library.focus", 1.0));
+                            }
+                            break 'resolve true;
+                        }
+                        if status == 0x96 && FLX4_LOAD_NOTES.contains(&d1) {
+                            let deck = usize::from(d1 - FLX4_LOAD_NOTES[0]);
+                            if raw_d2 > 0 && !telemetry.is_playing(deck) {
+                                router.emit_now(ControllerUpdateEvent::new(
+                                    format!("library.load.{deck}"),
+                                    1.0,
+                                ));
+                            }
+                            break 'resolve true;
+                        }
+                    }
+                    resolve_midi(
                         &registry,
                         &mapping,
+                        script.as_ref(),
                         &mut current,
                         &mut out,
                         &mut fb_last,
-                        channel,
-                        inp,
-                        d2,
-                    ) {
-                        updates.push(u);
-                    } else if mapping.find(channel, inp).is_none() {
-                        // No declarative binding owns this input — let the script handle it.
-                        if let Some(rt) = script.as_ref() {
-                            if let Ok(ups) = rt.on_midi(status, d1, d2) {
-                                for cu in ups {
-                                    // Script `engine.set` values are normalized by convention.
-                                    let norm = cu.value.clamp(0.0, 1.0);
-                                    let value = registry
-                                        .get_str(&cu.control)
-                                        .map(|s| s.behavior.from_normalized(norm))
-                                        .unwrap_or(norm);
-                                    current.insert(cu.control.clone(), norm);
-                                    updates.push(ControllerUpdateEvent {
-                                        control: cu.control,
-                                        value,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-
-                for u in updates {
-                    let _ = app.emit("controller:update", u);
+                        &mut router,
+                        [status, d1, raw_d2],
+                    )
+                };
+                if learning || !consumed {
+                    emit_raw_midi(&app, status, d1, raw_d2, consumed);
                 }
             }
             ControllerMsg::Hid { byte, value } => {
                 // HID reports carry no MIDI channel; bindings use channel 0 + `InputKind::Hid`.
-                if let Some(u) = resolve_binding(
+                if let Some(update) = resolve_binding(
                     &registry,
                     &mapping,
                     &mut current,
@@ -310,10 +869,193 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                     InputKind::Hid { byte },
                     value,
                 ) {
-                    let _ = app.emit("controller:update", u);
+                    router.route(&registry, update);
                 }
             }
         }
+    }
+}
+
+/// Resolve a non-FLX4-specific MIDI message through the declarative bindings, then the profile
+/// script. Returns whether the active profile consumed the message.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "controller-thread state is owned by the run loop and borrowed per message"
+)]
+fn resolve_midi(
+    registry: &Registry,
+    mapping: &Mapping,
+    script: Option<&ScriptRuntime>,
+    current: &mut HashMap<String, f64>,
+    out: &mut Option<MidiOutputConnection>,
+    fb_last: &mut HashMap<[u8; 2], u8>,
+    router: &mut Router,
+    [status, d1, raw_d2]: [u8; 3],
+) -> bool {
+    let d2 = if status & 0xf0 == 0x80 { 0 } else { raw_d2 };
+    let channel = status & 0x0F;
+    let input = match status & 0xF0 {
+        0xB0 => InputKind::Cc { cc: d1 },
+        0x90 | 0x80 => InputKind::Note { note: d1 },
+        _ => return false,
+    };
+    if mapping.find(channel, input).is_some() {
+        if let Some(update) =
+            resolve_binding(registry, mapping, current, out, fb_last, channel, input, d2)
+        {
+            router.route(registry, update);
+        }
+        return true;
+    }
+    // No declarative binding owns this input — let the script handle it.
+    let Some(Ok(script_updates)) = script.map(|runtime| runtime.on_midi(status, d1, d2)) else {
+        return false;
+    };
+    if script_updates.is_empty() {
+        return false;
+    }
+    for script_update in script_updates {
+        // Script `engine.set` values are normalized by convention.
+        let norm = script_update.value.clamp(0.0, 1.0);
+        let value = registry
+            .get_str(&script_update.control)
+            .map(|spec| spec.behavior.from_normalized(norm))
+            .unwrap_or(norm);
+        current.insert(script_update.control.clone(), norm);
+        router.route(
+            registry,
+            ControllerUpdateEvent::new(script_update.control, value),
+        );
+    }
+    true
+}
+
+// Vendor E1 output table: CC2 on channels0/1, five cumulative LED ranges.
+// Our peak thresholds are -36/-24/-12/-6/0 dBFS; not a claim of rekordbox calibration.
+fn flx4_meter_value(level: f32) -> u8 {
+    if !level.is_finite() || level < 0.015848932 {
+        return 0;
+    }
+    if level < 0.06309573 {
+        0x26
+    } else if level < 0.25118864 {
+        0x41
+    } else if level < 0.5011872 {
+        0x57
+    } else if level < 1.0 {
+        0x65
+    } else {
+        0x77
+    }
+}
+fn clear_flx4_meters(out: &mut Option<MidiOutputConnection>) {
+    if let Some(port) = out.as_mut() {
+        let _ = port.send(&[0xb0, 0x02, 0]);
+        let _ = port.send(&[0xb1, 0x02, 0]);
+    }
+}
+
+struct PadModeLeds {
+    clear: Option<u8>,
+    lit: u8,
+}
+
+/// One pad-mode button per deck stays lit. Returns the previous note to extinguish, if it changed.
+fn flx4_pad_mode_press(active: &mut [Option<u8>; 2], deck: usize, note: u8) -> Option<PadModeLeds> {
+    if !FLX4_PAD_MODE_NOTES.contains(&note) {
+        return None;
+    }
+    let slot = active.get_mut(deck)?;
+    let clear = (*slot).filter(|previous| *previous != note);
+    *slot = Some(note);
+    Some(PadModeLeds { clear, lit: note })
+}
+
+fn clear_flx4_deck_lights(
+    out: &mut Option<MidiOutputConnection>,
+    fb_last: &mut HashMap<[u8; 2], u8>,
+    pad_mode: &mut [Option<u8>; 2],
+) {
+    clear_flx4_meters(out);
+    for deck in 0..2u8 {
+        send_feedback(
+            out,
+            fb_last,
+            deck,
+            InputKind::Note {
+                note: FLX4_PLAY_NOTE,
+            },
+            0,
+        );
+        if let Some(note) = pad_mode[deck as usize].take() {
+            send_feedback(out, fb_last, deck, InputKind::Note { note }, 0);
+        }
+        for note in [
+            FLX4_CUE_NOTE,
+            FLX4_SHIFT_NOTE,
+            FLX4_LOOP_IN_ADJUST_NOTE,
+            FLX4_LOOP_OUT_ADJUST_NOTE,
+        ] {
+            send_feedback(out, fb_last, deck, InputKind::Note { note }, 0);
+        }
+        let shift_channel = 8 + deck * 2;
+        for note in FLX4_TRACK_LOADED_NOTES {
+            send_feedback(out, fb_last, shift_channel, InputKind::Note { note }, 0);
+        }
+    }
+}
+
+fn clear_loop_adjust(app: &AppHandle) {
+    let jog = app.state::<crate::flx4_runtime::JogRuntime>();
+    jog.set_loop_adjust(0, 0);
+    jog.set_loop_adjust(1, 0);
+    let _ = jog.take_loop_nudges();
+}
+
+fn tempo_deck(control: &str) -> Option<usize> {
+    let rest = control.strip_prefix("deck.")?;
+    let (index, name) = rest.split_once('.')?;
+    if name != "tempo" {
+        return None;
+    }
+    let deck = index.parse::<usize>().ok()?;
+    (deck < 2).then_some(deck)
+}
+
+fn tempo_percent_from_normalized(normalized: f64) -> f64 {
+    -8.0 + 16.0 * normalized.clamp(0.0, 1.0)
+}
+
+fn scale_tempo_percent(percent: f64, range: f64) -> f64 {
+    if !percent.is_finite() || !range.is_finite() || range <= 0.0 {
+        return 0.0;
+    }
+    (percent * (range / 8.0)).clamp(-100.0, 100.0)
+}
+
+fn next_tempo_range(current: f64) -> f64 {
+    let index = FLX4_TEMPO_RANGES
+        .iter()
+        .position(|range| (*range - current).abs() < 0.01)
+        .unwrap_or(0);
+    FLX4_TEMPO_RANGES[(index + 1) % FLX4_TEMPO_RANGES.len()]
+}
+
+fn flx4_shift_layer_channel(control: &str, channel: u8) -> Option<u8> {
+    (control.contains(".beatloop.") && matches!(channel, 7 | 9)).then_some(channel + 1)
+}
+
+fn send_bound_feedback(
+    out: &mut Option<MidiOutputConnection>,
+    last: &mut HashMap<[u8; 2], u8>,
+    control: &str,
+    channel: u8,
+    input: InputKind,
+    value: u8,
+) {
+    send_feedback(out, last, channel, input, value);
+    if let Some(shift_channel) = flx4_shift_layer_channel(control, channel) {
+        send_feedback(out, last, shift_channel, input, value);
     }
 }
 
@@ -341,12 +1083,12 @@ fn resolve_binding(
     let u = mapping.resolve(registry, channel, input, value, cur, TAKEOVER)?;
     // Echo to the device address that moved (immediate LED/feedback); UI changes flow via Feedback.
     let mv = (u.normalized * 127.0).round().clamp(0.0, 127.0) as u8;
-    send_feedback(out, fb_last, b_channel, b_input, mv);
+    // Continuous controls can still echo immediately for motor/display feedback.
+    if !matches!(b_input, InputKind::Note { .. }) || !has_state_led(u.control.as_str()) {
+        send_feedback(out, fb_last, b_channel, b_input, mv);
+    }
     current.insert(u.control.as_str().to_string(), u.normalized);
-    Some(ControllerUpdateEvent {
-        control: u.control.as_str().to_string(),
-        value: u.value,
-    })
+    Some(ControllerUpdateEvent::new(u.control.as_str(), u.value))
 }
 
 /// Open a MIDI output port whose name contains `name` (for LED/feedback echo).
@@ -404,6 +1146,134 @@ fn midi_bytes(channel: u8, input: InputKind, value: u8) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flx4_high_resolution_crossfade_endpoints_and_lsb_and_jog_isolation() {
+        let mut state = [[0_u16; 32]; 16];
+        assert!(flx4_cc_pair(&mut state, 0xb6, 31, 0).is_none());
+        assert!(flx4_cc_pair(&mut state, 0xb6, 31, 127).is_none());
+        assert_eq!(flx4_cc_pair(&mut state, 0xb6, 63, 127), Some((6, 31, 1.0)));
+        assert!(flx4_cc_pair(&mut state, 0xb6, 31, 0).is_none());
+        assert_eq!(flx4_cc_pair(&mut state, 0xb6, 63, 0), Some((6, 31, 0.0)));
+        assert_eq!(
+            flx4_cc_pair(&mut state, 0xb6, 63, 1),
+            Some((6, 31, 1.0 / 16383.0))
+        );
+        for cc in [33, 34, 35, 41] {
+            assert!(flx4_cc_pair(&mut state, 0xb0, cc, 65).is_none());
+        }
+        assert!(flx4_cc_pair(&mut state, 0x96, 31, 127).is_none());
+        assert!(flx4_cc_pair(&mut state, 0xb4, 2, 64).is_none());
+        assert_eq!(
+            flx4_cc_pair(&mut state, 0xb4, 34, 0),
+            Some((4, 2, 64.0 * 128.0 / 16383.0))
+        );
+    }
+
+    #[test]
+    fn pad_mode_press_clears_the_previous_mode() {
+        let mut active = [None, None];
+        let first = flx4_pad_mode_press(&mut active, 0, 0x1B).expect("hot cue mode");
+        assert_eq!(first.clear, None);
+        assert_eq!(first.lit, 0x1B);
+        let second = flx4_pad_mode_press(&mut active, 0, 0x20).expect("pad fx mode");
+        assert_eq!(second.clear, Some(0x1B));
+        assert_eq!(second.lit, 0x20);
+        assert_eq!(active[0], Some(0x20));
+        assert_eq!(active[1], None);
+        assert!(flx4_pad_mode_press(&mut active, 0, 0x01).is_none());
+        assert!(flx4_pad_mode_press(&mut active, 2, 0x1B).is_none());
+    }
+    #[test]
+    fn bundled_flx4_every_binding_resolves_and_addresses_are_unique() {
+        let p: ControllerProfile = serde_json::from_str(include_str!(
+            "../resources/controllers/pioneer-ddj-flx4.json"
+        ))
+        .unwrap();
+        let registry = Registry::defaults(4);
+        let mapping = p.mapping();
+        let mut addresses = std::collections::HashSet::new();
+        for b in &mapping.bindings {
+            assert!(
+                addresses.insert(format!("{}:{:?}", b.channel, b.input)),
+                "duplicate binding {:?}",
+                b
+            );
+            let up = mapping
+                .resolve(&registry, b.channel, b.input, 127, 1.0, TAKEOVER)
+                .expect("every binding has a registered implementation contract");
+            assert!(up.value.is_finite());
+            assert!(mapping
+                .resolve(&registry, b.channel, b.input, 0, 0.0, TAKEOVER)
+                .is_some());
+        }
+        let mut old = p.clone();
+        old.bindings.truncate(26);
+        old.bindings[0].control = compas_core::ControlId::new("deck.0.gain");
+        let upgraded = upgrade_flx4_profile(old);
+        assert_eq!(upgraded.bindings.len(), p.bindings.len());
+        assert_eq!(upgraded.bindings[0].control.as_str(), "deck.0.gain");
+        assert_eq!(
+            upgrade_flx4_profile(upgraded).bindings.len(),
+            p.bindings.len()
+        );
+    }
+    #[test]
+    fn flx4_meter_encodes_silence_levels_and_clip() {
+        for (input, expected) in [
+            (0.0, 0),
+            (0.02, 0x26),
+            (0.1, 0x41),
+            (0.3, 0x57),
+            (0.7, 0x65),
+            (1.0, 0x77),
+            (2.0, 0x77),
+        ] {
+            assert_eq!(flx4_meter_value(input), expected);
+        }
+        assert_eq!(flx4_meter_value(f32::NAN), 0);
+        assert_eq!(flx4_meter_value(-1.0), 0);
+        assert!((0..200)
+            .map(|i| flx4_meter_value(i as f32 / 100.0))
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn flx4_trim_and_fader_use_distinct_vendor_addresses_and_ranges() {
+        let profile: ControllerProfile = serde_json::from_str(include_str!(
+            "../resources/controllers/pioneer-ddj-flx4.json"
+        ))
+        .unwrap();
+        let map = profile.mapping();
+        let registry = Registry::defaults(4);
+        for deck in 0..2 {
+            let trim = map
+                .resolve(&registry, deck, InputKind::Cc { cc: 4 }, 127, 0.0, TAKEOVER)
+                .unwrap();
+            let volume = map
+                .resolve(
+                    &registry,
+                    deck,
+                    InputKind::Cc { cc: 19 },
+                    127,
+                    0.0,
+                    TAKEOVER,
+                )
+                .unwrap();
+            assert_eq!(trim.control.as_str(), format!("deck.{deck}.trim"));
+            assert_eq!(trim.value, compas_core::control::TRIM_MAX_GAIN);
+            assert_eq!(volume.control.as_str(), format!("deck.{deck}.volume"));
+            assert_eq!(volume.value, 1.0);
+            assert_eq!(
+                map.resolve(&registry, deck, InputKind::Cc { cc: 19 }, 0, 1.0, TAKEOVER)
+                    .unwrap()
+                    .value,
+                0.0
+            );
+        }
+    }
 
     #[test]
     fn feedback_dedups_per_address() {
@@ -542,5 +1412,73 @@ mod tests {
         // Nothing was written.
         assert!(list_profiles(&tmp).is_empty());
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn coalesced_batch_keeps_only_the_latest_value_per_control() {
+        let mut pending = Vec::new();
+        upsert_latest(
+            &mut pending,
+            ControllerUpdateEvent::new("deck.0.volume", 0.2),
+        );
+        upsert_latest(
+            &mut pending,
+            ControllerUpdateEvent::new("deck.1.volume", 0.4),
+        );
+        upsert_latest(
+            &mut pending,
+            ControllerUpdateEvent::new("deck.0.volume", 0.9),
+        );
+        let latest: Vec<(&str, f64)> = pending
+            .iter()
+            .map(|update| (update.control.as_str(), update.value))
+            .collect();
+        assert_eq!(latest, vec![("deck.0.volume", 0.9), ("deck.1.volume", 0.4)]);
+    }
+
+    #[test]
+    fn state_leds_cover_pads_and_transport_but_not_continuous_controls() {
+        let state_led_controls = [
+            "deck.0.play",
+            "deck.1.sync",
+            "deck.0.headphone_cue",
+            "deck.0.hotcue.3",
+            "deck.1.beatloop.7",
+            "deck.0.key_shift.2",
+            "deck.1.loop.in",
+            "deck.0.cue",
+            "deck.0.beatjump.scale_up",
+            "sampler.4.trigger",
+        ];
+        let momentary_controls = [
+            "deck.0.volume",
+            "deck.1.eq.low",
+            "mixer.crossfader",
+            "deck.0.censor",
+            "fx.next",
+        ];
+        assert!(state_led_controls
+            .iter()
+            .all(|control| has_state_led(control)));
+        assert!(momentary_controls
+            .iter()
+            .all(|control| !has_state_led(control)));
+        assert!(is_native_transport_led("deck.1.play"));
+        assert!(!is_native_transport_led("deck.1.cue"));
+    }
+
+    #[test]
+    fn tempo_range_cycles_and_scales_the_existing_fader_span() {
+        assert_eq!(next_tempo_range(8.0), 6.0);
+        assert_eq!(next_tempo_range(6.0), 10.0);
+        assert_eq!(next_tempo_range(10.0), 16.0);
+        assert_eq!(next_tempo_range(16.0), 100.0);
+        assert_eq!(next_tempo_range(100.0), 8.0);
+        assert!((scale_tempo_percent(8.0, 8.0) - 8.0).abs() < 1e-9);
+        assert!((scale_tempo_percent(8.0, 16.0) - 16.0).abs() < 1e-9);
+        assert!((scale_tempo_percent(-8.0, 6.0) + 6.0).abs() < 1e-9);
+        assert_eq!(scale_tempo_percent(8.0, 100.0), 100.0);
+        assert!(tempo_deck("deck.0.tempo").is_some());
+        assert!(tempo_deck("deck.0.tempo_range").is_none());
     }
 }

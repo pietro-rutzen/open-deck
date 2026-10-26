@@ -285,45 +285,161 @@ impl TempoAnalysis {
         (strength * octave_factor * rival_factor).clamp(0.0, 1.0)
     }
 
-    /// Octave-aware tempo pick, returning the selected `(folded_bpm, period_in_env_samples)`.
+    /// Tempo pick among the winning lag, its octaves, and its 3:2 hemiola.
     ///
-    /// The largest autocorrelation peak is not always the musically-correct octave: a track
-    /// with strong half-note accents can peak at half the perceived tempo, and a busy
-    /// eighth-note groove can peak at double. Instead of trusting that peak blindly, we score
-    /// the winner against its ½× and 2× octaves by `onset_support × tempo_prior(bpm)` and take
-    /// the best. `onset_support` keeps the pick honest (an octave with no onsets can't win);
-    /// the prior (see [`tempo_prior`]) gently resolves genuine 2:1 ambiguity toward the
-    /// beat-matchable range. Folding still confines the result to [`MIN_BPM`, `MAX_BPM`].
+    /// The largest autocorrelation peak is not always the tactus a DJ would count. Half-note
+    /// accents peak at half tempo, eighth-note grooves peak at double, and a dotted drum
+    /// pattern (drum-and-bass, samba, trance) peaks at 2/3 of the beat — 177 BPM reads as
+    /// ~118. Octaves are scored by `onset_support × tempo_prior`. The 3:2 candidate is the
+    /// same evidence with an extra weight when that faster tempo is itself well supported,
+    /// which is the correction Mixxx users apply by hand and the one Rekordbox/Serato make
+    /// for those rhythms. The period always matches the folded BPM.
     fn select_tempo(&self) -> (f32, f32) {
         let mut best_score = f32::MIN;
         let mut chosen = (0.0f32, 0.0f32);
-        // 2× lag = half tempo, 0.5× lag = double tempo. Include 1× so the winner competes.
-        for &mult in &[1.0f32, 2.0, 0.5] {
+        // 2× lag = half tempo, 0.5× lag = double tempo, 2/3 lag = 3/2 tempo.
+        for &mult in &[1.0f32, 2.0, 0.5, 2.0 / 3.0] {
             let lag = self.best_lag as f32 * mult;
             if lag < 1.0 || lag as usize >= self.env.len() {
                 continue;
             }
-            let support = autocorr_score(&self.env, lag.round() as usize, self.energy, self.best_r)
-                .unwrap_or(0.0);
-            let refined =
-                parabolic_peak(&self.env, lag.round() as usize, self.energy).unwrap_or(lag);
-            let mut bpm = 60.0 * self.env_rate / refined;
-            let mut period = refined;
-            while bpm < MIN_BPM {
-                bpm *= 2.0;
-                period *= 2.0;
+            let refined = self.snap_lag(lag);
+            if refined <= 0.0 {
+                continue;
             }
-            while bpm > MAX_BPM {
-                bpm /= 2.0;
-                period /= 2.0;
-            }
-            let score = support * tempo_prior(bpm);
+            // Score the lobe we actually picked. The exact multiple can sit on its shoulder.
+            let support = autocorr_score(
+                &self.env,
+                refined.round() as usize,
+                self.energy,
+                self.best_r,
+            )
+            .unwrap_or(0.0);
+            let raw_bpm = 60.0 * self.env_rate / refined;
+            let (bpm, period) = fold_tempo(raw_bpm, self.env_rate);
+            let offbeat_ratio = if (mult - 0.5).abs() < 1e-3 {
+                odd_even_onset_ratio(&self.env, refined)
+            } else {
+                0.0
+            };
+            let weight = if (mult - 2.0 / 3.0).abs() < 1e-3 {
+                hemiola_weight(raw_bpm, bpm, support)
+            } else if (mult - 0.5).abs() < 1e-3 {
+                fast_pulse_weight(raw_bpm, bpm, support, offbeat_ratio)
+            } else {
+                1.0
+            };
+            let score = support * tempo_prior(bpm) * weight;
             if score > best_score {
                 best_score = score;
                 chosen = (bpm, period);
             }
         }
         chosen
+    }
+
+    /// Parabolic peak of the strongest autocorrelation lobe within 3% of `lag`'s tempo.
+    /// A 3:2 probe can sit on the shoulder of the real beat, and the lobe center is the
+    /// tempo the rest of the track actually repeats.
+    fn snap_lag(&self, lag: f32) -> f32 {
+        if lag <= 1.0 {
+            return lag;
+        }
+        let target = 60.0 * self.env_rate / lag;
+        let mut best_lag = lag.round() as usize;
+        let mut best_r = f32::MIN;
+        for (i, &r) in self.r_by_lag.iter().enumerate() {
+            let candidate = self.lag_min + i;
+            if candidate == 0 {
+                continue;
+            }
+            let bpm = 60.0 * self.env_rate / candidate as f32;
+            if (bpm - target).abs() > target * 0.03 {
+                continue;
+            }
+            let left = if i == 0 {
+                f32::MIN
+            } else {
+                self.r_by_lag[i - 1]
+            };
+            let right = if i + 1 == self.r_by_lag.len() {
+                f32::MIN
+            } else {
+                self.r_by_lag[i + 1]
+            };
+            if r >= left && r >= right && r > best_r {
+                best_r = r;
+                best_lag = candidate;
+            }
+        }
+        parabolic_peak(&self.env, best_lag, self.energy).unwrap_or(best_lag as f32)
+    }
+}
+
+fn fold_tempo(mut bpm: f32, env_rate: f32) -> (f32, f32) {
+    if !bpm.is_finite() || bpm <= 0.0 {
+        return (0.0, 0.0);
+    }
+    bpm = clamp_search_edge(bpm);
+    while bpm < MIN_BPM {
+        bpm *= 2.0;
+    }
+    while bpm > MAX_BPM {
+        bpm /= 2.0;
+    }
+    (bpm, 60.0 * env_rate / bpm)
+}
+
+/// A half-tempo peak is a harmonic of any faster pulse, so it does not by itself mean the
+/// fast onsets are missing. The fast period is the pulse when its lobe nearly matches that
+/// harmonic, or when the beats between those half-notes are onsets too. An even fast click
+/// clears the first test. A backbeat that still hits every fast beat clears the second.
+/// Empty in-between beats stay at the slow tempo.
+pub(crate) fn fast_pulse_weight(
+    raw_bpm: f32,
+    folded_bpm: f32,
+    support: f32,
+    offbeat_ratio: f32,
+) -> f32 {
+    if (raw_bpm - folded_bpm).abs() > 0.5 || !support.is_finite() {
+        return 1.0;
+    }
+    let counted = support >= 0.90 || (support >= 0.80 && offbeat_ratio >= 0.70);
+    if !counted {
+        return 1.0;
+    }
+    let slow = folded_bpm / 2.0;
+    let fast_prior = tempo_prior(folded_bpm);
+    let tilt = if slow >= MIN_BPM && fast_prior > 1e-6 {
+        tempo_prior(slow) / fast_prior
+    } else {
+        1.0
+    };
+    (tilt / support.max(0.05) * 1.02).max(1.15)
+}
+
+/// The autocorrelation window includes one bin past [`MAX_BPM`]. That bin is still the
+/// fast tempo, not the next octave down.
+fn clamp_search_edge(bpm: f32) -> f32 {
+    if bpm > MAX_BPM && bpm <= MAX_BPM + 2.0 {
+        MAX_BPM
+    } else {
+        bpm
+    }
+}
+
+/// Extra weight for a 3:2-faster reading of the winning lag. Only a well-supported
+/// candidate in the range where drum-and-bass, house and trance actually sit can use it.
+pub(crate) fn hemiola_weight(raw_bpm: f32, folded_bpm: f32, support: f32) -> f32 {
+    if (raw_bpm - folded_bpm).abs() > 0.5 || support < 0.8 {
+        return 1.0;
+    }
+    if (140.0..=MAX_BPM).contains(&folded_bpm) {
+        1.45
+    } else if (115.0..140.0).contains(&folded_bpm) {
+        1.15
+    } else {
+        1.0
     }
 }
 
@@ -349,6 +465,7 @@ fn fold_bpm(mut bpm: f32) -> f32 {
     if bpm <= 0.0 {
         return 0.0;
     }
+    bpm = clamp_search_edge(bpm);
     while bpm < MIN_BPM {
         bpm *= 2.0;
     }
@@ -369,6 +486,43 @@ fn autocorr_score(env: &[f32], lag: usize, energy: f32, best_r: f32) -> Option<f
         acc += env[i] * env[i + lag];
     }
     Some(((acc / energy) / best_r).clamp(0.0, 4.0))
+}
+
+/// Onset energy on the in-between beats of `period`, divided by the energy on the beats
+/// the phase lock treats as downbeats. Near 0 means those in-between beats are empty
+/// (the pulse is twice as slow). Near 1 means both halves of the period are beats.
+pub(crate) fn odd_even_onset_ratio(env: &[f32], period: f32) -> f32 {
+    if period < 1.0 || env.is_empty() {
+        return 0.0;
+    }
+    let phi_max = period.ceil() as usize;
+    let mut best_even = 0.0f32;
+    let mut odd_at_best = 0.0f32;
+    for phi in 0..phi_max {
+        let mut even = 0.0f32;
+        let mut odd = 0.0f32;
+        let mut idx = phi as f32;
+        let mut beat = 0u32;
+        while (idx as usize) < env.len() {
+            let sample = env[idx as usize];
+            if beat % 2 == 0 {
+                even += sample;
+            } else {
+                odd += sample;
+            }
+            idx += period;
+            beat += 1;
+        }
+        if even > best_even {
+            best_even = even;
+            odd_at_best = odd;
+        }
+    }
+    if best_even <= 0.0 {
+        0.0
+    } else {
+        odd_at_best / best_even
+    }
 }
 
 /// Comb candidate phases [0, period) over the onset envelope and return the first-beat
@@ -871,6 +1025,116 @@ mod tests {
     fn tempo_on_empty_is_zero_confidence() {
         let est = estimate_tempo(&[], 44_100);
         assert_eq!(est.confidence, 0.0);
+    }
+
+    fn clicks_at(bpm: f32, seconds: f32, amp: f32, phase: f32) -> Vec<f32> {
+        let sr = 44_100u32;
+        let mut samples = vec![0.0f32; (sr as f32 * seconds) as usize];
+        let period = 60.0 / bpm;
+        let mut at = phase;
+        while at < seconds {
+            let start = (at * sr as f32) as usize;
+            for k in 0..64 {
+                if start + k < samples.len() {
+                    let env = 1.0 - k as f32 / 64.0;
+                    samples[start + k] += amp * env * if k % 2 == 0 { 1.0 } else { -1.0 };
+                }
+            }
+            at += period;
+        }
+        samples
+    }
+
+    #[test]
+    fn even_fast_pulse_counts_at_its_own_period() {
+        let est = estimate_tempo(&clicks_at(174.0, 16.0, 1.0, 0.0), 44_100);
+        assert!(
+            (est.bpm - 174.0).abs() <= 2.0,
+            "an even 174 pulse should stay 174, got {}",
+            est.bpm
+        );
+    }
+
+    #[test]
+    fn tempo_at_the_top_of_the_range_is_not_folded_in_half() {
+        let est = estimate_tempo(&clicks_at(180.0, 16.0, 1.0, 0.0), 44_100);
+        assert!(
+            (est.bpm - 180.0).abs() <= 2.0,
+            "an even 180 pulse is the top of the window, not 90, got {}",
+            est.bpm
+        );
+    }
+
+    #[test]
+    fn half_note_accent_does_not_hide_an_even_fast_pulse() {
+        let mut samples = clicks_at(180.0, 16.0, 1.0, 0.0);
+        for (index, sample) in clicks_at(90.0, 16.0, 0.45, 0.0).into_iter().enumerate() {
+            samples[index] += sample;
+        }
+        let est = estimate_tempo(&samples, 44_100);
+        let diagnostics = estimate_tempo_diagnostics(&samples, 44_100).unwrap();
+        assert!(
+            (est.bpm - 180.0).abs() <= 2.0,
+            "accents on every other fast beat should stay at 180, got {} candidates {:?}",
+            est.bpm,
+            diagnostics
+                .candidates
+                .iter()
+                .map(|candidate| (candidate.raw_bpm, candidate.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn weak_offbeats_stay_at_the_slow_pulse() {
+        let mut samples = clicks_at(88.0, 16.0, 1.0, 0.0);
+        for (index, sample) in clicks_at(176.0, 16.0, 0.25, 0.0).into_iter().enumerate() {
+            samples[index] += sample;
+        }
+        let est = estimate_tempo(&samples, 44_100);
+        assert!(
+            (est.bpm - 88.0).abs() <= 2.0,
+            "weak in-between beats should stay at 88, got {}",
+            est.bpm
+        );
+    }
+
+    #[test]
+    fn even_slow_pulse_does_not_invent_a_faster_beat() {
+        let est = estimate_tempo(&clicks_at(90.0, 16.0, 1.0, 0.0), 44_100);
+        assert!(
+            (est.bpm - 90.0).abs() <= 2.0,
+            "an even 90 pulse has no faster onsets and should stay 90, got {}",
+            est.bpm
+        );
+    }
+
+    #[test]
+    fn dotted_pulse_resolves_to_the_fast_dance_tempo() {
+        let bpm = 176.0;
+        let mut samples = clicks_at(bpm * 2.0 / 3.0, 16.0, 1.0, 0.0);
+        for (offset, sample) in clicks_at(bpm, 16.0, 0.72, 0.0).iter().enumerate() {
+            samples[offset] += sample;
+        }
+        for (offset, sample) in clicks_at(bpm / 2.0, 16.0, 0.62, 0.0).iter().enumerate() {
+            samples[offset] += sample;
+        }
+        let est = estimate_tempo(&samples, 44_100);
+        assert!(
+            (est.bpm - bpm).abs() <= 3.0,
+            "dotted drum pattern should count at {bpm}, got {}",
+            est.bpm
+        );
+    }
+
+    #[test]
+    fn steady_pulse_does_not_jump_by_a_third() {
+        let est = estimate_tempo(&clicks_at(118.0, 16.0, 1.0, 0.0), 44_100);
+        assert!(
+            (est.bpm - 118.0).abs() <= 2.0,
+            "a plain 118 click must stay 118, got {}",
+            est.bpm
+        );
     }
 
     #[test]

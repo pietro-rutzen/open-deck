@@ -1,4 +1,5 @@
 import { useCallback, useId, useRef, type PointerEvent } from "react";
+import { TRIM_UNITY, trimGain, trimNorm } from "../lib/trim";
 
 /** Rotary knob (Traktor/Serato-style): a 270° value arc around a beveled cap with a short
  *  indicator notch. Bipolar controls (EQ/filter — `min < 0 < max`) detent at 12 o'clock and fill
@@ -33,6 +34,7 @@ export function Knob({
   size = 36,
   color = "var(--accent)",
   disabled = false,
+  law = "linear",
 }: {
   value: number;
   min: number;
@@ -42,6 +44,7 @@ export function Knob({
   size?: number;
   color?: string;
   disabled?: boolean;
+  law?: "linear" | "trim";
 }) {
   const drag = useRef<{ y: number; v: number } | null>(null);
   const capId = "kc" + useId().replace(/:/g, "");
@@ -52,7 +55,9 @@ export function Knob({
   // Value → angle. Bipolar maps each side of center onto its own 135° half so the detent stays
   // straight up even when the range is asymmetric (EQ is −26..+6). Unipolar is a plain linear sweep.
   let angle: number;
-  if (bipolar) {
+  if (law === "trim") {
+    angle = A0 + trimNorm(value) * (A1 - A0);
+  } else if (bipolar) {
     angle = value >= center ? ((value - center) / (max - center)) * A1 : ((value - center) / (center - min)) * A1;
   } else {
     angle = A0 + ((value - min) / (max - min)) * (A1 - A0);
@@ -78,11 +83,15 @@ export function Knob({
     (e: PointerEvent) => {
       if (!drag.current) return;
       const dy = drag.current.y - e.clientY; // up = increase
+      if (law === "trim") {
+        onChange(trimGain(trimNorm(drag.current.v) + dy / 180));
+        return;
+      }
       const range = max - min;
       const next = Math.min(max, Math.max(min, drag.current.v + (dy / 180) * range));
       onChange(next);
     },
-    [min, max, onChange],
+    [law, min, max, onChange],
   );
 
   const end = useCallback(() => {
@@ -99,7 +108,9 @@ export function Knob({
         onPointerMove={onPointerMove}
         onPointerUp={end}
         onPointerLeave={end}
-        onDoubleClick={() => !disabled && onChange(bipolar ? center : (min + max) / 2)}
+        onDoubleClick={() =>
+          !disabled && onChange(law === "trim" ? TRIM_UNITY : bipolar ? center : (min + max) / 2)
+        }
         style={{ touchAction: "none", cursor: disabled ? "not-allowed" : "ns-resize" }}
       >
         <defs>

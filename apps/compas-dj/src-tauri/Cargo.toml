@@ -18,6 +18,8 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+base64 = "0.22.1"
+symphonia = { workspace = true }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"   # in-app auto-update against GitHub Releases (latest.json + signed payloads)
@@ -38,6 +40,11 @@ hidapi = "2"                      # raw HID input for non-class-compliant contro
 rusqlite = { version = "0.32", features = ["bundled"] }  # library + per-track state (cues/loops/grid/history)
 notify = "8"                      # live OS filesystem watch over registered library folders (auto-import)
 zip = { version = "4", default-features = false }  # pure-Rust crate packaging (export/import); Stored entries (audio is already compressed)
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSPasteboard"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSString"] }
 
 [lints]
 workspace = true

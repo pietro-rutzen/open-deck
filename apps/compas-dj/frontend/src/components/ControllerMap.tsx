@@ -4,16 +4,20 @@ import {
   controllerList,
   controllerRegistry,
   controllerSave,
+  controllerSession,
+  onControllerSession,
   exportProfilePack,
   importProfilePack,
   hidConnect,
   hidDisconnect,
   hidList,
+  holdRawMidi,
   onHidInput,
   onMidiCc,
   onMidiNote,
   type ControllerBinding,
   type ControllerProfile,
+  type ControllerSession,
   type ControlSpec,
   type HidDeviceInfo,
 } from "../lib/ipc";
@@ -35,6 +39,7 @@ const inputLabel = (b: ControllerBinding) =>
 export function ControllerMap({ onClose }: { onClose: () => void }) {
   const [registry, setRegistry] = useState<ControlSpec[]>([]);
   const [profiles, setProfiles] = useState<ControllerProfile[]>([]);
+  const [selectedProfile, setSelectedProfile] = useState<ControllerProfile | null>(null);
   const [name, setName] = useState("My Controller");
   const [bindings, setBindings] = useState<Record<string, ControllerBinding>>({});
   const [learning, setLearning] = useState<string | null>(null);
@@ -43,6 +48,9 @@ export function ControllerMap({ onClose }: { onClose: () => void }) {
   const [hidPath, setHidPath] = useState("");
   const [lastInput, setLastInput] = useState("");
   const midi = useMidi();
+  const [session, setSession] = useState<ControllerSession | null>(null);
+  const editorTouched = useRef(false);
+  const editorInitialized = useRef(false);
 
   const learningRef = useRef<string | null>(null);
   learningRef.current = learning;
@@ -52,12 +60,50 @@ export function ControllerMap({ onClose }: { onClose: () => void }) {
     controllerList().then(setProfiles).catch(() => {});
   }, []);
 
+  // Seed the editor once from the actual active snapshot. Connection events must never
+  // replace unsaved edits, even when startup discovery completes after this panel opens.
+  useEffect(() => {
+    let active = true;
+    let version = 0;
+    const apply = (current: ControllerSession) => {
+      if (!active) return;
+      setSession(current);
+      if (editorTouched.current || editorInitialized.current || !current.profile) return;
+      editorInitialized.current = true;
+      const p = current.profile;
+      setSelectedProfile(p);
+      setName(p.name);
+      const map: Record<string, ControllerBinding> = {};
+      for (const binding of p.bindings) map[binding.control] = binding;
+      setBindings(map);
+      setStatus(`Loaded active profile "${p.name}"`);
+    };
+    const readInitial = async () => {
+      const initialVersion = version;
+      try {
+        const current = await controllerSession();
+        if (initialVersion === version) apply(current);
+      } catch { /* Keep manual profile editing available if the session read fails. */ }
+    };
+    const unlisten = onControllerSession((current) => { version++; apply(current); });
+    void unlisten.then(() => { if (active) void readInitial(); }).catch(() => {
+      if (active) void readInitial();
+    });
+    return () => {
+      active = false;
+      void unlisten.then((stop) => stop()).catch(() => {});
+    };
+  }, []);
+
+  useEffect(() => holdRawMidi(), []);
+
   // Capture the next MIDI or HID message into the control being learned.
   useEffect(() => {
     const capture = (input: ControllerBinding["input"], channel: number, label: string) => {
       setLastInput(label);
       const control = learningRef.current;
       if (!control) return;
+      editorTouched.current = true;
       setBindings((b) => ({ ...b, [control]: { channel, input, control, soft_takeover: true } }));
       setLearning(null);
       setStatus(`Bound ${control}`);
@@ -94,8 +140,8 @@ export function ControllerMap({ onClose }: { onClose: () => void }) {
   };
 
   const profile = useMemo<ControllerProfile>(
-    () => ({ id: slug(name), name, bindings: Object.values(bindings) }),
-    [name, bindings],
+    () => ({ ...selectedProfile, id: selectedProfile?.id ?? slug(name), name, bindings: Object.values(bindings) }),
+    [name, bindings, selectedProfile],
   );
 
   const save = async () => {
@@ -108,6 +154,7 @@ export function ControllerMap({ onClose }: { onClose: () => void }) {
     }
   };
   const activate = async () => {
+    editorTouched.current = true;
     try {
       await controllerActivate(profile);
       // Sync the device LEDs/faders to current software state now that bindings are live.
@@ -138,18 +185,22 @@ export function ControllerMap({ onClose }: { onClose: () => void }) {
     }
   };
   const loadProfile = (p: ControllerProfile) => {
+    editorTouched.current = true;
+    setSelectedProfile(p);
     setName(p.name);
     const map: Record<string, ControllerBinding> = {};
     for (const b of p.bindings) map[b.control] = b;
     setBindings(map);
     setStatus(`Loaded "${p.name}"`);
   };
-  const clearBinding = (control: string) =>
+  const clearBinding = (control: string) => {
+    editorTouched.current = true;
     setBindings((b) => {
       const next = { ...b };
       delete next[control];
       return next;
     });
+  };
 
   const boundCount = Object.keys(bindings).length;
 
@@ -162,7 +213,7 @@ export function ControllerMap({ onClose }: { onClose: () => void }) {
         </header>
 
         <div className="ctrl-toolbar">
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Profile name" />
+          <input value={name} onChange={(e) => { editorTouched.current = true; setName(e.target.value); }} placeholder="Profile name" />
           <button className="chip" onClick={save} disabled={!boundCount}>Save</button>
           <button className="chip chip--on" onClick={activate} disabled={!boundCount}>Activate</button>
           <span className="mono">{boundCount} bound</span>
@@ -196,6 +247,11 @@ export function ControllerMap({ onClose }: { onClose: () => void }) {
           {lastInput && <span className="mono ctrl-last">{lastInput}</span>}
         </div>
 
+        <p className="ctrl-hint" role="status">
+          {midi.connected ? `Connected: ${midi.connected}` : "MIDI disconnected"}
+          {session?.auto_paused ? " · Automatic reconnect paused for this session" : ""}
+          {session?.error ? ` · ${session.error}` : ""}
+        </p>
         <p className="ctrl-hint">
           Click <strong>Learn</strong> on a control, then move that knob/pad/fader on your controller.
           The device's own MIDI/HID messages define the mapping.
@@ -234,7 +290,7 @@ export function ControllerMap({ onClose }: { onClose: () => void }) {
                 <span className="ctrl-binding mono">{b ? `${inputLabel(b)} · ch${b.channel}` : "—"}</span>
                 <button
                   className={`chip ${isLearning ? "chip--on" : ""}`}
-                  onClick={() => setLearning(isLearning ? null : c.id)}
+                  onClick={() => { editorTouched.current = true; setLearning(isLearning ? null : c.id); }}
                 >
                   {isLearning ? "Wiggle…" : "Learn"}
                 </button>
