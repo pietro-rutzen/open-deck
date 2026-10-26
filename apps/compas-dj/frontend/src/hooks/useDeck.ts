@@ -53,6 +53,7 @@ import {
   type FilterMode,
 } from "../lib/ipc";
 import { listeningModeActive } from "../lib/listeningMode";
+import { firstAudibleFrame } from "../lib/silence";
 import { TRIM_MAX } from "../lib/trim";
 
 export interface LoopState {
@@ -327,8 +328,9 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         const gainLoad = ++gainLoadRef.current;
         const gainEdit = gainEditRef.current;
         setMeta(e);
-        setFrame(0);
-        frameRef.current = 0;
+        const origin = firstAudibleFrame(e.silence, e.frames);
+        setFrame(origin);
+        frameRef.current = origin;
         setPlaying(false);
         setTempo(1);
         setKeylockState(false); // engine resets key-lock on load

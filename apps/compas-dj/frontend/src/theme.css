@@ -14,11 +14,11 @@
   --text-tertiary: #92939d;
   --text-disabled: #41444c;
 
-  /* brand & semantic — electric blue accent (rgb triplet for alpha tints), amber cue */
-  --accent: #6aafff;
-  --accent-rgb: 106, 175, 255;
-  --accent-glow: #9bcaff;
-  --accent-deep: #4089dc;
+  /* system highlight — neutral, so blue and orange stay with decks A and B */
+  --accent: #d5d6dc;
+  --accent-rgb: 213, 214, 220;
+  --accent-glow: #eeeef2;
+  --accent-deep: #a6a8b2;
   --stream: #ffb36b;
   --stream-dim: #b67b48;
   --violet: #4a64ff;

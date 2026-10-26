@@ -1,5 +1,68 @@
 //! Waveform peak extraction for rendering. Offline (runs on a worker after decode).
 
+/// Quiet stretches the deck should skip, as `[start, end)` source frames.
+///
+/// A window counts as silence when it is below 2% of the track peak. The floor is
+/// about −48 dBFS, so a quiet recording is not swallowed. Only runs of at least a
+/// quarter-second are returned, so gaps between hits stay. A file that is almost
+/// entirely quiet is left unchanged.
+pub fn silence_spans(samples: &[f32], source_rate: u32) -> Vec<(f64, f64)> {
+    let frames = samples.len() / 2;
+    if frames == 0 || source_rate == 0 {
+        return Vec::new();
+    }
+    let window = (source_rate as usize / 100).max(1);
+    let min_run = ((source_rate as f64) * 0.25).round().max(1.0) as usize;
+    let mut track_peak = 0.0f32;
+    let mut index = 0;
+    while index < frames {
+        let end = (index + window).min(frames);
+        track_peak = track_peak.max(window_peak(samples, index, end));
+        index = end;
+    }
+    let threshold = (track_peak * 0.02).max(0.004);
+    let mut spans = Vec::new();
+    let mut run_start = None;
+    let mut silent_frames = 0usize;
+    index = 0;
+    while index < frames {
+        let end = (index + window).min(frames);
+        let silent = window_peak(samples, index, end) < threshold;
+        if silent {
+            if run_start.is_none() {
+                run_start = Some(index);
+            }
+        } else if let Some(start) = run_start.take() {
+            if index - start >= min_run {
+                spans.push((start as f64, index as f64));
+                silent_frames += index - start;
+            }
+        }
+        index = end;
+    }
+    if let Some(start) = run_start {
+        if frames - start >= min_run {
+            spans.push((start as f64, frames as f64));
+            silent_frames += frames - start;
+        }
+    }
+    if frames.saturating_sub(silent_frames) < source_rate as usize / 2 {
+        Vec::new()
+    } else {
+        spans
+    }
+}
+
+fn window_peak(samples: &[f32], start: usize, end: usize) -> f32 {
+    let mut peak = 0.0f32;
+    for frame in start..end {
+        peak = peak
+            .max(samples[frame * 2].abs())
+            .max(samples[frame * 2 + 1].abs());
+    }
+    peak
+}
+
 /// Compute one peak (max absolute amplitude across both channels) per bin of
 /// `bin_frames` source frames. The result is a compact envelope the frontend renders
 /// on a WebGL canvas; it is sent once per load rather than streaming the whole buffer.
@@ -37,6 +100,31 @@ mod tests {
     #[test]
     fn empty_input_yields_no_peaks() {
         assert!(compute_peaks(&[], 512).is_empty());
+    }
+
+    #[test]
+    fn trailing_silence_becomes_a_span() {
+        let rate = 1_000;
+        let mut samples = vec![0.5f32; 1_000 * 2];
+        samples.extend(std::iter::repeat(0.0).take(500 * 2));
+        let spans = silence_spans(&samples, rate);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert!(spans[0].0 >= 900.0 && spans[0].0 <= 1_100.0, "{spans:?}");
+        assert_eq!(spans[0].1, 1_500.0);
+    }
+
+    #[test]
+    fn short_gap_is_not_silence() {
+        let rate = 1_000;
+        let mut samples = vec![0.5f32; 1_000 * 2];
+        samples.extend(std::iter::repeat(0.0).take(100 * 2));
+        samples.extend(std::iter::repeat(0.5).take(1_000 * 2));
+        assert!(silence_spans(&samples, rate).is_empty());
+    }
+
+    #[test]
+    fn a_silent_file_is_not_skipped() {
+        assert!(silence_spans(&vec![0.0f32; 2_000 * 2], 1_000).is_empty());
     }
 
     #[test]

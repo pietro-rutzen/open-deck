@@ -86,6 +86,40 @@ const readStoredView = (): 'unset' | 'library' | string => {
   }
 };
 
+const FOLDER_ORDER_KEY = 'opendeck.library.folderOrder.v1';
+
+const readFolderOrders = (): Record<string, string[]> => {
+  try {
+    const parsed = JSON.parse(
+      localStorage.getItem(FOLDER_ORDER_KEY) ?? 'null',
+    ) as unknown;
+    if (!parsed || typeof parsed !== 'object') return {};
+    return Object.fromEntries(
+      Object.entries(parsed).flatMap(([folder, paths]) =>
+        Array.isArray(paths) &&
+        paths.every((path) => typeof path === 'string')
+          ? [[folder, paths]]
+          : [],
+      ),
+    );
+  } catch {
+    return {};
+  }
+};
+
+const writeFolderOrders = (orders: Record<string, string[]>) => {
+  try {
+    localStorage.setItem(FOLDER_ORDER_KEY, JSON.stringify(orders));
+  } catch {
+    /* The renamed files still carry the order. */
+  }
+};
+
+const storedFolderPath = () => {
+  const view = readStoredView();
+  return view !== 'unset' && view !== 'library' ? view : null;
+};
+
 const pointerOverElement = (element: Element, position: PhysicalPosition) => {
   const point = position.toLogical(window.devicePixelRatio);
   const bounds = element.getBoundingClientRect();
@@ -243,7 +277,7 @@ export const Library = memo(
     const inspectorRef = useRef<HTMLElement>(null);
     const [actionError, setActionError] = useState<string | null>(null);
     const viewGeneration = useRef(0);
-    const openedInitialFolder = useRef(false);
+    const openedInitialFolder = useRef(readStoredView() !== 'unset');
     const reportError = (error: unknown) => setActionError(String(error));
     const load = async (deck: number, path: string) => {
       setActionError(null);
@@ -333,7 +367,16 @@ export const Library = memo(
       setSuggestFor(t.title);
       setPlanPath(t.path);
     };
-    const [folderPath, setFolderPath] = useState<string | null>(null);
+    const [folderPath, setFolderPath] = useState<string | null>(storedFolderPath);
+    const [folderOrders, setFolderOrders] =
+      useState<Record<string, string[]>>(readFolderOrders);
+    const rememberFolderOrder = (folder: string, paths: string[]) => {
+      setFolderOrders((current) => {
+        const next = { ...current, [folder]: paths };
+        writeFolderOrders(next);
+        return next;
+      });
+    };
     const [reorderArmed, setReorderArmed] = useState(false);
     const [listening, setListening] = useState(listeningModeActive);
     const [listeningBusy, setListeningBusy] = useState(false);
@@ -511,6 +554,16 @@ export const Library = memo(
       const un = onLibraryPathsMoved((moves) => {
         const moved = new Map(moves.map((move) => [move.from, move.to]));
         movedTo.current = moved;
+        setFolderOrders((current) => {
+          const next = Object.fromEntries(
+            Object.entries(current).map(([folder, paths]) => [
+              folder,
+              paths.map((path) => moved.get(path) ?? path),
+            ]),
+          );
+          writeFolderOrders(next);
+          return next;
+        });
         setSelectedPath((path) => (path && moved.get(path)) || path);
         setPlanPath((path) => (path && moved.get(path)) || path);
         setQueue((current) =>
@@ -583,13 +636,22 @@ export const Library = memo(
       if (!browsingFolder || !folderPath) return filtered;
       const direct = directTracks(lib.tracks, folderPath);
       if (sort.column !== 'order') return sortTracks(direct, sort);
-      const byName = [...direct].sort(
-        (left, right) =>
+      const saved = folderOrders[folderPath] ?? [];
+      const rank = new Map(saved.map((path, index) => [path, index]));
+      const bySavedOrder = [...direct].sort((left, right) => {
+        const leftRank = rank.get(left.path);
+        const rightRank = rank.get(right.path);
+        if (leftRank != null && rightRank != null && leftRank !== rightRank)
+          return leftRank - rightRank;
+        if (leftRank != null) return -1;
+        if (rightRank != null) return 1;
+        return (
           compareFileNames(baseName(left.path), baseName(right.path)) ||
-          left.path.localeCompare(right.path),
-      );
-      return sort.direction === 'asc' ? byName : byName.reverse();
-    }, [browsingFolder, folderPath, lib.tracks, sort, filtered]);
+          left.path.localeCompare(right.path)
+        );
+      });
+      return sort.direction === 'asc' ? bySavedOrder : bySavedOrder.reverse();
+    }, [browsingFolder, folderPath, folderOrders, lib.tracks, sort, filtered]);
     useEffect(() => {
       if (!browsingFolder) setReorderArmed(false);
     }, [browsingFolder]);
@@ -605,7 +667,15 @@ export const Library = memo(
       setReordering(true);
       setActionError(null);
       reorderFolderTracks(next)
-        .then(() => setSort({ column: 'order', direction: 'asc' }))
+        .then((moves) => {
+          const relocated = new Map(moves.map((move) => [move.from, move.to]));
+          if (folderPath)
+            rememberFolderOrder(
+              folderPath,
+              next.map((path) => relocated.get(path) ?? path),
+            );
+          setSort({ column: 'order', direction: 'asc' });
+        })
         .catch((error) => reportError(error))
         .finally(() => {
           setReordering(false);

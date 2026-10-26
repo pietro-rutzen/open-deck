@@ -76,7 +76,7 @@ export function Mixer({
         })}
       </div>
       <div className="xfader">
-        <span className="overline" style={{ color: "var(--accent)" }}>A</span>
+        <span className="overline" style={{ color: "var(--deck-a)" }}>A</span>
         <Fader
           value={crossfader}
           min={0}
@@ -87,7 +87,7 @@ export function Mixer({
           center
           color="var(--text-primary)"
         />
-        <span className="overline" style={{ color: "var(--stream)" }}>B</span>
+        <span className="overline" style={{ color: "var(--deck-b)" }}>B</span>
       </div>
       {options && <div className="mixer-options">
         {auto && (
@@ -210,7 +210,7 @@ function NextTracks({
       {columns.map(({ channel, suggestions }) => (
         <section className="mixer-next-col" key={channel.letter} aria-label={`Next tracks for deck ${channel.letter}`}>
           <div className="next-col-head">
-            <div className="next-modes" role="group" aria-label={`Auto load for deck ${channel.letter}`}>
+            <div className={`next-modes next-modes--${channel.letter.toLowerCase()}`} role="group" aria-label={`Auto load for deck ${channel.letter}`}>
               <button
                 type="button"
                 className={`chip ${queueOn[channel.ctrl.deck] ? "chip--on" : ""}`}

@@ -32,7 +32,8 @@ mod native_controls;
 mod track_visuals;
 
 use compas_audio::{
-    compute_peaks, AudioCommand, AudioEngine, DeckBuffer, DeckTelemetry, EngineConfig, FilterMode,
+    compute_peaks, silence_spans, AudioCommand, AudioEngine, DeckBuffer, DeckTelemetry,
+    EngineConfig, FilterMode,
 };
 use midir::{MidiInput, MidiInputConnection};
 use notify::Watcher;
@@ -746,6 +747,8 @@ struct DeckLoadedEvent {
     band_peaks: Vec<[f32; 3]>,
     /// Loudness-normalization (ReplayGain) factor the engine applied on load.
     replay_gain: f32,
+    /// Silent regions `[start, end)` in source frames. Playback jumps across them.
+    silence: Vec<(f64, f64)>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1014,6 +1017,8 @@ fn load_track(
         };
 
         let peaks = compute_peaks(&buffer.samples, WAVEFORM_BIN_FRAMES);
+        let silence = silence_spans(&buffer.samples, buffer.source_rate);
+        let buffer = buffer.with_silence(silence.clone());
         let band_peaks = compas_dsp::analysis::band_peaks(
             &buffer.samples,
             buffer.source_rate,
@@ -1041,6 +1046,7 @@ fn load_track(
                 peaks,
                 band_peaks,
                 replay_gain,
+                silence,
             },
         );
 

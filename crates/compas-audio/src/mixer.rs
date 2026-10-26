@@ -909,6 +909,9 @@ struct DeckPlayer {
     censoring: bool,
     /// Transport state to restore when censor is released.
     censor_was_playing: bool,
+    /// Output frames still fading in after a silence skip.
+    silence_fade: u32,
+    silence_fade_len: u32,
 }
 
 impl DeckPlayer {
@@ -951,6 +954,8 @@ impl DeckPlayer {
             cue_previewing: false,
             censoring: false,
             censor_was_playing: false,
+            silence_fade: 0,
+            silence_fade_len: (0.008 * device_rate as f64).round().clamp(1.0, 4_096.0) as u32,
         }
     }
 
@@ -1061,6 +1066,7 @@ impl DeckPlayer {
         if !self.playing && !self.scratching && !self.censoring {
             return DeckFrame::default();
         }
+        self.skip_silence();
         // End-of-track auto-stops normal playback, but never scratching or censor
         // (both need to move back from the end).
         if !self.scratching && !self.censoring && self.playhead >= frames as f64 {
@@ -1081,6 +1087,12 @@ impl DeckPlayer {
         }
         let engaged = self.keylock.begin_frame(self.scratching || self.censoring);
         let (mut l, mut r) = self.read_source_frame(engaged);
+        if self.silence_fade > 0 {
+            let gain = 1.0 - self.silence_fade as f32 / self.silence_fade_len.max(1) as f32;
+            l *= gain;
+            r *= gain;
+            self.silence_fade -= 1;
+        }
         if self.censoring && self.playhead <= 0.0 {
             l = 0.0;
             r = 0.0;
@@ -1140,6 +1152,49 @@ impl DeckPlayer {
             }
         } else {
             (0.0, 0.0)
+        }
+    }
+
+    /// Jump the play-head out of a measured silent span. Scratching and censor keep
+    /// the hand in control. A loop that still contains the landing point wraps first.
+    /// RT-SAFE: reads the immutable span list and writes only the play-head.
+    #[inline]
+    fn skip_silence(&mut self) {
+        if self.scratching || self.censoring || !self.playing {
+            return;
+        }
+        for _ in 0..8 {
+            let jump_to = {
+                let Some(buf) = self.buffer.as_ref() else {
+                    return;
+                };
+                let spans = buf.silence.as_ref();
+                if spans.is_empty() {
+                    return;
+                }
+                let head = self.playhead;
+                let index = spans.partition_point(|span| span.1 <= head);
+                let Some(&(start, end)) = spans.get(index) else {
+                    return;
+                };
+                if head < start || head >= end {
+                    return;
+                }
+                end
+            };
+            self.playhead = jump_to;
+            self.keylock.mark_jumped();
+            self.silence_fade = self.silence_fade_len;
+            if self.loop_active && self.loop_out > self.loop_in && self.playhead >= self.loop_out {
+                let len = self.loop_out - self.loop_in;
+                let mut wraps = 0;
+                while self.playhead >= self.loop_out && wraps < 8 {
+                    self.playhead -= len;
+                    wraps += 1;
+                }
+                continue;
+            }
+            return;
         }
     }
 
@@ -1876,6 +1931,14 @@ impl Mixer {
                         d.sync_master = None;
                         d.sync_tempo = None;
                         let old = d.buffer.replace(buffer);
+                        let park = d.buffer.as_ref().and_then(|buf| {
+                            let (start, end) = *buf.silence.first()?;
+                            (start <= 0.0 && end > 0.0 && end < buf.frames() as f64).then_some(end)
+                        });
+                        if let Some(end) = park {
+                            d.playhead = end;
+                            d.cue_point = end;
+                        }
                         self.retire(old);
                     } else {
                         self.retire(Some(buffer));
@@ -2591,6 +2654,43 @@ mod tests {
             d.beat_offset = 0.0;
             d.beat_interval = 24_000.0; // 120 BPM @ 48 kHz
         }
+    }
+
+    #[test]
+    fn playback_jumps_over_silence_and_scratch_stays() {
+        let rate = 48_000u32;
+        let mut samples = vec![0.4f32; 2 * rate as usize];
+        samples.extend(std::iter::repeat(0.0).take(2 * rate as usize));
+        samples.extend(std::iter::repeat(0.4).take(2 * rate as usize));
+        let spans = crate::silence_spans(&samples, rate);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let mut deck = DeckPlayer::new(rate as f32);
+        deck.buffer = Some(Arc::new(DeckBuffer::new(samples, rate).with_silence(spans)));
+        deck.base_ratio = 1.0;
+        deck.tempo = 1.0;
+        deck.playing = true;
+        deck.playhead = rate as f64 - 10.0;
+        for _ in 0..100 {
+            deck.next_frame();
+        }
+        assert!(
+            deck.playhead > rate as f64 * 2.0,
+            "playhead {}",
+            deck.playhead
+        );
+
+        deck.playhead = rate as f64 - 10.0;
+        deck.scratching = true;
+        deck.scratch_speed = 1.0;
+        deck.scratch_rate = 1.0;
+        for _ in 0..100 {
+            deck.next_frame();
+        }
+        assert!(
+            deck.playhead < rate as f64 + 200.0,
+            "scratch playhead {}",
+            deck.playhead
+        );
     }
 
     #[test]

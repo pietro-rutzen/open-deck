@@ -30,6 +30,8 @@ export interface DeckLoaded {
   band_peaks: [number, number, number][];
   /** Loudness-normalization factor applied on load (1.0 = none). */
   replay_gain: number;
+  /** Silent regions `[start, end)` in source frames. Playback jumps across them. */
+  silence?: [number, number][];
 }
 
 /** Frequency colors are independent of deck identity: blue lows, amber mids, pale highs. */

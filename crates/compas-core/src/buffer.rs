@@ -11,6 +11,9 @@ pub struct DeckBuffer {
     pub samples: Vec<f32>,
     /// The rate the samples were decoded at (NOT the output device rate).
     pub source_rate: u32,
+    /// Silent regions `[start, end)` in source frames. Empty unless a load measured them.
+    /// The audio thread only reads this; it never grows it.
+    pub silence: std::sync::Arc<[(f64, f64)]>,
 }
 
 impl DeckBuffer {
@@ -18,7 +21,13 @@ impl DeckBuffer {
         DeckBuffer {
             samples,
             source_rate,
+            silence: std::sync::Arc::from([]),
         }
+    }
+
+    pub fn with_silence(mut self, spans: Vec<(f64, f64)>) -> Self {
+        self.silence = std::sync::Arc::from(spans);
+        self
     }
 
     /// Number of stereo frames.
