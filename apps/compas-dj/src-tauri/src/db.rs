@@ -645,12 +645,148 @@ pub fn history(c: &Connection, limit: i64) -> rusqlite::Result<Vec<HistoryRow>> 
 // Search query language
 // ---------------------------------------------------------------------------------
 
+const PITCH_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
+
+fn flat_to_sharp(note: &str) -> Option<&'static str> {
+    match note {
+        "DB" => Some("C#"),
+        "EB" => Some("D#"),
+        "GB" => Some("F#"),
+        "AB" => Some("G#"),
+        "BB" => Some("A#"),
+        _ => None,
+    }
+}
+
+fn camelot_code(token: &str) -> Option<String> {
+    let upper = token.to_ascii_uppercase();
+    let (number, mode) = upper.split_at(upper.len().saturating_sub(1));
+    if mode != "A" && mode != "B" {
+        return None;
+    }
+    let wheel = number.parse::<u8>().ok()?;
+    if (1..=12).contains(&wheel) {
+        Some(format!("{wheel}{mode}"))
+    } else {
+        None
+    }
+}
+
+fn note_suffix(lower: &str) -> Option<(&'static str, bool)> {
+    if lower.ends_with("minor") {
+        Some(("minor", true))
+    } else if lower.ends_with("major") {
+        Some(("major", false))
+    } else if lower.ends_with("min") && lower.len() > 3 {
+        Some(("min", true))
+    } else if lower.ends_with("maj") && lower.len() > 3 {
+        Some(("maj", false))
+    } else if lower.ends_with('m') && lower.len() > 1 {
+        Some(("m", true))
+    } else {
+        None
+    }
+}
+
+/// Musical names a token should match: the stored short name (`Am`, `F#`) and the long form.
+fn musical_names(token: &str) -> Vec<String> {
+    let compact: String = token
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .replace('♯', "#")
+        .replace('♭', "b");
+    let lower = compact.to_ascii_lowercase();
+    let (suffix, minor) = note_suffix(&lower).unwrap_or(("", false));
+    let note = &compact[..compact.len() - suffix.len()];
+    let mut upper = note.to_ascii_uppercase();
+    if let Some(sharp) = flat_to_sharp(&upper) {
+        upper = sharp.to_string();
+    }
+    if !PITCH_NAMES.contains(&upper.as_str()) {
+        return Vec::new();
+    }
+    if minor {
+        vec![format!("{upper}m"), format!("{upper} minor")]
+    } else {
+        vec![upper.clone(), format!("{upper} major")]
+    }
+}
+
+fn parse_bpm_endpoint(raw: &str) -> Option<f64> {
+    let normalized = raw.trim().replace(',', ".");
+    let value = normalized.parse::<f64>().ok()?;
+    if value.is_finite() && value > 0.0 && value < 400.0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Inclusive display window for one tempo token. `117` covers 117.00–117.99; `117.69` covers the
+/// values that round to that text.
+fn bpm_window(token: &str) -> Option<(f64, f64)> {
+    let normalized = token.trim().replace(',', ".");
+    if normalized.contains('-') {
+        return None;
+    }
+    let value = parse_bpm_endpoint(&normalized)?;
+    match normalized.split_once('.') {
+        Some((_, fraction)) if !fraction.is_empty() => {
+            let half = 10f64.powi(-(fraction.len() as i32)) / 2.0;
+            Some((value - half, value + half))
+        }
+        Some(_) => None,
+        None => Some((value, value + 1.0)),
+    }
+}
+
+fn push_bpm_match(token: &str, params: &mut Vec<rusqlite::types::Value>) -> Option<String> {
+    use rusqlite::types::Value;
+    if let Some((start, end)) = token.split_once('-') {
+        let first = parse_bpm_endpoint(start)?;
+        let second = parse_bpm_endpoint(end)?;
+        let (low, high) = if first <= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        params.push(Value::Real(low));
+        params.push(Value::Real(high));
+        return Some("(bpm >= ? AND bpm <= ?)".to_string());
+    }
+    let (low, high) = bpm_window(token)?;
+    params.push(Value::Real(low));
+    params.push(Value::Real(high));
+    Some("(bpm >= ? AND bpm < ?)".to_string())
+}
+
+fn push_key_match(token: &str, params: &mut Vec<rusqlite::types::Value>) -> Option<String> {
+    use rusqlite::types::Value;
+    let mut parts = Vec::new();
+    if let Some(code) = camelot_code(token) {
+        params.push(Value::Text(code));
+        parts.push("UPPER(key_camelot) = ?".to_string());
+    }
+    for name in musical_names(token) {
+        params.push(Value::Text(name.to_uppercase()));
+        parts.push("UPPER(key_name) = ?".to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("({})", parts.join(" OR ")))
+    }
+}
+
 /// Compile a search string into a SQL `WHERE` body + bound parameters. Grammar (space-separated):
-/// `bpm:120-128` (range) · `bpm:128` (±1) · `key:8A` · `artist:foo` / `title:foo` (fuzzy LIKE) ·
-/// `tag:foo` (exact tag) · a bare word matches title OR artist · a `-` prefix negates any term.
-/// Unknown `field:` tokens are
-/// ignored. Terms are AND-ed within a group; a literal `OR` (or `|`) token starts a new group and
-/// groups are OR-ed — e.g. `artist:daft OR artist:justice`, or `bpm:120-125 key:8A OR bpm:170-175`.
+/// `bpm:120-128` (range) · `bpm:117` or `117.69` (the tempo as shown) · `key:8A` / `8A` / `Am` ·
+/// `artist:foo` / `title:foo` (fuzzy LIKE) · `tag:foo` (exact tag) · a bare word matches title,
+/// artist, the displayed tempo, or the key · a `-` prefix negates any term.
+/// Unknown `field:` tokens are ignored. Terms are AND-ed within a group; a literal `OR` (or `|`)
+/// token starts a new group and groups are OR-ed.
 /// Returns `("1=1", [])` for an empty query.
 pub fn build_search(query: &str) -> (String, Vec<rusqlite::types::Value>) {
     use rusqlite::types::Value;
@@ -673,28 +809,8 @@ pub fn build_search(query: &str) -> (String, Vec<rusqlite::types::Value>) {
                 None
             } else {
                 match field.to_ascii_lowercase().as_str() {
-                    "bpm" => {
-                        if let Some((a, b)) = val.split_once('-') {
-                            match (a.parse::<f64>(), b.parse::<f64>()) {
-                                (Ok(a), Ok(b)) => {
-                                    params.push(Value::Real(a));
-                                    params.push(Value::Real(b));
-                                    Some("bpm BETWEEN ? AND ?".to_string())
-                                }
-                                _ => None,
-                            }
-                        } else if let Ok(v) = val.parse::<f64>() {
-                            params.push(Value::Real(v - 1.0));
-                            params.push(Value::Real(v + 1.0));
-                            Some("bpm BETWEEN ? AND ?".to_string())
-                        } else {
-                            None
-                        }
-                    }
-                    "key" => {
-                        params.push(Value::Text(val.to_uppercase()));
-                        Some("key_camelot = ?".to_string())
-                    }
+                    "bpm" => push_bpm_match(val, &mut params),
+                    "key" => push_key_match(val, &mut params),
                     "artist" => {
                         params.push(Value::Text(format!("%{val}%")));
                         Some("artist LIKE ?".to_string())
@@ -718,7 +834,14 @@ pub fn build_search(query: &str) -> (String, Vec<rusqlite::types::Value>) {
             let like = format!("%{tok}%");
             params.push(Value::Text(like.clone()));
             params.push(Value::Text(like));
-            Some("(title LIKE ? OR artist LIKE ?)".to_string())
+            let mut clauses = vec!["title LIKE ?".to_string(), "artist LIKE ?".to_string()];
+            if let Some(bpm) = push_bpm_match(tok, &mut params) {
+                clauses.push(bpm);
+            }
+            if let Some(key) = push_key_match(tok, &mut params) {
+                clauses.push(key);
+            }
+            Some(format!("({})", clauses.join(" OR ")))
         };
 
         if let Some(c) = cond {
@@ -1168,6 +1291,27 @@ mod tests {
 
         assert_eq!(search_tracks(&c, "funk").unwrap().len(), 1);
         assert_eq!(search_tracks(&c, "  ").unwrap().len(), 2); // empty → all
+    }
+
+    #[test]
+    fn search_matches_displayed_bpm_and_key() {
+        let c = mem();
+        add_track(&c, "/a.mp3", "Samba", "Maya", 1).unwrap();
+        upsert_analysis(&c, "/a.mp3", 117.694, 0.9, 0.0, 0.5, "8B", "C").unwrap();
+        add_track(&c, "/b.mp3", "Other", "Someone", 1).unwrap();
+        upsert_analysis(&c, "/b.mp3", 87.97, 0.9, 0.0, 0.5, "7B", "F#m").unwrap();
+
+        assert_eq!(search_tracks(&c, "117").unwrap()[0].path, "/a.mp3");
+        assert_eq!(search_tracks(&c, "117.69").unwrap()[0].path, "/a.mp3");
+        assert_eq!(search_tracks(&c, "117,69").unwrap()[0].path, "/a.mp3");
+        assert!(search_tracks(&c, "118").unwrap().is_empty());
+        assert_eq!(search_tracks(&c, "8B").unwrap()[0].path, "/a.mp3");
+        assert_eq!(search_tracks(&c, "8b").unwrap()[0].path, "/a.mp3");
+        assert_eq!(search_tracks(&c, "C").unwrap()[0].path, "/a.mp3");
+        assert_eq!(search_tracks(&c, "F#m").unwrap()[0].path, "/b.mp3");
+        assert_eq!(search_tracks(&c, "key:F#m").unwrap()[0].path, "/b.mp3");
+        assert_eq!(search_tracks(&c, "bpm:87.97").unwrap()[0].path, "/b.mp3");
+        assert_eq!(search_tracks(&c, "Gbm").unwrap()[0].path, "/b.mp3");
     }
 
     #[test]

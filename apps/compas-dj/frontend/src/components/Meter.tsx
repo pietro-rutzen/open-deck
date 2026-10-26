@@ -8,8 +8,6 @@ const SEGMENTS = [
   { db: -36, threshold: 0.015848932, color: "#39e58c", label: "−36" },
 ];
 
-export const METER_DB_LABELS = SEGMENTS.map((segment) => segment.label);
-
 export function Meter({
   level,
   height,

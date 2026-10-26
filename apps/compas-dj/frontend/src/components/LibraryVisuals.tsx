@@ -126,7 +126,7 @@ export function TrackCells({ path, title, artist, color, afterArtist, beforeWave
     const el = ref.current;
     if (!el || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver(([entry]) => setVisible(entry.isIntersecting), {
-      root: el.closest(".tl-body"), rootMargin: "120px 0px",
+      root: el.closest(".tl-sheet"), rootMargin: "120px 0px",
     });
     observer.observe(el);
     return () => observer.disconnect();

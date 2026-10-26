@@ -23,6 +23,7 @@ import { useMidi } from "./hooks/useMidi";
 import { useMidiMap } from "./hooks/useMidiMap";
 import { useSampler } from "./hooks/useSampler";
 import { controllerLearn, controllerSession, onControllerSession, controllerFeedback, engineStatus, inTauri, onControllerBatch, onControllerUpdate, pickRecordingPath, pitchClassOf, setCrossfader, setCrossfaderConfig, setDeckFxMacro, setMasterGain, startRecording, stopRecording, type ControllerUpdate, type EngineStatus, type KeyNotation } from "./lib/ipc";
+import { useWindowFrame } from "./lib/windowFrame";
 
 const DECK_COLORS = ["var(--deck-a)", "var(--deck-b)", "var(--deck-c)", "var(--deck-d)"];
 const DECK_LETTERS = ["A", "B", "C", "D"];
@@ -34,6 +35,7 @@ const KEY_SHIFT_PADS = [0, 1, 2, 3, -3, -2, -1, 0];
 const KEY_SHIFT_STEP_PADS = [1, 2, 3, 4, -1, -2, -3, -4];
 
 export function App() {
+  useWindowFrame();
   // Four local/full-DSP decks; only two deck panels are shown at a time (switching slots),
   // while the mixer exposes all four channel strips.
   // The internal master clock is a global tempo source decks can follow (INT) and beat-synced FX

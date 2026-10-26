@@ -169,13 +169,19 @@ const stepsAhead = (index: number, here: number, count: number) => {
   return index > here ? index - here : count - here + index;
 };
 
-/** Closest analyzed BPM first. Equal distances follow the next filename in that folder. */
+const tempoFraction = (bpm: number | null, reference: number | null) => {
+  if (reference == null || bpm == null) return 0.5;
+  return Math.min(1, Math.abs(bpm - reference) / 32);
+};
+
+/** Closest analyzed BPM first when `tempoWeight` is 1. Lower weights follow folder order and only nudge for tempo. */
 export function suggestNextTracks<Track extends NextTrackCandidate>(
   tracks: readonly Track[],
   currentPath: string,
   currentBpm: number | null,
   busyPaths: readonly string[],
   limit: number,
+  tempoWeight = 1,
 ): Track[] {
   if (limit <= 0) return [];
   const folder = directoryOf(currentPath);
@@ -185,17 +191,28 @@ export function suggestNextTracks<Track extends NextTrackCandidate>(
   const here = ordered.findIndex((track) => track.path === currentPath);
   const reference = knownTempo(currentBpm) ?? knownTempo(here >= 0 ? ordered[here]?.bpm : null);
   const busy = new Set([...busyPaths, currentPath]);
+  const weight = Math.min(1, Math.max(0, tempoWeight));
   return ordered
     .map((track, index) => ({ track, index }))
     .filter(({ track }) => !busy.has(track.path))
     .sort((left, right) => {
-      const leftTempo = knownTempo(left.track.bpm);
-      const rightTempo = knownTempo(right.track.bpm);
-      const leftDistance = reference == null || leftTempo == null ? Number.POSITIVE_INFINITY : Math.abs(leftTempo - reference);
-      const rightDistance = reference == null || rightTempo == null ? Number.POSITIVE_INFINITY : Math.abs(rightTempo - reference);
-      if (leftDistance < rightDistance) return -1;
-      if (leftDistance > rightDistance) return 1;
-      return stepsAhead(left.index, here, ordered.length) - stepsAhead(right.index, here, ordered.length);
+      const leftSteps = stepsAhead(left.index, here, ordered.length);
+      const rightSteps = stepsAhead(right.index, here, ordered.length);
+      if (weight >= 1) {
+        const leftTempo = knownTempo(left.track.bpm);
+        const rightTempo = knownTempo(right.track.bpm);
+        const leftDistance = reference == null || leftTempo == null ? Number.POSITIVE_INFINITY : Math.abs(leftTempo - reference);
+        const rightDistance = reference == null || rightTempo == null ? Number.POSITIVE_INFINITY : Math.abs(rightTempo - reference);
+        if (leftDistance < rightDistance) return -1;
+        if (leftDistance > rightDistance) return 1;
+        return leftSteps - rightSteps;
+      }
+      const span = Math.max(1, ordered.length);
+      const leftScore = (1 - weight) * (leftSteps / span) + weight * tempoFraction(knownTempo(left.track.bpm), reference);
+      const rightScore = (1 - weight) * (rightSteps / span) + weight * tempoFraction(knownTempo(right.track.bpm), reference);
+      if (leftScore < rightScore) return -1;
+      if (leftScore > rightScore) return 1;
+      return leftSteps - rightSteps;
     })
     .slice(0, limit)
     .map(({ track }) => track);

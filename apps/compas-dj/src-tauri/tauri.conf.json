@@ -15,8 +15,8 @@
       {
         "label": "main",
         "title": "OpenDeck \u2014 Comp\u00e1s prototype",
-        "width": 1440,
-        "height": 900,
+        "width": 1680,
+        "height": 1050,
         "minWidth": 1280,
         "minHeight": 768,
         "resizable": true,

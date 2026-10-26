@@ -2,16 +2,19 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 
 const clampSize = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
-export function useStoredSize(key: string, fallback: number, min: number, max: number) {
-  const [size, setSize] = useState(() => {
+export function useStoredSize(key: string, min: number, max: number) {
+  const [size, setSize] = useState<number | null>(() => {
     try {
-      const saved = Number(localStorage.getItem(key));
-      return Number.isFinite(saved) ? clampSize(saved, min, max) : fallback;
+      const saved = localStorage.getItem(key);
+      if (saved == null || saved.trim() === "") return null;
+      const parsed = Number(saved);
+      return Number.isFinite(parsed) ? clampSize(parsed, min, max) : null;
     } catch {
-      return fallback;
+      return null;
     }
   });
   useEffect(() => {
+    if (size == null) return;
     try { localStorage.setItem(key, String(size)); } catch { /* Preference is optional. */ }
   }, [key, size]);
   return [size, setSize] as const;
@@ -54,7 +57,9 @@ export function PaneDivider({
         event.preventDefault();
         event.currentTarget.focus();
         event.currentTarget.setPointerCapture(event.pointerId);
-        drag.current = { x: event.clientX, width: value };
+        const pane = grow === 1 ? event.currentTarget.previousElementSibling : event.currentTarget.nextElementSibling;
+        const measured = pane instanceof HTMLElement ? pane.getBoundingClientRect().width : value;
+        drag.current = { x: event.clientX, width: measured };
       }}
       onPointerMove={(event) => {
         const start = drag.current;
@@ -78,33 +83,39 @@ export function PaneDivider({
 }
 
 export function MixerFrame({ children }: { children: ReactNode }) {
-  const [width, setWidth] = useStoredSize("opendeck.mixer.width.v1", 268, 220, 640);
+  const [width, setWidth] = useStoredSize("opendeck.mixer.width.v2", 320, 720);
   return (
     <>
-      <PaneDivider label="Resize mixer" value={width} min={220} max={640} fallback={268} grow={-1} onChange={setWidth} />
-      <div className="mixer-size" style={{ width }}>{children}</div>
-      <PaneDivider label="Resize mixer" value={width} min={220} max={640} fallback={268} grow={1} onChange={setWidth} />
+      <PaneDivider label="Resize mixer" value={width ?? 360} min={320} max={720} fallback={360} grow={-1} onChange={setWidth} />
+      <div className="mixer-size" style={width == null ? undefined : { width }}>{children}</div>
+      <PaneDivider label="Resize mixer" value={width ?? 360} min={320} max={720} fallback={360} grow={1} onChange={setWidth} />
     </>
   );
 }
 
-const STORAGE_KEY = "opendeck.workspace.split.v1";
-const DEFAULT_RATIO = 0.8;
+const STORAGE_KEY = "opendeck.workspace.split.v2";
 const DIVIDER = 1;
+const DEFAULT_RATIO = 0.58;
+const MIN_PANE = 140;
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const readRatio = () => {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved == null || saved.trim() === "") return null;
+    const value = Number(saved);
+    return Number.isFinite(value) && value > 0 && value < 1 ? value : null;
+  } catch {
+    return null;
+  }
+};
 
 /** Resize the performance layout within usable control and library bounds. */
 export function WorkspaceSplit({ upper, lower }: { upper: ReactNode; lower: ReactNode }) {
   const root = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
   const [height, setHeight] = useState(0);
-  const [ratio, setRatio] = useState(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      const value = saved === null ? NaN : Number(saved);
-      return Number.isFinite(value) && value > 0 && value < 1 ? value : DEFAULT_RATIO;
-    } catch { return DEFAULT_RATIO; }
-  });
+  const [ratio, setRatio] = useState<number | null>(readRatio);
   useEffect(() => {
     const element = root.current;
     if (!element) return;
@@ -114,26 +125,30 @@ export function WorkspaceSplit({ upper, lower }: { upper: ReactNode; lower: Reac
     return () => observer.disconnect();
   }, []);
   useEffect(() => {
+    if (ratio == null) {
+      try { localStorage.removeItem(STORAGE_KEY); } catch { /* Preference is optional. */ }
+      return;
+    }
     try { localStorage.setItem(STORAGE_KEY, String(ratio)); } catch { /* Preference is optional. */ }
   }, [ratio]);
 
   const available = Math.max(0, height - DIVIDER);
-  const min = Math.min(500, Math.max(available / 2, available - 160));
-  const max = available - Math.min(160, available / 2);
-  const upperHeight = clamp(available * ratio, min, max);
+  const min = Math.min(MIN_PANE, available);
+  const max = Math.max(min, available - Math.min(MIN_PANE, available));
+  const upperHeight = clamp(available * (ratio ?? DEFAULT_RATIO), min, max);
   const moveTo = (pixels: number) => {
     if (available > 0) setRatio(clamp(pixels, min, max) / available);
   };
   return (
     <div className="workspace-split" ref={root}
-      style={{ gridTemplateRows: height ? `${upperHeight}px ${DIVIDER}px minmax(0, 1fr)` : `${DEFAULT_RATIO}fr ${DIVIDER}px ${1 - DEFAULT_RATIO}fr` }}>
+      style={{ gridTemplateRows: height && upperHeight ? `${upperHeight}px ${DIVIDER}px minmax(0, 1fr)` : `max-content ${DIVIDER}px minmax(220px, 1fr)` }}>
       <section className="workspace-upper" aria-label="Decks and mixer">{upper}</section>
       <div className="workspace-divider" role="separator" tabIndex={0}
         aria-label="Resize decks and library" aria-orientation="horizontal"
         aria-valuemin={Math.round(min)} aria-valuemax={Math.round(max)} aria-valuenow={Math.round(upperHeight)}
         aria-valuetext={`Decks ${Math.round(upperHeight)} pixels, library ${Math.round(available - upperHeight)} pixels`}
         title="Drag to resize decks and library · double-click to reset"
-        onDoubleClick={() => setRatio(DEFAULT_RATIO)}
+        onDoubleClick={() => setRatio(null)}
         onPointerDown={(event) => {
           if (event.button !== 0) return;
           event.preventDefault();

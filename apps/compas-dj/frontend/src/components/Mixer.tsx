@@ -10,7 +10,7 @@ import { baseName, orderSuggestions, reorderPaths, suggestNextTracks } from "../
 import { TRIM_MAX } from "../lib/trim";
 import { Knob } from "./Knob";
 import { Fader } from "./Fader";
-import { Meter, METER_DB_LABELS } from "./Meter";
+import { Meter } from "./Meter";
 import { useTrackVisuals } from "./LibraryVisuals";
 import { Icon } from "./icons";
 
@@ -70,7 +70,6 @@ export function Mixer({
           return (
             <div className="mixer-pair" key={left.letter}>
               <ChannelStrip {...left} cue={cue} onFxMacro={onFxMacro} compact={quad} options={options} />
-              <MeterBridge left={left} right={right} />
               {right && <ChannelStrip {...right} cue={cue} onFxMacro={onFxMacro} compact={quad} options={options} />}
             </div>
           );
@@ -124,18 +123,6 @@ const channelPairs = (channels: Channel[]) => {
   return pairs;
 };
 
-function MeterBridge({ left, right }: { left: Channel; right?: Channel }) {
-  return (
-    <div className="meter-bridge">
-      <Meter level={left.ctrl.state.level} streaming={!left.ctrl.state.dsp} showClip={false} showLabels={false} />
-      <div className="meter-scale">
-        {METER_DB_LABELS.map((label) => <span key={label}>{label}</span>)}
-      </div>
-      {right && <Meter level={right.ctrl.state.level} streaming={!right.ctrl.state.dsp} showClip={false} showLabels={false} />}
-    </div>
-  );
-}
-
 function useLibraryTracks(): DbTrack[] {
   const [tracks, setTracks] = useState<DbTrack[]>([]);
   useEffect(() => {
@@ -169,10 +156,12 @@ function NextTracks({
 }) {
   const tracks = useLibraryTracks();
   const deckAFollow = (): Record<number, boolean> => (listeningModeActive() ? { 0: true } : {});
+  const [listening, setListening] = useState(listeningModeActive);
   const [queueOn, setQueueOn] = useState<Record<number, boolean>>(deckAFollow);
   const [playOn, setPlayOn] = useState<Record<number, boolean>>(deckAFollow);
   useEffect(() => subscribeListeningMode(() => {
     const active = listeningModeActive();
+    setListening(active);
     setQueueOn((current) => ({ ...current, 0: active }));
     setPlayOn((current) => ({ ...current, 0: active }));
   }), []);
@@ -207,23 +196,20 @@ function NextTracks({
     const reference = libraryBpm != null && libraryBpm > 0 ? libraryBpm : (meta && meta.bpm > 0 ? meta.bpm : null);
     const suggestions = meta
       ? orderSuggestions(
-          suggestNextTracks(tracks, meta.path, reference, busyPaths.filter((path): path is string => Boolean(path)), limit),
+          suggestNextTracks(tracks, meta.path, reference, busyPaths.filter((path): path is string => Boolean(path)), limit, listening ? 0.2 : 1),
           manualOrder[`${channel.ctrl.deck}:${meta.path}`],
         )
       : [];
     return { channel, suggestions };
-  }), [channels, tracks, busyPaths, limit, manualOrder]);
+  }), [channels, tracks, busyPaths, limit, manualOrder, listening]);
 
   return (
     <div className={`mixer-next ${channels.length > 2 ? "mixer-next--quad" : ""}`}>
-      <div className="next-banner">
-        <h3 className="overline">Next</h3>
-      </div>
+      <h3 className="overline next-banner">Next</h3>
       <div className="next-grid">
       {columns.map(({ channel, suggestions }) => (
         <section className="mixer-next-col" key={channel.letter} aria-label={`Next tracks for deck ${channel.letter}`}>
           <div className="next-col-head">
-            <span className="next-letter" style={{ color: channel.color }}>{channel.letter}</span>
             <div className="next-modes" role="group" aria-label={`Auto load for deck ${channel.letter}`}>
               <button
                 type="button"
@@ -401,11 +387,9 @@ function NextCard({
       </span>
       <span className="next-copy">
         <span className="next-title">{title}</span>
-        <span className="next-line">
-          <span className="next-artist">{artist}</span>
-          {tempo && <span className="next-bpm">{tempo}</span>}
-        </span>
+        <span className="next-artist">{artist}</span>
       </span>
+      {tempo && <span className="next-bpm">{tempo}</span>}
     </div>
   );
 }
@@ -595,22 +579,25 @@ function ChannelStrip({
           ))}
         </div>}
 
-        <div className={`knob-stack ${compact ? "knob-stack--compact" : ""} ${dsp ? "" : "knob-stack--locked"}`}>
-          <Knob label="TRIM" value={state.trim} min={0} max={TRIM_MAX} law="trim" size={ks} color={color} disabled={!dsp}
-            onChange={actions.setTrim} />
-          <Knob label="HI" value={state.eq.hi} min={-26} max={6} size={ks} color={color} disabled={!dsp}
-            onChange={(v) => actions.setEq({ ...state.eq, hi: v })} />
-          <Knob label="MID" value={state.eq.mid} min={-26} max={6} size={ks} color={color} disabled={!dsp}
-            onChange={(v) => actions.setEq({ ...state.eq, mid: v })} />
-          <Knob label="LOW" value={state.eq.low} min={-26} max={6} size={ks} color={color} disabled={!dsp}
-            onChange={(v) => actions.setEq({ ...state.eq, low: v })} />
-          <Knob label="FILTER" value={state.filter} min={-1} max={1} size={ks} color={color} disabled={!dsp}
-            onChange={(v) => actions.setFilter(v)} />
-          {options && onFxMacro && (
-            <Knob label="FX" value={fxMacro} min={0} max={1} size={ks} color={color} disabled={!dsp}
-              onChange={(v) => { setFxMacro(v); onFxMacro(ctrl.deck, v); }} />
-          )}
-          {!dsp && <span className="eq-na">EQ N/A</span>}
+        <div className="strip-eq">
+          <div className={`knob-stack ${compact ? "knob-stack--compact" : ""} ${dsp ? "" : "knob-stack--locked"}`}>
+            <Knob label="TRIM" value={state.trim} min={0} max={TRIM_MAX} law="trim" size={ks} color={color} disabled={!dsp}
+              onChange={actions.setTrim} />
+            <Knob label="HI" value={state.eq.hi} min={-26} max={6} size={ks} color={color} disabled={!dsp}
+              onChange={(v) => actions.setEq({ ...state.eq, hi: v })} />
+            <Knob label="MID" value={state.eq.mid} min={-26} max={6} size={ks} color={color} disabled={!dsp}
+              onChange={(v) => actions.setEq({ ...state.eq, mid: v })} />
+            <Knob label="LOW" value={state.eq.low} min={-26} max={6} size={ks} color={color} disabled={!dsp}
+              onChange={(v) => actions.setEq({ ...state.eq, low: v })} />
+            <Knob label="FILTER" value={state.filter} min={-1} max={1} size={ks} color={color} disabled={!dsp}
+              onChange={(v) => actions.setFilter(v)} />
+            {options && onFxMacro && (
+              <Knob label="FX" value={fxMacro} min={0} max={1} size={ks} color={color} disabled={!dsp}
+                onChange={(v) => { setFxMacro(v); onFxMacro(ctrl.deck, v); }} />
+            )}
+            {!dsp && <span className="eq-na">EQ N/A</span>}
+          </div>
+          <Meter level={state.level} streaming={!dsp} showClip={false} showLabels />
         </div>
       </div>
     </div>

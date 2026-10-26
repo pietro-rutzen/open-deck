@@ -353,7 +353,7 @@ export function Deck({
             <button className="deck-load" onClick={actions.eject}>Eject</button>
           ) : (
             <button className="deck-load deck-load--primary" onClick={actions.load} style={{ borderColor: `${color}66`, color }}>
-              Load…
+              Load
             </button>
           )}
           <span className="src-badge" style={dsp ? { color: "var(--status-ok)", borderColor: "#3ddc9755", background: "#3ddc971a" } : { color: "var(--stream)", borderColor: "#28e0ff55", background: "#28e0ff1a" }}>
@@ -656,12 +656,7 @@ export function Deck({
                 </div>
               )}
             </>
-          ) : (
-            <div className="stream-note">
-              Loops &amp; FX disabled on stream decks — the service returns playback control, not
-              decoded audio; compas won't fake DSP it can't perform.
-            </div>
-          )}
+          ) : null}
         </div>
 
         {/* tempo fader */}
