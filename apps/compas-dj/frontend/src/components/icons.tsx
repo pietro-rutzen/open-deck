@@ -102,6 +102,38 @@ const PATHS: Record<IconName, ReactNode> = {
   ),
 };
 
+export function BrandMark() {
+  return (
+    <svg className="brand-mark" viewBox="0 0 72 34" aria-hidden="true">
+      <defs>
+        <linearGradient id="brand-split" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="50%" stopColor="var(--deck-a)" />
+          <stop offset="50%" stopColor="var(--deck-b)" />
+        </linearGradient>
+      </defs>
+      <rect width="72" height="34" fill="url(#brand-split)" />
+      <circle cx="9" cy="6" r="2.1" fill="#141416" />
+      <circle cx="16" cy="6" r="2.1" fill="#141416" />
+      <circle cx="23" cy="6" r="2.1" fill="#141416" />
+      <circle cx="49" cy="6" r="2.1" fill="#141416" />
+      <circle cx="56" cy="6" r="2.1" fill="#141416" />
+      <circle cx="63" cy="6" r="2.1" fill="#141416" />
+      <circle cx="15" cy="21" r="9" fill="#141416" />
+      <circle cx="57" cy="21" r="9" fill="#141416" />
+      <circle cx="15" cy="21" r="1.15" fill="#e4e4e8" />
+      <circle cx="57" cy="21" r="1.15" fill="#e4e4e8" />
+      <path d="M27 16 L17 19" stroke="#e4e4e8" strokeWidth="1.7" />
+      <path d="M45 16 L55 19" stroke="#e4e4e8" strokeWidth="1.7" />
+      <circle cx="27" cy="16" r="1.5" fill="#e4e4e8" />
+      <circle cx="45" cy="16" r="1.5" fill="#e4e4e8" />
+      <rect x="2" y="15" width="2.2" height="12" fill="#141416" />
+      <rect x="67.8" y="15" width="2.2" height="12" fill="#141416" />
+      <rect x="2" y="19" width="2.2" height="2.4" fill="#e4e4e8" />
+      <rect x="67.8" y="19" width="2.2" height="2.4" fill="#e4e4e8" />
+    </svg>
+  );
+}
+
 export function Icon({
   name,
   size = 22,

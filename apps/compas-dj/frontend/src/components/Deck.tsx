@@ -78,6 +78,24 @@ const END_LIGHT_STOPS: ReadonlyArray<
   [1, [255, 42, 42]],
 ];
 
+const BEAT_FLASH_SECS = 0.11;
+
+/** 1 on the beat, then a short falloff. Time is the track's own clock, so pitch still lands on the grid. */
+const beatFlash = (
+  audioSeconds: number,
+  beatOffset: number,
+  beatInterval: number,
+  audioPerWallSecond: number,
+): number => {
+  if (beatInterval <= 0 || audioPerWallSecond <= 0) return 0;
+  const phase = (audioSeconds - beatOffset) / beatInterval;
+  const intoBeat = phase - Math.floor(phase);
+  const wallSeconds = (intoBeat * beatInterval) / audioPerWallSecond;
+  if (wallSeconds >= BEAT_FLASH_SECS) return 0;
+  const falloff = wallSeconds / BEAT_FLASH_SECS;
+  return (1 - falloff) * (1 - falloff);
+};
+
 const endingLight = (remainingSecs: number): string => {
   const progress = Math.min(
     1,
@@ -206,6 +224,11 @@ export function Deck({
   const endLightStyle = endLight
     ? { ['--end-light' as string]: endLight }
     : undefined;
+  const beatInterval = meta?.beat_interval_sec ?? 0;
+  const beatSynced =
+    endWarning &&
+    beatInterval > 0 &&
+    !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   // Manual loop-in is set and waiting for OUT — light IN, invite OUT.
   const loopArmed = !!state.loop.armed && !state.loop.active;
@@ -217,6 +240,7 @@ export function Deck({
   // Dragging the platter streams a read-rate to the engine derived from angular
   // velocity, and rotates the disc 1:1 with the hand. A rAF loop samples the pointer
   // so a held-but-still finger decays to a clean "held" (speed 0) instead of coasting.
+  const deckRef = useRef<HTMLElement>(null);
   const platterRef = useRef<HTMLDivElement>(null);
   const needleRef = useRef<SVGGElement>(null);
   const arcRef = useRef<SVGCircleElement>(null);
@@ -340,6 +364,16 @@ export function Deck({
     sourceRate: rate,
     frames,
   };
+  const endBlink = useRef({
+    active: false,
+    interval: 0,
+    offset: 0,
+  });
+  endBlink.current = {
+    active: beatSynced,
+    interval: beatInterval,
+    offset: (meta?.first_beat_sec ?? 0) + state.gridOffset,
+  };
   useEffect(() => {
     const circumference = 2 * Math.PI * 44;
     let raf = 0;
@@ -368,6 +402,23 @@ export function Deck({
           (circumference * (1 - played)).toFixed(2),
         );
       }
+      const deck = deckRef.current;
+      const blink = endBlink.current;
+      if (deck && blink.active && blink.interval > 0) {
+        const audioPerWall =
+          motion.sourceRate > 0 ? Math.abs(motion.rate) / motion.sourceRate : 0;
+        deck.style.setProperty(
+          '--end-flash',
+          beatFlash(
+            playheadSeconds(motion),
+            blink.offset,
+            blink.interval,
+            audioPerWall,
+          ).toFixed(3),
+        );
+      } else {
+        deck?.style.removeProperty('--end-flash');
+      }
       raf = requestAnimationFrame(paint);
     };
     raf = requestAnimationFrame(paint);
@@ -394,6 +445,7 @@ export function Deck({
 
   return (
     <section
+      ref={deckRef}
       className={`deck${expanded ? ' deck--expanded' : ''}${mirror ? ' deck--mirror' : ''}${compact ? ' deck--compact' : ''}`}
       style={
         {
@@ -560,13 +612,14 @@ export function Deck({
         color={color}
         onSeek={actions.seekFrac}
         ending={endWarning}
+        beat={beatSynced}
       />
 
       <div className="deck-body">
         {/* platter */}
         <div className="platter-col">
           <div
-            className={`platter${scratching ? ' platter--scratch' : ''}${endWarning ? ' platter--warn' : ''}`}
+            className={`platter${scratching ? ' platter--scratch' : ''}${endWarning ? ' platter--warn' : ''}${beatSynced ? ' platter--beat' : ''}`}
             style={endLightStyle}
             ref={platterRef}
             onPointerDown={onPointerDown}
@@ -654,7 +707,7 @@ export function Deck({
               CUE
             </button>
             <button
-              className={`btn-play${playing ? ' btn-play--on' : meta ? ' btn-play--ready' : ''}${endWarning ? ' btn-play--warn' : ''}`}
+              className={`btn-play${playing ? ' btn-play--on' : meta ? ' btn-play--ready' : ''}${endWarning ? ' btn-play--warn' : ''}${beatSynced ? ' btn-play--beat' : ''}`}
               style={endLightStyle}
               onClick={actions.togglePlay}
               disabled={!meta}
@@ -1225,11 +1278,13 @@ function OverviewBar({
   color,
   onSeek,
   ending,
+  beat,
 }: {
   state: DeckState;
   color: string;
   onSeek: (frac: number) => void;
   ending: boolean;
+  beat: boolean;
 }) {
   const meta = state.meta;
   const frames = meta?.frames ?? 0;
@@ -1250,7 +1305,7 @@ function OverviewBar({
 
   return (
     <div
-      className={`overview${ending ? ' overview--warn' : ''}`}
+      className={`overview${ending ? ' overview--warn' : ''}${beat ? ' overview--beat' : ''}`}
       title="Click or drag to seek"
       onPointerDown={(e) => {
         dragging.current = true;

@@ -46,6 +46,7 @@ pub struct AuxInput {
 /// thread (`cpal::Stream` is not `Send`).
 pub fn open_aux_input(
     device_name: Option<&str>,
+    active_sample_rate: Option<u32>,
     producer: Producer<f32>,
     analysis: Option<Producer<f32>>,
 ) -> Result<AuxInput> {
@@ -62,11 +63,20 @@ pub fn open_aux_input(
             .ok_or_else(|| CompasError::Device("no default input device".into()))?,
     };
     let name = device.name().unwrap_or_else(|_| "aux input".to_string());
-    let supported = device
+    let current = device
         .default_input_config()
         .map_err(|e| CompasError::Device(e.to_string()))?;
-    let sample_format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.into();
+    let chosen = match device.supported_input_configs() {
+        Ok(ranges) => {
+            crate::device_format::config_at_active_rate(current, ranges, active_sample_rate)
+        }
+        Err(error) => {
+            tracing::warn!("could not list input formats ({error}); using the device default");
+            current
+        }
+    };
+    let sample_format = chosen.sample_format();
+    let config: cpal::StreamConfig = chosen.into();
     let sample_rate = config.sample_rate.0;
 
     let stream = match sample_format {

@@ -35,7 +35,7 @@ export function StatusBar({ sampleRate, audioStatus, beatFxLabel }: { sampleRate
         </>
       )}
       <span className="st-right">
-        <span>OpenDeck · Prototype</span>
+        <span>Open Deck · Prototype</span>
       </span>
     </footer>
   );

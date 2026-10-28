@@ -319,10 +319,13 @@ fn start_locked(app: &AppHandle, route: &Route) -> Result<String, String> {
     let spawn = std::thread::Builder::new()
         .name("opendeck-headphones".into())
         .spawn(move || {
+            let active_rate =
+                crate::device_rate::active_sample_rate(crate::device_rate::AudioEndpoint::Output, Some(&device));
             match compas_audio::open_cue_output_route_with_latency(
                 &device,
                 first,
                 source_rate,
+                active_rate,
                 consumer,
                 latency,
             ) {

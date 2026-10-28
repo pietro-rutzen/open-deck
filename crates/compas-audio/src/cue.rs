@@ -89,20 +89,30 @@ impl CueOutput {
 /// Compatibility wrapper: first pair of named/default device, same nominal rate.
 /// An explicitly missing or ambiguous name is an error, never a default-device fallback.
 pub fn open_cue_output(device_name: Option<&str>, consumer: Consumer<f32>) -> Result<CueOutput> {
-    open_monitor_output("cue", device_name, 0, None, consumer, None, true)
+    open_monitor_output("cue", device_name, 0, None, None, consumer, None, true)
 }
 pub fn open_cue_output_with_latency(
     device_name: Option<&str>,
     consumer: Consumer<f32>,
     latency: Arc<MonitorLatency>,
 ) -> Result<CueOutput> {
-    open_monitor_output("cue", device_name, 0, None, consumer, Some(latency), true)
+    open_monitor_output(
+        "cue",
+        device_name,
+        0,
+        None,
+        None,
+        consumer,
+        Some(latency),
+        true,
+    )
 }
 /// Explicit headphone route. `first_channel=2` means physical channels 3/4.
 pub fn open_cue_output_route_with_latency(
     device: &str,
     first_channel: u16,
     source_sample_rate: u32,
+    active_sample_rate: Option<u32>,
     consumer: Consumer<f32>,
     latency: Arc<MonitorLatency>,
 ) -> Result<CueOutput> {
@@ -111,20 +121,32 @@ pub fn open_cue_output_route_with_latency(
         Some(device),
         first_channel,
         Some(source_sample_rate),
+        active_sample_rate,
         consumer,
         Some(latency),
         false,
     )
 }
 pub fn open_booth_output(device_name: Option<&str>, consumer: Consumer<f32>) -> Result<CueOutput> {
-    open_monitor_output("booth", device_name, 0, None, consumer, None, true)
+    open_monitor_output("booth", device_name, 0, None, None, consumer, None, true)
 }
 pub fn open_booth_output_with_latency(
     device_name: Option<&str>,
+    source_sample_rate: Option<u32>,
+    active_sample_rate: Option<u32>,
     consumer: Consumer<f32>,
     latency: Arc<MonitorLatency>,
 ) -> Result<CueOutput> {
-    open_monitor_output("booth", device_name, 0, None, consumer, Some(latency), true)
+    open_monitor_output(
+        "booth",
+        device_name,
+        0,
+        source_sample_rate,
+        active_sample_rate,
+        consumer,
+        Some(latency),
+        true,
+    )
 }
 
 fn route_error(message: impl Into<String>) -> CompasError {
@@ -160,6 +182,7 @@ fn open_monitor_output(
     device_name: Option<&str>,
     first: u16,
     source_rate: Option<u32>,
+    active_sample_rate: Option<u32>,
     consumer: Consumer<f32>,
     latency: Option<Arc<MonitorLatency>>,
     allow_mono: bool,
@@ -186,11 +209,22 @@ fn open_monitor_output(
             .ok_or_else(|| route_error("no default output device"))?,
     };
     let name = device.name().map_err(|e| route_error(e.to_string()))?;
-    let supported = device
+    let current = device
         .default_output_config()
         .map_err(|e| route_error(e.to_string()))?;
-    let sample_format = supported.sample_format();
-    let config: cpal::StreamConfig = supported.into();
+    let chosen = match device.supported_output_configs() {
+        Ok(ranges) => {
+            crate::device_format::config_at_active_rate(current, ranges, active_sample_rate)
+        }
+        Err(error) => {
+            tracing::warn!(
+                "could not list {label} output formats ({error}); using the device default"
+            );
+            current
+        }
+    };
+    let sample_format = chosen.sample_format();
+    let config: cpal::StreamConfig = chosen.into();
     let source_rate = source_rate.unwrap_or(config.sample_rate.0);
     validate_route(
         config.channels,

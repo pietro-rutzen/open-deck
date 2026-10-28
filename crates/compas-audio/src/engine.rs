@@ -15,6 +15,8 @@ pub struct EngineConfig {
     pub command_capacity: usize,
     /// Capacity of the buffer-reclaim ring (retired decks awaiting drop on control thread).
     pub reclaim_capacity: usize,
+    /// Sample rate the output device is already running, when the host can report it.
+    pub active_sample_rate: Option<u32>,
 }
 
 impl Default for EngineConfig {
@@ -23,6 +25,7 @@ impl Default for EngineConfig {
             command_capacity: 256,
             // Sized to absorb a burst of deck reloads each retiring their mix buffer, with headroom.
             reclaim_capacity: 16,
+            active_sample_rate: None,
         }
     }
 }
@@ -49,13 +52,24 @@ impl AudioEngine {
         let device = host
             .default_output_device()
             .ok_or_else(|| CompasError::Device("no default output device".into()))?;
-        let supported = device
+        let current = device
             .default_output_config()
             .map_err(|e| CompasError::Device(e.to_string()))?;
+        let chosen = match device.supported_output_configs() {
+            Ok(ranges) => crate::device_format::config_at_active_rate(
+                current,
+                ranges,
+                config.active_sample_rate,
+            ),
+            Err(error) => {
+                tracing::warn!("could not list output formats ({error}); using the device default");
+                current
+            }
+        };
 
-        let sample_rate = supported.sample_rate().0;
-        let sample_format = supported.sample_format();
-        let stream_config: cpal::StreamConfig = supported.into();
+        let sample_rate = chosen.sample_rate().0;
+        let sample_format = chosen.sample_format();
+        let stream_config: cpal::StreamConfig = chosen.into();
 
         let (cmd_tx, cmd_rx) = RingBuffer::<AudioCommand>::new(config.command_capacity);
         let (reclaim_tx, reclaim_rx) = RingBuffer::<RetiredResource>::new(config.reclaim_capacity);

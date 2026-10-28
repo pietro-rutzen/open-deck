@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OpenDeck",
+  "productName": "Open Deck",
   "mainBinaryName": "compas-dj",
   "version": "0.1.0",
   "identifier": "org.opendeck.prototype",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "OpenDeck \u2014 Comp\u00e1s prototype",
+        "title": "Open Deck \u2014 Comp\u00e1s prototype",
         "width": 1680,
         "height": 1050,
         "minWidth": 1280,
@@ -35,8 +35,12 @@
     "active": true,
     "targets": "all",
     "icon": [
-      "icons/icon.png",
-      "icons/icon.ico"
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/icon.png"
     ],
     "resources": [
       "resources/controllers/*"

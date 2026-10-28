@@ -206,8 +206,8 @@ export async function exportDiagnostics(settings: Record<string, unknown> = {}):
 
 /** Explain the local source-update workflow; this fork never installs upstream releases. */
 export async function checkForUpdate(): Promise<boolean> {
-  await message("This local OpenDeck prototype is updated from its source checkout.", {
-    title: "OpenDeck prototype", kind: "info",
+  await message("This local Open Deck prototype is updated from its source checkout.", {
+    title: "Open Deck prototype", kind: "info",
   });
   return false;
 }

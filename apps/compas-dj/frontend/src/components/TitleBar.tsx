@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Icon } from "./icons";
+import { BrandMark, Icon } from "./icons";
 import { buildInfo, checkForUpdate, inTauri, onEngineLoad, onMasterMeter, type BuildInfo, type EngineLoad, type MasterMeter } from "../lib/ipc";
 
 export function TitleBar({
@@ -105,8 +105,8 @@ export function TitleBar({
   return (
     <header className="titlebar" data-tauri-drag-region>
       <div className="brand" data-tauri-drag-region>
-        <span className="brand-mark" aria-hidden="true">◧</span>
-        <span className="brand-word">OpenDeck</span>
+        <BrandMark />
+        <span className="brand-word">Open Deck</span>
       </div>
       <div className="master-cluster" data-tauri-drag-region>
         <div className="master-pill">
@@ -201,7 +201,7 @@ export function TitleBar({
             className="mono build-chip"
             onClick={onCheckUpdate}
             disabled={updBusy}
-            title={`OpenDeck ${build.version} · ${build.sha}${
+            title={`Open Deck ${build.version} · ${build.sha}${
               build.built_at ? ` · built ${new Date(Number(build.built_at) * 1000).toISOString().slice(0, 16).replace("T", " ")} UTC` : ""
             } · local prototype information`}
           >

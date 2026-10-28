@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 mod controller_session;
 mod controllers;
 mod db;
+mod device_rate;
 mod export;
 mod flx4_jog;
 mod flx4_runtime;
@@ -381,7 +382,10 @@ fn spawn_engine() -> EngineHandle {
             let mut initial_report = Some(sr_tx);
             let mut start_engine = |is_restart: bool| {
                 audio_for_thread.mark_restarting();
-                match AudioEngine::new(EngineConfig::default(), telemetry_for_thread.clone()) {
+                let mut engine_config = EngineConfig::default();
+                engine_config.active_sample_rate =
+                    device_rate::active_sample_rate(device_rate::AudioEndpoint::Output, None);
+                match AudioEngine::new(engine_config, telemetry_for_thread.clone()) {
                     Ok(engine) => {
                         if is_restart {
                             audio_for_thread.count_restart();
@@ -2605,11 +2609,22 @@ fn start_booth_output(
     let (stop_tx, stop_rx) = channel::<()>();
     let (ready_tx, ready_rx) = channel::<Result<String, String>>();
     let latency = booth.latency.clone();
+    let master_rate = state.audio.sample_rate.load(Ordering::Relaxed);
+    let master_rate = (master_rate > 0).then_some(master_rate);
     let spawn = thread::Builder::new()
         .name("compas-booth".to_string())
         .spawn(move || {
-            match compas_audio::open_booth_output_with_latency(device.as_deref(), consumer, latency)
-            {
+            let active_rate = device_rate::active_sample_rate(
+                device_rate::AudioEndpoint::Output,
+                device.as_deref(),
+            );
+            match compas_audio::open_booth_output_with_latency(
+                device.as_deref(),
+                master_rate,
+                active_rate,
+                consumer,
+                latency,
+            ) {
                 Ok(out) => {
                     let _ = ready_tx.send(Ok(out.device_name.clone()));
                     let _ = stop_rx.recv();
@@ -2717,7 +2732,16 @@ fn start_aux_input(
     let spawn = thread::Builder::new()
         .name("compas-aux-input".to_string())
         .spawn(move || {
-            match compas_audio::open_aux_input(device.as_deref(), producer, Some(analysis_tx)) {
+            let active_rate = device_rate::active_sample_rate(
+                device_rate::AudioEndpoint::Input,
+                device.as_deref(),
+            );
+            match compas_audio::open_aux_input(
+                device.as_deref(),
+                active_rate,
+                producer,
+                Some(analysis_tx),
+            ) {
                 Ok(input) => {
                     let _ = ready_tx.send(Ok((input.device_name.clone(), input.sample_rate)));
                     let _ = stop_rx.recv(); // park until told to stop (or the sender is dropped)

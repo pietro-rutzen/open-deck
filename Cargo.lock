@@ -520,6 +520,7 @@ dependencies = [
  "compas-dsp",
  "compas-script",
  "compas-sources",
+ "coreaudio-rs",
  "hidapi",
  "midir",
  "notify",

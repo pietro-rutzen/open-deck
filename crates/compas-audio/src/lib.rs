@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod cue;
+mod device_format;
 mod engine;
 mod input;
 mod live;
