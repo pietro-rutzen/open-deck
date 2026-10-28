@@ -321,3 +321,13 @@ T018 checkpoint:126 Rust tests and fullbuildPASS; launched07:24UTCnativebuild, F
 - [ ] Physical FLX4 qualification and full-length mix.
 
 Owner root. [Task](tasks/T-019.md), [handoff](handoffs/T-019-20261026-01.md), [control inventory](testing/FLX4_FUNCTIONALITY_AUDIT.md). Follow-up: audio lib 69 PASS, app lib 68 PASS, `tsc --noEmit` PASS, clippy has the same pre-existing warnings, `./scripts/opendeck-build.sh` PASS. Hardware NOT RUN.
+
+
+## T020 — Beginner hierarchy and responsive polish
+
+- [x] Clearer primary transport, monitoring and secondary-control hierarchy.
+- [x] Preserve preferred large waveform, yielding space only in constrained panes; consistent drag/keyboard/accessibility geometry.
+- [x] Independent review, TypeScript/Vite/native build and native wide/short-pane inspection.
+- [x] Reopen final build for local-file practice.
+
+Owner root; reviewer deck_layout_review. [Task](tasks/T-020.md), [handoff](handoffs/T-020-20261028-01.md). No audio/controller logic changes; T019 physical qualification remains open.

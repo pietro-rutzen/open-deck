@@ -17,7 +17,7 @@ const WAVE_PAD = 3.2;
 const WAVE_SLACK = 0.5;
 const WAVE_HEIGHT_KEY = "opendeck.waveform.height.v1";
 const MIN_WAVE_HEIGHT = 72;
-const DECK_FLOOR = 200;
+const DECK_FLOOR = 380;
 const DOWNBEAT = "#ff1a1a";
 const DOWNBEAT_TEXT = "#ff3b30";
 
@@ -51,7 +51,7 @@ interface Lane {
 }
 
 export function WaveformZone({ lanes }: { lanes: Lane[] }) {
-  const zoneRef = useRef<HTMLDivElement>(null);
+  const [zoneRef, zoneSize] = useElementSize<HTMLDivElement>();
   const drag = useRef<{ startY: number; startHeight: number } | null>(null);
   const [view, setView] = useState(8);
   const [height, setHeight] = useState<number | null>(() => {
@@ -81,11 +81,12 @@ export function WaveformZone({ lanes }: { lanes: Lane[] }) {
       else localStorage.setItem(WAVE_HEIGHT_KEY, String(Math.round(height)));
     } catch { /* The strip still resizes for this session. */ }
   }, [height]);
-  const limitHeight = (pixels: number) => {
-    const parent = zoneRef.current?.parentElement?.clientHeight ?? pixels;
-    const max = Math.max(MIN_WAVE_HEIGHT, parent - DECK_FLOOR);
-    return Math.min(max, Math.max(MIN_WAVE_HEIGHT, pixels));
+  const maxHeight = () => {
+    const parent = zoneRef.current?.parentElement;
+    const floor = parent ? parseFloat(getComputedStyle(parent).getPropertyValue("--deck-control-floor")) || DECK_FLOOR : DECK_FLOOR;
+    return Math.max(MIN_WAVE_HEIGHT, (parent?.clientHeight ?? MIN_WAVE_HEIGHT + floor) - floor);
   };
+  const limitHeight = (pixels: number) => Math.min(maxHeight(), Math.max(MIN_WAVE_HEIGHT, pixels));
   // Highlight the preset closest to the current (possibly wheel-adjusted) view.
   const nearest = ZOOMS.reduce((a, b) => (Math.abs(b - view) < Math.abs(a - view) ? b : a));
   return (
@@ -110,7 +111,7 @@ export function WaveformZone({ lanes }: { lanes: Lane[] }) {
         aria-orientation="horizontal"
         aria-label="Resize waveform"
         aria-valuemin={MIN_WAVE_HEIGHT}
-        aria-valuenow={height == null ? undefined : Math.round(height)}
+        aria-valuenow={Math.round(zoneSize.height)}
         title="Drag to resize the waveform · double-click to reset"
         onDoubleClick={() => setHeight(null)}
         onPointerDown={(event) => {
@@ -135,9 +136,8 @@ export function WaveformZone({ lanes }: { lanes: Lane[] }) {
         onKeyDown={(event) => {
           if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
           event.preventDefault();
-          const current = height ?? zoneRef.current?.getBoundingClientRect().height ?? MIN_WAVE_HEIGHT;
-          const parent = zoneRef.current?.parentElement?.clientHeight ?? current + DECK_FLOOR;
-          const max = Math.max(MIN_WAVE_HEIGHT, parent - DECK_FLOOR);
+          const current = zoneRef.current?.getBoundingClientRect().height ?? MIN_WAVE_HEIGHT;
+          const max = maxHeight();
           if (event.key === "Home") setHeight(MIN_WAVE_HEIGHT);
           else if (event.key === "End") setHeight(max);
           else setHeight(limitHeight(current + (event.key === "ArrowDown" ? 16 : -16)));

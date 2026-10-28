@@ -75,3 +75,8 @@ Show26px square embedded album cover alongside title and a subdued album-name su
 ## Adaptive controls supersede scroll-only resizing (T016)
 
 Normal A/B controls must remain visible as the upper pane shrinks. Use container-height dimensions with lower/upper bounds for waveforms, jog, Play/Cue, hotcues, spacing and fader travel; retain readable text and primary target priority. Reserve500pxupper +160pxlibrary when available, rather than allowing unusably small performance panes. Extremely short windows and expanded extras/quad can still scroll. Use actual rendered fader length for pointer mapping. T014's fixed-size scroll-only normal deck behavior and240pxminimum are superseded. T00990pxoverview is now a cap, adaptive down to40px. Do not scale the whole interface as an image.
+
+
+## Responsive hierarchy (T020, 2026-10-28)
+
+Treat resize adaptability as a standing requirement for every UI change. Prioritize Play/Cue, tempo and headphone monitoring, with bounded container-relative sizing and compact spacing. Preserve the user's preferred large waveform height when space allows; temporarily cap its displayed height to reserve usable control space, and restore it automatically on expansion. Waveform drag, keyboard and accessibility values must reflect rendered geometry. Very small panes retain scrolling rather than overlapping controls. Verify short and tall panes; do not infer narrow-window or quad-mode coverage from a wide screenshot.

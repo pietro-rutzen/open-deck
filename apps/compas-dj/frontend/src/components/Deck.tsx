@@ -649,7 +649,7 @@ export function Deck({
               onPointerLeave={() => dsp && actions.cueButton(false)}
               onClick={() => !dsp && actions.cue()}
               disabled={!meta}
-              title="Main cue (hold to preview)"
+              title="Track Cue controls the cue point and preview playback. Use mixer CUE to listen privately in headphones."
             >
               CUE
             </button>
@@ -660,7 +660,8 @@ export function Deck({
               disabled={!meta}
               title={playing ? 'Pause' : meta ? 'Play (ready)' : 'Play'}
             >
-              <Icon name={playing ? 'pause' : 'play'} size={16} />
+              <Icon name={playing ? 'pause' : 'play'} size={18} />
+              <span className="transport-label">{playing ? 'PAUSE' : 'PLAY'}</span>
             </button>
           </div>
           {dsp && (
@@ -704,7 +705,7 @@ export function Deck({
                           }
                         : undefined
                     }
-                    title={set ? 'Jump (right-click clears)' : 'Set hot cue'}
+                    title={set ? 'Jump to this saved track position. Right-click to clear it.' : 'Save this track position so you can jump back to it.'}
                   >
                     {i + 1}
                   </button>
@@ -841,7 +842,7 @@ export function Deck({
                     className={`chip ${state.echo.active ? 'chip--on' : ''}`}
                     onClick={actions.toggleEcho}
                     disabled={!meta}
-                    title="Echo / delay"
+                    title="Echo: repeat the sound in time with the beat. Click to turn it on or off."
                   >
                     ECHO
                   </button>
@@ -849,7 +850,7 @@ export function Deck({
                     className={`chip ${state.reverb.active ? 'chip--on' : ''}`}
                     onClick={actions.toggleReverb}
                     disabled={!meta}
-                    title="Reverb"
+                    title="Reverb: add a room-like sound tail. Click to turn it on or off."
                   >
                     REVERB
                   </button>
@@ -857,7 +858,7 @@ export function Deck({
                     className={`chip ${state.flanger.active ? 'chip--on' : ''}`}
                     onClick={actions.toggleFlanger}
                     disabled={!meta}
-                    title="Flanger (beat-synced sweep)"
+                    title="Flanger: add a sweeping sound in time with the beat."
                   >
                     FLANGE
                   </button>
@@ -865,7 +866,7 @@ export function Deck({
                     className={`chip ${state.crusher.active ? 'chip--on' : ''}`}
                     onClick={actions.toggleCrusher}
                     disabled={!meta}
-                    title="Bitcrusher (bit-depth + sample-rate reduction)"
+                    title="Crush: deliberately add digital distortion to the sound."
                   >
                     CRUSH
                   </button>
@@ -986,7 +987,7 @@ export function Deck({
                 }
                 onClick={onSync}
                 disabled={!dsp || (!syncEnabled && !syncActive)}
-                title="Continuous beat-sync to the other deck (tempo + phase)"
+                title={state.syncMode === 1 ? "Tempo Sync: match the other deck’s speed. Press again to mix manually." : "Beat Sync: match the other deck’s speed and beat timing. Press again to mix manually."}
               >
                 SYNC
               </button>
@@ -1064,7 +1065,7 @@ export function Deck({
                     className={`chip ${state.isLeader ? 'chip--on' : ''}`}
                     onClick={actions.toggleLeader}
                     disabled={!meta}
-                    title="Pin this deck as the sync leader"
+                    title="Leader: make this deck the timing reference for the other deck’s Sync."
                   >
                     LEAD
                   </button>

@@ -490,7 +490,7 @@ button:not(.light), input:not([type="range"]), select, .search, .tile, .art, .pa
 .workspace-upper .mixer { min-height: 0; }
 .workspace-upper > .wf-zone { height: clamp(64px, 18cqh, 180px); flex: none; }
 .workspace-upper .deck { padding: clamp(6px, 1.4cqh, 14px); gap: clamp(4px, 1cqh, 10px); min-height: 0; }
-.workspace-upper .deck .overview { flex-basis: clamp(32px, 8cqh, 90px); height: clamp(32px, 8cqh, 90px); min-height: clamp(32px, 8cqh, 90px); max-height: 90px; }
+.workspace-upper .deck .overview { flex-basis: clamp(40px, 14cqh, 90px); height: clamp(40px, 14cqh, 90px); min-height: clamp(40px, 14cqh, 90px); max-height: 90px; }
 .workspace-upper .deck .deck-body { gap: clamp(6px, 1.4cqh, 14px); min-height: 0; }
 .workspace-upper .deck .platter { width: clamp(72px, 16.5cqh, 156px); height: clamp(72px, 16.5cqh, 156px); }
 .workspace-upper .deck .platter-col { width: clamp(84px, 18.5cqh, 164px); flex-basis: clamp(84px, 18.5cqh, 164px); gap: clamp(4px, 0.7cqh, 8px); }
@@ -590,3 +590,51 @@ button:not(.light), input:not([type="range"]), select, .search, .tile, .art, .pa
 .next-bpm { flex: none; font-size: 10px; line-height: 20px; font-weight: 600; color: var(--text-primary); font-variant-numeric: tabular-nums; }
 .next-queue-remove { flex: none; width: 14px; height: 14px; margin: 0; padding: 0; border: 0; background: transparent; color: var(--text-tertiary); font-size: 13px; line-height: 12px; cursor: pointer; }
 .next-queue-remove:hover { color: var(--text-primary); }
+
+/* T020: primary transport and monitoring remain readable at practice-window sizes. */
+.workspace-upper .deck .platter-col { width: clamp(100px, 19cqh, 164px); flex-basis: clamp(100px, 19cqh, 164px); gap: 10px; }
+.workspace-upper .deck .btn-cue,
+.workspace-upper .deck .btn-play { width: clamp(44px, 7cqh, 60px); height: clamp(44px, 7cqh, 56px); font-size: 11px; font-weight: 650; }
+.workspace-upper .deck .platter-btns { grid-template-columns: repeat(2, clamp(44px, 7cqh, 60px)); gap: 6px; }
+.deck .btn-play { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; }
+.transport-label { font-size: 9px; line-height: 1; letter-spacing: .04em; }
+.workspace-upper .deck .controls-col { gap: clamp(10px, 2cqh, 20px); padding-top: 2px; }
+.workspace-upper .deck .pad { height: clamp(24px, 4cqh, 36px); }
+.workspace-upper .deck .effect-tools .chip:not(.chip--on),
+.workspace-upper .deck .beat-tools .chip:not(.chip--on) { background: transparent; border-color: var(--border-hairline); }
+.workspace-upper .deck .loop-controls .chip,
+.workspace-upper .deck .beat-tools .chip,
+.workspace-upper .deck .effect-tools .chip { border-radius: 0; }
+.workspace-upper .deck .tempo-main > .overline { color: var(--text-secondary); font-size: 10px; }
+.workspace-upper .deck .tempo-val { font-size: 14px; font-weight: 650; }
+.workspace-upper .deck .tempo-col .sync-btn { min-height: 26px; font-size: 10px; }
+.workspace-upper .deck .nudge button { min-width: 24px; min-height: 24px; }
+.workspace-upper .mixer--hardware > .phones--monitor { padding-block: clamp(4px, 1.4cqh, 10px); border-top: 1px solid var(--border-hairline); gap: 10px; flex-shrink: 0; }
+.workspace-upper .mixer--hardware .phones--monitor .knob svg { width: clamp(22px, 4cqh, 28px); height: clamp(22px, 4cqh, 28px); }
+.phones--monitor .phones-on { min-width: 40px; min-height: 28px; }
+.mixer--hardware .phones--monitor .knob .knob-label { font-size: 9px; }
+.monitor-control { display: flex; justify-content: center; min-width: 0; }
+.next-title, .next-artist { text-overflow: ellipsis; }
+.next-card { height: 24px; }
+.next-title, .next-artist, .next-bpm { font-size: 11px; line-height: 24px; }
+
+/* A saved waveform size must yield to usable controls as its pane shrinks.
+   Very small panes scroll rather than clipping controls or overlapping the mixer. */
+.workspace-upper { --deck-control-floor: 380px; }
+.workspace-upper > .wf-zone { max-height: max(72px, calc(100% - var(--deck-control-floor))); }
+.workspace-upper > .deck-row { min-height: 380px; }
+.workspace-upper .mixer--hardware .mixer-head,
+.workspace-upper .mixer--hardware .mixer-strips,
+.workspace-upper .mixer--hardware .xfader { flex-shrink: 0; }
+.workspace-upper .mixer--hardware .mixer-strips { min-height: min-content; }
+@container performance (max-height: 570px) {
+  .workspace-upper .deck .controls-col { gap: 6px; }
+  .workspace-upper .deck .platter-col { gap: 6px; }
+  .workspace-upper .deck .loop-controls .chip,
+  .workspace-upper .deck .beat-tools .chip,
+  .workspace-upper .deck .effect-tools .chip { height: 24px; min-height: 24px; }
+}
+@media (max-width: 1200px) {
+  .workspace-upper > .deck-row { min-height: 560px; }
+  .workspace-upper { --deck-control-floor: 560px; }
+}

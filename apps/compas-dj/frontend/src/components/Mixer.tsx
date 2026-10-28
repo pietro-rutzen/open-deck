@@ -618,7 +618,7 @@ function XfaderConfigRow({ curve, additive, reverse, onChange }: XfaderConfig) {
 function Phones({ cue }: { cue: CueApi }) {
   const route = cue.device ? `${cue.connectedName ?? cue.device} · channels ${cue.firstChannel + 1}/${cue.firstChannel + 2}` : "Select a headphone output in Settings";
   return <>
-    <div className="phones">
+    <div className="phones phones--monitor" aria-label="Headphone monitoring">
       <Icon name="headphones" size={14} />
       <button
         className={`chip phones-on ${cue.enabled ? "chip--on" : ""}`}
@@ -629,8 +629,8 @@ function Phones({ cue }: { cue: CueApi }) {
       >
         {cue.enabled ? "ON" : "OFF"}
       </button>
-      <Knob value={cue.mix} min={0} max={1} size={22} label="CUE◁▷MAS" onChange={cue.setMix} />
-      <Knob value={cue.volume} min={0} max={1} size={22} label="PHONES" onChange={cue.setVolume} />
+      <div className="monitor-control" title="Headphone mix: turn left to hear the decks selected with mixer CUE; turn right to hear the speaker mix."><Knob value={cue.mix} min={0} max={1} size={22} label="CUE / MIX" onChange={cue.setMix} /></div>
+      <div className="monitor-control" title="Headphone volume: adjust your preview listening level without changing the speakers."><Knob value={cue.volume} min={0} max={1} size={22} label="VOLUME" onChange={cue.setVolume} /></div>
     </div>
     {cue.error ? <div role="alert" style={{ fontSize: 10 }}>{cue.error}</div>
       : !cue.device && <div role="status" style={{ fontSize: 10 }}>Select headphone output in Settings</div>}
@@ -684,7 +684,7 @@ function ChannelStrip({
           className={`cue-btn ${cued ? "cue-btn--on" : ""}`}
           onClick={() => cue?.toggleDeckCue(ctrl.deck)}
           disabled={!cue}
-          title="Pre-listen this deck in the headphones (PFL)"
+          title="Headphone Cue: preview this deck privately, even with its channel fader down. This does not start playback."
         >
           <span>CUE</span>
         </button>
