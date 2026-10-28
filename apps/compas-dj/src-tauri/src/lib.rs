@@ -1605,6 +1605,53 @@ struct DescribedDrop {
     target: std::path::PathBuf,
 }
 
+/// Move a library file out of its playlist folder into ~/Music/removed from playlists.
+#[tauri::command]
+fn remove_from_folder(app: AppHandle, db: State<'_, db::Db>, path: String) -> Result<(), String> {
+    let music = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .map_err(|_| "Could not find the home folder".to_string())?
+        .join("Music");
+    let source = std::path::PathBuf::from(&path);
+    let planned = folder_drop::plan_remove_from_folder(&source, &music)?;
+    let from = planned
+        .from
+        .to_str()
+        .ok_or_else(|| format!("{} is not a valid path", planned.from.display()))?
+        .to_string();
+    let to = planned
+        .to
+        .to_str()
+        .ok_or_else(|| format!("{} is not a valid path", planned.to.display()))?
+        .to_string();
+    folder_drop::commit_move(&planned.from, &planned.to)?;
+    let recorded = with_db(&db, |connection| {
+        if db::track_exists(connection, &from)? {
+            db::relocate_tracks(connection, &[(from.clone(), to.clone())])?;
+        }
+        Ok(())
+    });
+    match recorded {
+        Ok(()) => {
+            let _ = app.emit(
+                "library:paths-moved",
+                &[PathMove {
+                    from: from.clone(),
+                    to: to.clone(),
+                }],
+            );
+            let _ = app.emit("library:changed", ());
+            Ok(())
+        }
+        Err(error) => match folder_drop::commit_move(&planned.to, &planned.from) {
+            Ok(()) => Err(format!("Could not keep {from} in the library: {error}")),
+            Err(undo) => Err(format!(
+                "Moved {to} but the library could not follow it ({error}), and moving it back failed: {undo}"
+            )),
+        },
+    }
+}
+
 fn dropped_file_title(path: &str) -> String {
     std::path::Path::new(path)
         .file_stem()
@@ -3382,6 +3429,7 @@ pub fn run() {
             db_remove_track,
             reorder_folder_tracks,
             move_into_open_folder,
+            remove_from_folder,
             db_add_tag,
             db_remove_tag,
             list_watch_folders,

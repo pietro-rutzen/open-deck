@@ -167,6 +167,9 @@
 .ov-cue::before { content: ""; position: absolute; top: 0; left: -1.75px; width: 5px; height: 5px; border-radius: 0 0 2px 2px; background: inherit; }
 
 .deck-body { flex: 1; display: flex; gap: 10px; min-height: 0; }
+.deck-body > .platter-col { order: 1; }
+.deck-body > .tempo-col { order: 2; }
+.deck-body > .controls-col { order: 3; }
 /* Mirrored deck (left of the mixer): platter sits on the inner edge, near the center. */
 .deck--mirror .deck-header,
 .deck--mirror .readouts,

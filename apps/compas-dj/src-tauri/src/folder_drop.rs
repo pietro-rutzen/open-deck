@@ -54,6 +54,46 @@ pub fn commit_move(from: &Path, to: &Path) -> Result<(), String> {
     move_file(from, to)
 }
 
+pub const REMOVED_FROM_PLAYLISTS: &str = "removed from playlists";
+
+pub fn removed_playlists_dir(music_dir: &Path) -> PathBuf {
+    music_dir.join(REMOVED_FROM_PLAYLISTS)
+}
+
+/// Choose where `source` lands inside the user's Music folder. Creates that folder when it is missing.
+pub fn plan_remove_from_folder(source: &Path, music_dir: &Path) -> Result<PlannedMove, String> {
+    if !source.is_file() {
+        return Err(format!("{} is no longer on disk", source.display()));
+    }
+    let destination = removed_playlists_dir(music_dir);
+    if parent_is_inside(source, &destination) {
+        return Err("This track is already in removed from playlists".to_string());
+    }
+    fs::create_dir_all(&destination).map_err(|error| {
+        format!(
+            "Could not create {}: {error}",
+            destination.display()
+        )
+    })?;
+    let planned = plan_audio_moves(&destination, &[path_text(source)?])?;
+    planned.into_iter().next().ok_or_else(|| {
+        "This track is already in removed from playlists".to_string()
+    })
+}
+
+fn parent_is_inside(source: &Path, destination: &Path) -> bool {
+    let Some(parent) = source.parent() else {
+        return false;
+    };
+    if !destination.exists() {
+        return false;
+    }
+    match (fs::canonicalize(parent), fs::canonicalize(destination)) {
+        (Ok(parent), Ok(destination)) => parent.starts_with(destination),
+        _ => false,
+    }
+}
+
 /// Move dropped audio into `folder`. A dropped directory contributes the audio
 /// files inside it. A name that is already taken gets a numeric suffix.
 #[cfg(test)]
@@ -286,6 +326,42 @@ mod tests {
         assert!(landed.contains(&b"one".to_vec()));
         assert!(landed.contains(&b"two".to_vec()));
         assert_eq!(dropped.moves.len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_from_folder_lands_in_removed_from_playlists() {
+        let root = scratch("remove-folder");
+        let music = root.join("Music");
+        let playlist = music.join("Friday");
+        fs::create_dir_all(&playlist).unwrap();
+        let source = playlist.join("Song.mp3");
+        fs::write(&source, b"audio").unwrap();
+        let planned = plan_remove_from_folder(&source, &music).unwrap();
+        commit_move(&planned.from, &planned.to).unwrap();
+        let landed = removed_playlists_dir(&music).join("Song.mp3");
+        assert_eq!(planned.to, landed);
+        assert!(landed.is_file());
+        assert!(!source.exists());
+        let again = plan_remove_from_folder(&landed, &music).unwrap_err();
+        assert!(again.contains("already in removed from playlists"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remove_from_folder_keeps_a_file_already_in_the_holding_folder() {
+        let root = scratch("remove-clash");
+        let music = root.join("Music");
+        let holding = removed_playlists_dir(&music);
+        fs::create_dir_all(&holding).unwrap();
+        fs::write(holding.join("Song.mp3"), b"kept").unwrap();
+        let source = music.join("Friday").join("Song.mp3");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"incoming").unwrap();
+        let planned = plan_remove_from_folder(&source, &music).unwrap();
+        commit_move(&planned.from, &planned.to).unwrap();
+        assert_eq!(fs::read(holding.join("Song.mp3")).unwrap(), b"kept");
+        assert_eq!(fs::read(holding.join("Song 2.mp3")).unwrap(), b"incoming");
         let _ = fs::remove_dir_all(root);
     }
 

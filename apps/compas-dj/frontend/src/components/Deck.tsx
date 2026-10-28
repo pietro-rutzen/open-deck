@@ -642,16 +642,6 @@ export function Deck({
             </div>
           </div>
           <div className="platter-btns">
-            {dsp && (
-              <button
-                className="chip cue-mode"
-                onClick={() => actions.setCueMode(state.cueMode === 0 ? 1 : 0)}
-                disabled={!meta}
-                title="Cue button mode: CDJ (preview-while-held) vs gated (stutter)"
-              >
-                {state.cueMode === 1 ? 'GATE' : 'CDJ'}
-              </button>
-            )}
             <button
               className="btn-cue"
               onPointerDown={() => dsp && actions.cueButton(true)}
@@ -673,6 +663,16 @@ export function Deck({
               <Icon name={playing ? 'pause' : 'play'} size={16} />
             </button>
           </div>
+          {dsp && (
+            <button
+              className="chip cue-mode"
+              onClick={() => actions.setCueMode(state.cueMode === 0 ? 1 : 0)}
+              disabled={!meta}
+              title="Cue button mode: CDJ previews while held and returns on release. GATE stutters from the cue point while held."
+            >
+              {state.cueMode === 1 ? 'GATE' : 'CDJ'}
+            </button>
+          )}
         </div>
 
         {/* controls */}
@@ -790,11 +790,10 @@ export function Deck({
                   ✕
                 </button>
               </div>
-              <div className="deck-tool-row">
-                <div
-                  className="chip-row beat-tools"
-                  aria-label="Beat jump and loop roll"
-                >
+              <div
+                className="chip-row beat-tools"
+                aria-label="Beat jump and loop roll"
+              >
                   <button
                     className={`chip ${state.quantize ? 'chip--on' : ''}`}
                     onClick={actions.toggleQuantize}
@@ -836,8 +835,8 @@ export function Deck({
                       {r.label}
                     </button>
                   ))}
-                </div>
-                <div className="chip-row effect-tools" aria-label="Effects">
+              </div>
+              <div className="chip-row effect-tools" aria-label="Effects">
                   <button
                     className={`chip ${state.echo.active ? 'chip--on' : ''}`}
                     onClick={actions.toggleEcho}
@@ -870,7 +869,6 @@ export function Deck({
                   >
                     CRUSH
                   </button>
-                </div>
               </div>
               {state.echo.active && (
                 <div className="fx-detail">
@@ -972,164 +970,160 @@ export function Deck({
           ) : null}
         </div>
 
-        {/* tempo fader */}
         <div className="tempo-col">
-          <button
-            className={`sync-btn ${syncActive ? 'sync-btn--on' : ''}`}
-            style={
-              syncActive
-                ? {
-                    color: '#fff',
-                    borderColor: color,
-                    background: `${color}cc`,
-                  }
-                : { color, borderColor: `${color}66` }
-            }
-            onClick={onSync}
-            disabled={!dsp || (!syncEnabled && !syncActive)}
-            title="Continuous beat-sync to the other deck (tempo + phase)"
-          >
-            SYNC
-          </button>
-          {dsp && (
-            <button
-              className={`chip mic-sync ${state.syncLive ? 'chip--on' : ''}`}
-              style={{
-                flex: 'none',
-                width: '100%',
-                padding: '3px 0',
-                fontSize: 9,
-              }}
-              onClick={actions.toggleSyncLive}
-              disabled={!meta}
-              title="Beat-match this deck to the live mic/aux input (tempo). Turn AUX on first."
-            >
-              MIC
-            </button>
-          )}
-          {dsp && (
-            <button
-              className={`chip int-sync ${state.syncInternal ? 'chip--on' : ''}`}
-              style={{
-                flex: 'none',
-                width: '100%',
-                padding: '3px 0',
-                fontSize: 9,
-              }}
-              onClick={actions.toggleSyncInternal}
-              disabled={!meta}
-              title="Beat-match this deck to the internal master clock. Turn INT CLK on first."
-            >
-              INT
-            </button>
-          )}
-          {dsp && (
-            <div className="sync-opts">
+          <div className="tempo-stack">
+            <div className="tempo-main">
               <button
-                className={`chip ${state.syncMode === 1 ? 'chip--on' : ''}`}
-                onClick={() =>
-                  actions.setSyncMode(state.syncMode === 1 ? 0 : 1)
+                className={`sync-btn ${syncActive ? 'sync-btn--on' : ''}`}
+                style={
+                  syncActive
+                    ? {
+                        color: '#fff',
+                        borderColor: color,
+                        background: `${color}cc`,
+                      }
+                    : { color, borderColor: `${color}66` }
                 }
-                disabled={!meta}
-                title="Tempo-only sync (match BPM without locking phase)"
+                onClick={onSync}
+                disabled={!dsp || (!syncEnabled && !syncActive)}
+                title="Continuous beat-sync to the other deck (tempo + phase)"
               >
-                TEMPO
+                SYNC
               </button>
-              <button
-                className={`chip ${state.isLeader ? 'chip--on' : ''}`}
-                onClick={actions.toggleLeader}
-                disabled={!meta}
-                title="Pin this deck as the sync leader"
-              >
-                LEAD
-              </button>
-            </div>
-          )}
-          <span className="overline" title={`Tempo range ±${tempoRange}%`}>
-            TEMPO ±{tempoRange}
-          </span>
-          <Fader
-            value={dsp ? pct : 0}
-            min={-tempoRange}
-            max={tempoRange}
-            length={compact ? 72 : 112}
-            center
-            color={color}
-            disabled={!dsp || !meta}
-            onChange={(v) => actions.setTempo(1 + v / 100)}
-          />
-          <span className="mono tempo-val" style={{ opacity: dsp ? 1 : 0.45 }}>
-            {dsp ? `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}` : '0.0'}
-            <small>%</small>
-          </span>
-          {dsp && (
-            <div className="nudge">
-              <button
-                onClick={() => actions.trimTempo(-1)}
-                disabled={!meta}
-                title="Nudge tempo −0.1%"
-              >
-                −
-              </button>
-              <button
-                onClick={() => actions.trimTempo(1)}
-                disabled={!meta}
-                title="Nudge tempo +0.1%"
-              >
-                +
-              </button>
-            </div>
-          )}
-          {dsp && (
-            <button
-              className={`keylock-btn ${state.keylock ? 'keylock-btn--on' : ''}`}
-              style={
-                state.keylock ? { color, borderColor: `${color}80` } : undefined
-              }
-              onClick={actions.toggleKeylock}
-              disabled={!meta}
-              title="Key-lock: change tempo without changing pitch (master tempo)"
-            >
-              {state.keylock ? '🔒 KEY' : 'KEY'}
-            </button>
-          )}
-          {dsp && onKeySync && (
-            <button
-              className="chip key-sync-btn"
-              onClick={onKeySync}
-              disabled={!keySyncEnabled}
-              title="Key Sync: transpose this deck to harmonically match the other deck"
-            >
-              KEY⇄
-            </button>
-          )}
-          {dsp && (
-            <div
-              className="key-shift"
-              title="Key shift: transpose ± semitones without changing tempo"
-            >
-              <button
-                onClick={() => actions.setPitchShift(state.pitchShift - 1)}
-                disabled={!meta || state.pitchShift <= -12}
-                title="Pitch down a semitone"
-              >
-                −
-              </button>
-              <span
-                className="mono key-shift-val"
-                style={state.pitchShift !== 0 ? { color } : undefined}
-              >
-                {state.pitchShift > 0
-                  ? `+${state.pitchShift}`
-                  : state.pitchShift}
+              <span className="overline" title={`Tempo range ±${tempoRange}%`}>
+                TEMPO ±{tempoRange}
               </span>
+              <Fader
+                value={dsp ? pct : 0}
+                min={-tempoRange}
+                max={tempoRange}
+                length={compact ? 72 : 112}
+                center
+                color={color}
+                disabled={!dsp || !meta}
+                onChange={(v) => actions.setTempo(1 + v / 100)}
+              />
+              <div className="tempo-readout">
+                <span
+                  className="mono tempo-val"
+                  style={{ opacity: dsp ? 1 : 0.45 }}
+                >
+                  {dsp ? `${pct >= 0 ? '+' : ''}${pct.toFixed(1)}` : '0.0'}
+                  <small>%</small>
+                </span>
+                {dsp && (
+                  <div className="nudge">
+                    <button
+                      onClick={() => actions.trimTempo(-1)}
+                      disabled={!meta}
+                      title="Nudge tempo −0.1%"
+                    >
+                      −
+                    </button>
+                    <button
+                      onClick={() => actions.trimTempo(1)}
+                      disabled={!meta}
+                      title="Nudge tempo +0.1%"
+                    >
+                      +
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+            {dsp && (
+              <div className="tempo-side">
+                <button
+                  className={`chip mic-sync ${state.syncLive ? 'chip--on' : ''}`}
+                  onClick={actions.toggleSyncLive}
+                  disabled={!meta}
+                  title="Beat-match this deck to the live mic/aux input (tempo). Turn AUX on first."
+                >
+                  MIC
+                </button>
+                <button
+                  className={`chip int-sync ${state.syncInternal ? 'chip--on' : ''}`}
+                  onClick={actions.toggleSyncInternal}
+                  disabled={!meta}
+                  title="Beat-match this deck to the internal master clock. Turn INT CLK on first."
+                >
+                  INT
+                </button>
+                <div className="sync-opts">
+                  <button
+                    className={`chip ${state.syncMode === 1 ? 'chip--on' : ''}`}
+                    onClick={() =>
+                      actions.setSyncMode(state.syncMode === 1 ? 0 : 1)
+                    }
+                    disabled={!meta}
+                    title="Tempo-only sync (match BPM without locking phase)"
+                  >
+                    TEMPO
+                  </button>
+                  <button
+                    className={`chip ${state.isLeader ? 'chip--on' : ''}`}
+                    onClick={actions.toggleLeader}
+                    disabled={!meta}
+                    title="Pin this deck as the sync leader"
+                  >
+                    LEAD
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+          {dsp && (
+            <div className="key-group">
               <button
-                onClick={() => actions.setPitchShift(state.pitchShift + 1)}
-                disabled={!meta || state.pitchShift >= 12}
-                title="Pitch up a semitone"
+                className={`keylock-btn ${state.keylock ? 'keylock-btn--on' : ''}`}
+                style={
+                  state.keylock
+                    ? { color, borderColor: `${color}80` }
+                    : undefined
+                }
+                onClick={actions.toggleKeylock}
+                disabled={!meta}
+                title="Key-lock: change tempo without changing pitch (master tempo)"
               >
-                +
+                {state.keylock ? '🔒 KEY' : 'KEY'}
               </button>
+              <div
+                className="key-shift"
+                title="Key shift: transpose ± semitones without changing tempo"
+              >
+                <button
+                  onClick={() => actions.setPitchShift(state.pitchShift - 1)}
+                  disabled={!meta || state.pitchShift <= -12}
+                  title="Pitch down a semitone"
+                >
+                  −
+                </button>
+                <span
+                  className="mono key-shift-val"
+                  style={state.pitchShift !== 0 ? { color } : undefined}
+                >
+                  {state.pitchShift > 0
+                    ? `+${state.pitchShift}`
+                    : state.pitchShift}
+                </span>
+                <button
+                  onClick={() => actions.setPitchShift(state.pitchShift + 1)}
+                  disabled={!meta || state.pitchShift >= 12}
+                  title="Pitch up a semitone"
+                >
+                  +
+                </button>
+              </div>
+              {onKeySync && (
+                <button
+                  className="chip key-sync-btn"
+                  onClick={onKeySync}
+                  disabled={!keySyncEnabled}
+                  title="Key Sync: transpose this deck to harmonically match the other deck"
+                >
+                  KEY⇄
+                </button>
+              )}
             </div>
           )}
         </div>

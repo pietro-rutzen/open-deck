@@ -11,6 +11,7 @@ import {
 } from 'react';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import type { PhysicalPosition } from '@tauri-apps/api/dpi';
+import { ask } from '@tauri-apps/plugin-dialog';
 import {
   addWatchFolder,
   dbAddTag,
@@ -23,10 +24,10 @@ import {
   onLibraryPathsMoved,
   onControllerUpdate,
   pickFolder,
+  removeFromFolder,
   removeWatchFolder,
   rescanWatchFolders,
   reorderFolderTracks,
-  dbPlanNext,
   loadTrack,
   deckPlay,
   onDeckError,
@@ -46,18 +47,22 @@ import {
 import {
   ascendFolder,
   childFolders,
-  compareFileNames,
   directoryOf,
   directTracks,
   folderCrumbs,
+  folderOrderComparator,
   folderPlayCounts,
   isInside,
   playProgressTone,
+  readFolderOrders,
   reorderPaths,
+  writeFolderOrders,
 } from '../lib/libraryFolders';
 import { filterLibraryTracks } from '../lib/librarySearch';
 import { listeningModeActive, setListeningMode } from '../lib/listeningMode';
+import { enqueueOnDeck, readQueuedPaths, retargetNextQueuePaths, subscribeNextQueue } from '../lib/nextQueue';
 import { PaneDivider, useStoredSize } from './WorkspaceSplit';
+import { TrackMenu, type TrackMenuItem } from './TrackMenu';
 import { useLibrary } from '../hooks/useLibrary';
 import { Icon } from './icons';
 import { MiniWaveform, TrackCells, useTrackVisuals } from './LibraryVisuals';
@@ -83,35 +88,6 @@ const readStoredView = (): 'unset' | 'library' | string => {
     return value;
   } catch {
     return 'unset';
-  }
-};
-
-const FOLDER_ORDER_KEY = 'opendeck.library.folderOrder.v1';
-
-const readFolderOrders = (): Record<string, string[]> => {
-  try {
-    const parsed = JSON.parse(
-      localStorage.getItem(FOLDER_ORDER_KEY) ?? 'null',
-    ) as unknown;
-    if (!parsed || typeof parsed !== 'object') return {};
-    return Object.fromEntries(
-      Object.entries(parsed).flatMap(([folder, paths]) =>
-        Array.isArray(paths) &&
-        paths.every((path) => typeof path === 'string')
-          ? [[folder, paths]]
-          : [],
-      ),
-    );
-  } catch {
-    return {};
-  }
-};
-
-const writeFolderOrders = (orders: Record<string, string[]>) => {
-  try {
-    localStorage.setItem(FOLDER_ORDER_KEY, JSON.stringify(orders));
-  } catch {
-    /* The renamed files still carry the order. */
   }
 };
 
@@ -197,12 +173,13 @@ export const Library = memo(
     HTMLElement,
     {
       loadedPaths: (string | undefined)[];
+      nextDecks: readonly { index: number; letter: string }[];
       keyNotation?: KeyNotation;
       focusTarget?: 'library' | 'crates' | null;
       focusSeq?: number;
     }
   >(function Library(
-    { loadedPaths, keyNotation = 'camelot', focusTarget = null, focusSeq = 0 },
+    { loadedPaths, nextDecks, keyNotation = 'camelot', focusTarget = null, focusSeq = 0 },
     ref,
   ) {
     const lib = useLibrary();
@@ -246,9 +223,9 @@ export const Library = memo(
           title={
             column === 'order'
               ? canReorder
-                ? 'Folder order. Drag a track onto another to rearrange the files.'
+                ? 'Folder order. Drag a track onto another. Reordering edits filenames.'
                 : browsingFolder
-                  ? 'Folder order. Turn on Reorder before dragging tracks into a new order.'
+                  ? 'Folder order. Turn on Reorder before dragging tracks into a new order. Reordering edits filenames.'
                   : 'Original list order'
               : `Sort by ${label.toLowerCase()}`
           }
@@ -266,17 +243,21 @@ export const Library = memo(
     useImperativeHandle(ref, () => rootRef.current as HTMLElement);
     // Search results (engine grammar) and a "suggest next" override; null = show the full library.
     const [results, setResults] = useState<DbTrack[] | null>(null);
-    const [suggestFor, setSuggestFor] = useState<string | null>(null);
-    const [planPath, setPlanPath] = useState<string | null>(null);
-    const [queue, setQueue] = useState<DbTrack[]>([]);
     const [selectedPath, setSelectedPath] = useState<string | null>(null);
+    const [, setNextQueueVersion] = useState(0);
+    useEffect(() => subscribeNextQueue(() => setNextQueueVersion((version) => version + 1)), []);
     useEffect(() => {
       if (selectedPath && inTauri())
         prioritizeAnalysis(selectedPath).catch(() => {});
     }, [selectedPath]);
     const inspectorRef = useRef<HTMLElement>(null);
     const [actionError, setActionError] = useState<string | null>(null);
-    const viewGeneration = useRef(0);
+    const [trackMenu, setTrackMenu] = useState<{
+      track: DbTrack;
+      x: number;
+      y: number;
+    } | null>(null);
+    const closeTrackMenu = useCallback(() => setTrackMenu(null), []);
     const openedInitialFolder = useRef(readStoredView() !== 'unset');
     const reportError = (error: unknown) => setActionError(String(error));
     const load = async (deck: number, path: string) => {
@@ -322,52 +303,16 @@ export const Library = memo(
 
     useEffect(() => {
       const query = q.trim();
-      if (query) {
-        setResults(filterLibraryTracks(lib.tracks, query));
-        return;
-      }
-      if (!planPath || !inTauri()) {
-        setResults(null);
-        return;
-      }
-      const generation = ++viewGeneration.current;
-      const nextPath = planPath;
-      const id = setTimeout(() => {
-        dbPlanNext(nextPath, 12)
-          .then((tracks) => {
-            if (viewGeneration.current === generation) setResults(tracks);
-          })
-          .catch((error) => {
-            if (viewGeneration.current === generation) reportError(error);
-          });
-      }, 0);
-      return () => {
-        clearTimeout(id);
-        if (viewGeneration.current === generation) viewGeneration.current++;
-      };
-    }, [q, planPath, lib.tracks]);
+      setResults(query ? filterLibraryTracks(lib.tracks, query) : null);
+    }, [q, lib.tracks]);
 
-    const queueTrack = (t: DbTrack) => {
-      setQueue((cur) =>
-        cur.some((q) => q.path === t.path) ? cur : [...cur, t],
-      );
+    const queueTrack = (deck: number, path: string) => {
+      if (loadedPaths[deck] === path) return;
+      enqueueOnDeck(deck, path);
     };
-    const loadNextQueued = async () => {
-      const [next] = queue;
-      if (!next) return;
-      const emptyDeck = loadedPaths.findIndex((p) => !p);
-      const targetDeck = emptyDeck >= 0 ? emptyDeck : 1;
-      if (await load(targetDeck, next.path))
-        setQueue((cur) => cur.filter((t) => t.path !== next.path));
-    };
-
-    // Auto-mix planner: ranked next-track suggestions after `t`.
-    const suggestNext = (t: DbTrack) => {
-      setQ('');
-      setSuggestFor(t.title);
-      setPlanPath(t.path);
-    };
-    const [folderPath, setFolderPath] = useState<string | null>(storedFolderPath);
+    const [folderPath, setFolderPath] = useState<string | null>(
+      storedFolderPath,
+    );
     const [folderOrders, setFolderOrders] =
       useState<Record<string, string[]>>(readFolderOrders);
     const rememberFolderOrder = (folder: string, paths: string[]) => {
@@ -399,20 +344,14 @@ export const Library = memo(
     const movedTo = useRef(new Map<string, string>());
     const clearView = () => {
       openedInitialFolder.current = true;
-      viewGeneration.current++;
       setFolderPath(null);
       setResults(null);
-      setSuggestFor(null);
-      setPlanPath(null);
       setQ('');
     };
     const openFolder = (path: string) => {
       openedInitialFolder.current = true;
-      viewGeneration.current++;
       setFolderPath(path);
       setResults(null);
-      setSuggestFor(null);
-      setPlanPath(null);
       setQ('');
       setSelectedPath(null);
     };
@@ -436,6 +375,77 @@ export const Library = memo(
         .then(reloadView)
         .catch(() => {});
     };
+    const deckCount = Math.min(DECKS.length, Math.max(loadedPaths.length, 2));
+    const trackMenuGroups = (track: DbTrack): TrackMenuItem[][] => [
+      DECKS.slice(0, deckCount).map((deck, index) => ({
+        id: `load-${deck.letter}`,
+        label:
+          listening && index === 0
+            ? `Play on deck ${deck.letter}`
+            : `Load on deck ${deck.letter}`,
+        onSelect: () => {
+          if (listening && index === 0) {
+            playOnDeckA.current = track.path;
+            void load(0, track.path).then((loaded) => {
+              if (!loaded && playOnDeckA.current === track.path)
+                playOnDeckA.current = null;
+            });
+            return;
+          }
+          void load(index, track.path);
+        },
+      })),
+      [
+        ...nextDecks.flatMap((deck) => {
+          if (loadedPaths[deck.index] === track.path) return [];
+          if (readQueuedPaths(deck.index).includes(track.path)) return [];
+          return [
+            {
+              id: `queue-${deck.letter}`,
+              label: `Queue on deck ${deck.letter}`,
+              onSelect: () => queueTrack(deck.index, track.path),
+            },
+          ];
+        }),
+        {
+          id: 'tag',
+          label: 'Add tag',
+          onSelect: () => {
+            setSelectedPath(track.path);
+            setTaggingPath(track.path);
+            setTagInput('');
+          },
+        },
+        ...track.tags.map((tag) => ({
+          id: `untag-${tag}`,
+          label: `Remove tag ${tag}`,
+          onSelect: () => dropTag(track.path, tag),
+        })),
+      ],
+      [
+        {
+          id: 'remove-folder',
+          label: 'Remove from folder',
+          detail: 'Moves the file to Music/removed from playlists',
+          danger: true,
+          onSelect: () => {
+            void moveTrackFileOut(track);
+          },
+        },
+        {
+          id: 'remove-library',
+          label: 'Remove from library',
+          detail: 'The file stays on disk',
+          danger: true,
+          onSelect: () => {
+            lib.remove(track.path);
+            setSelectedPath((current) =>
+              current === track.path ? null : current,
+            );
+          },
+        },
+      ],
+    ];
 
     // Watched folders (auto-import).
     const [folders, setFolders] = useState<string[]>([]);
@@ -565,13 +575,7 @@ export const Library = memo(
           return next;
         });
         setSelectedPath((path) => (path && moved.get(path)) || path);
-        setPlanPath((path) => (path && moved.get(path)) || path);
-        setQueue((current) =>
-          current.map((track) => {
-            const to = moved.get(track.path);
-            return to ? { ...track, path: to } : track;
-          }),
-        );
+        retargetNextQueuePaths(moved);
       });
       return () => {
         un.then((stop) => stop());
@@ -618,13 +622,32 @@ export const Library = memo(
         .replace(/[\\/]+$/, '')
         .split(/[\\/]/)
         .pop() || p;
+    const moveTrackFileOut = async (track: DbTrack) => {
+      const name = track.title || baseName(track.path);
+      const accepted = await ask(
+        `This moves the actual track file for “${name}” to the "removed from playlists" folder in your Music folder.`,
+        {
+          title: 'Remove from folder',
+          kind: 'warning',
+          okLabel: 'Move file',
+          cancelLabel: 'Cancel',
+        },
+      );
+      if (!accepted) return;
+      try {
+        await removeFromFolder(track.path);
+        setActionError(null);
+      } catch (error) {
+        reportError(error);
+      }
+    };
 
     const sourceTracks = results ?? lib.tracks;
     const filtered = useMemo(
       () => sortTracks(sourceTracks, sort),
       [sourceTracks, sort],
     );
-    const browsingFolder = Boolean(folderPath) && !q.trim() && !planPath;
+    const browsingFolder = Boolean(folderPath) && !q.trim();
     const folderEntries = useMemo(
       () =>
         browsingFolder && folderPath
@@ -636,20 +659,10 @@ export const Library = memo(
       if (!browsingFolder || !folderPath) return filtered;
       const direct = directTracks(lib.tracks, folderPath);
       if (sort.column !== 'order') return sortTracks(direct, sort);
-      const saved = folderOrders[folderPath] ?? [];
-      const rank = new Map(saved.map((path, index) => [path, index]));
-      const bySavedOrder = [...direct].sort((left, right) => {
-        const leftRank = rank.get(left.path);
-        const rightRank = rank.get(right.path);
-        if (leftRank != null && rightRank != null && leftRank !== rightRank)
-          return leftRank - rightRank;
-        if (leftRank != null) return -1;
-        if (rightRank != null) return 1;
-        return (
-          compareFileNames(baseName(left.path), baseName(right.path)) ||
-          left.path.localeCompare(right.path)
-        );
-      });
+      const compareOrder = folderOrderComparator(folderOrders[folderPath]);
+      const bySavedOrder = [...direct].sort((left, right) =>
+        compareOrder(left.path, right.path),
+      );
       return sort.direction === 'asc' ? bySavedOrder : bySavedOrder.reverse();
     }, [browsingFolder, folderPath, folderOrders, lib.tracks, sort, filtered]);
     useEffect(() => {
@@ -1055,11 +1068,7 @@ export const Library = memo(
               <input
                 ref={searchRef}
                 value={q}
-                onChange={(e) => {
-                  setQ(e.target.value);
-                  setPlanPath(null);
-                  setSuggestFor(null);
-                }}
+                onChange={(e) => setQ(e.target.value)}
                 placeholder="Search tracks, artists, BPM or key"
                 aria-label="Search library"
                 title="Type a title, artist, tempo (117 or 117.69), or key (8A or Am). bpm:120-128 and key:8A work too. Terms AND together; OR starts another group."
@@ -1105,7 +1114,7 @@ export const Library = memo(
               disabled={listeningBusy}
               title={
                 listening
-                  ? 'Return to performance mode. Played marks count again, and deck A stops auto queue and play.'
+                  ? 'Return to performance mode. Played marks count again, and deck A stops auto queue and play. Next tracks rank by BPM, then key, then folder order.'
                   : "Reset played marks, ignore them on folders and the list, and turn on deck A queue and play 'next' modes. BPM has less importance on suggestions for listening mode."
               }
               onClick={() => {
@@ -1121,10 +1130,10 @@ export const Library = memo(
               disabled={!folderPath || !browsingFolder || reordering}
               title={
                 canReorder
-                  ? 'Reorder is on. Drag a track onto another row. Click again to drag onto decks only.'
+                  ? 'Reorder is on. Drag a track onto another row. Reordering edits filenames so the folder matches this list. Click again to drag onto decks only.'
                   : folderPath
-                    ? 'Turn on to rearrange this folder. Off, dragging a track only loads a deck.'
-                    : 'Open a folder to rearrange its tracks.'
+                    ? 'Turn on to rearrange this folder. Reordering edits filenames. Off, dragging a track only loads a deck.'
+                    : 'Open a folder to rearrange its tracks. Reordering edits filenames.'
               }
               onClick={() => {
                 stopReorderScroll();
@@ -1147,38 +1156,6 @@ export const Library = memo(
               Reset played
             </button>
           </div>
-
-          {queue.length > 0 && (
-            <div className="tl-banner tl-banner--queue">
-              <span>
-                <strong>Play queue</strong>
-                {' · '}
-                {queue
-                  .slice(0, 4)
-                  .map((t) => t.title)
-                  .join(' → ')}
-                {queue.length > 4 ? ` +${queue.length - 4}` : ''}
-              </span>
-              <button className="chip" onClick={loadNextQueued}>
-                load next
-              </button>
-              <button className="chip" onClick={() => setQueue([])}>
-                clear
-              </button>
-            </div>
-          )}
-
-          {suggestFor && (
-            <div className="tl-banner">
-              <span>
-                ✨ Suggested next after <strong>{suggestFor}</strong> (harmonic
-                + tempo)
-              </span>
-              <button className="chip" onClick={clearView}>
-                clear
-              </button>
-            </div>
-          )}
 
           {actionError && (
             <div className="tl-banner" role="alert">
@@ -1339,7 +1316,30 @@ export const Library = memo(
                       data-track-index={index}
                       data-track-path={t.path}
                       draggable
+                      onMouseDown={(event) => {
+                        if (event.button !== 2) return;
+                        event.preventDefault();
+                        selectBrowse(index);
+                        setTrackMenu({
+                          track: t,
+                          x: event.clientX,
+                          y: event.clientY,
+                        });
+                      }}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        selectBrowse(index);
+                        setTrackMenu({
+                          track: t,
+                          x: event.clientX,
+                          y: event.clientY,
+                        });
+                      }}
                       onDragStart={(e) => {
+                        if (e.button === 2) {
+                          e.preventDefault();
+                          return;
+                        }
                         draggingPath.current = t.path;
                         e.dataTransfer.setData(
                           'application/x-compas-track',
@@ -1427,10 +1427,10 @@ export const Library = memo(
                       }}
                       title={
                         canReorder
-                          ? 'Drag onto the row this track should take. Files in the folder are renamed to match.'
+                          ? 'Drag onto the row this track should take. Reordering edits filenames.'
                           : listening
                             ? 'Double-click loads this track on deck A and starts it'
-                            : 'Select for details · Enter opens inspector · drag onto a deck to load'
+                            : 'Select for details · right-click for actions · Enter opens inspector · drag onto a deck to load'
                       }
                     >
                       <span
@@ -1487,8 +1487,7 @@ export const Library = memo(
             </div>
           </div>
           <div className="tl-footer" id="library-keyboard-help">
-            ↑ ↓ Select · Enter opens a folder · Browse press enters · Load sends
-            a track
+            ↑ ↓ Select · Enter opens a folder · Right-click a track for actions
             {folderPath
               ? ' · Drop audio files here to move them into this folder'
               : ''}
@@ -1618,12 +1617,27 @@ export const Library = memo(
                 ))}
               </div>
               <div className="inspector-actions">
-                <button className="chip" onClick={() => queueTrack(selected)}>
-                  Add to queue
-                </button>
-                <button className="chip" onClick={() => suggestNext(selected)}>
-                  Find compatible
-                </button>
+                {nextDecks.map((deck) => {
+                  const loadedHere = loadedPaths[deck.index] === selected.path;
+                  const queued = readQueuedPaths(deck.index).includes(selected.path);
+                  return (
+                    <button
+                      key={deck.letter}
+                      className="chip"
+                      disabled={loadedHere || queued}
+                      title={
+                        loadedHere
+                          ? `Already loaded on deck ${deck.letter}`
+                          : queued
+                            ? `Already in deck ${deck.letter}'s Next queue`
+                            : `Add to deck ${deck.letter}'s Next queue, ahead of automatic suggestions`
+                      }
+                      onClick={() => queueTrack(deck.index, selected.path)}
+                    >
+                      {queued ? `Queued ${deck.letter}` : `Queue ${deck.letter}`}
+                    </button>
+                  );
+                })}
               </div>
               <div className="inspector-tags">
                 <div className="overline">Tags</div>
@@ -1699,6 +1713,17 @@ export const Library = memo(
             </div>
           )}
         </aside>
+        {trackMenu && (
+          <TrackMenu
+            x={trackMenu.x}
+            y={trackMenu.y}
+            groups={trackMenuGroups(
+              lib.tracks.find((track) => track.path === trackMenu.track.path) ??
+                trackMenu.track,
+            )}
+            onClose={closeTrackMenu}
+          />
+        )}
       </section>
     );
   }),

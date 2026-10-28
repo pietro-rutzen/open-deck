@@ -418,6 +418,10 @@ export function App() {
   });
 
   const quad = deckCount === 4;
+  const nextDecks = (quad ? [0, 1, 2, 3] : [leftSel, rightSel]).flatMap((index) => {
+    const letter = DECK_LETTERS[index];
+    return letter ? [{ index, letter }] : [];
+  });
   // In 4-deck mode each deck syncs to the other deck in its row (A↔B, C↔D; partner index = deck ^ 1).
   const fourDeckProps = (d: DeckController) => {
     const partner = decks[d.deck ^ 1];
@@ -507,7 +511,7 @@ export function App() {
                 />
               </div>
             </>
-          )} lower={<Library loadedPaths={loadedPaths} keyNotation={keyNotation} />} />
+          )} lower={<Library loadedPaths={loadedPaths} nextDecks={nextDecks} keyNotation={keyNotation} />} />
         </div>
       </div>
       <StatusBar

@@ -324,6 +324,9 @@ export const reorderFolderTracks = (paths: string[]) => invoke<PathMove[]>("reor
 export const moveIntoFolder = (folder: string, paths: string[]) =>
   invoke("move_into_open_folder", { folder, paths });
 
+/** Move a track out of its current folder into ~/Music/removed from playlists. */
+export const removeFromFolder = (path: string) => invoke("remove_from_folder", { path });
+
 export const onLibraryPathsMoved = (cb: (moves: PathMove[]) => void): Promise<UnlistenFn> =>
   listen<PathMove[]>("library:paths-moved", (event) => cb(event.payload));
 export const dbTrackState = (path: string) => invoke<DbTrackState>("db_track_state", { path });
@@ -416,10 +419,6 @@ export async function importCrate(): Promise<ImportSummary | null> {
   if (typeof selected !== "string") return null;
   return invoke<ImportSummary>("import_crate", { srcPath: selected });
 }
-
-/** Auto-mix planner: ranked next-track suggestions (harmonic + tempo) after `currentPath`. */
-export const dbPlanNext = (currentPath: string, limit: number) =>
-  invoke<DbTrack[]>("db_plan_next", { currentPath, limit });
 
 // ---- Controllers (mapping profiles) -----------------------------------------------
 export interface ControllerBinding {

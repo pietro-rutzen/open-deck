@@ -4,9 +4,10 @@ import type { CueApi } from "../hooks/useCue";
 import type { BoothApi } from "../hooks/useBooth";
 import type { AuxApi } from "../hooks/useAux";
 import type { InternalClockApi } from "../hooks/useInternalClock";
-import { dbListTracks, deckPlay, inTauri, loadTrack, onDeckLoaded, onLibraryChanged, type DbTrack } from "../lib/ipc";
+import { dbListTracks, deckPlay, inTauri, loadTrack, onDeckLoaded, onLibraryChanged, transposeKey, type DbTrack } from "../lib/ipc";
 import { listeningModeActive, subscribeListeningMode } from "../lib/listeningMode";
-import { baseName, orderSuggestions, reorderPaths, suggestNextTracks } from "../lib/libraryFolders";
+import { baseName, combineNextTracks, directoryOf, readFolderOrders, reorderPaths, savedFolderOrder, subscribeFolderOrders, suggestNextTracks } from "../lib/libraryFolders";
+import { forgetQueuedPath, nextOrderKey, readNextQueueSnapshot, replaceQueuedPaths, setManualNextOrder, subscribeNextQueue } from "../lib/nextQueue";
 import { TRIM_MAX } from "../lib/trim";
 import { Knob } from "./Knob";
 import { Fader } from "./Fader";
@@ -145,6 +146,39 @@ function useLibraryTracks(): DbTrack[] {
   return tracks;
 }
 
+const REPEAT_SUGGESTIONS_KEY = "opendeck.next.repeatSuggestions";
+
+const readRepeatedSuggestions = () => {
+  try {
+    return localStorage.getItem(REPEAT_SUGGESTIONS_KEY) === "1";
+  } catch {
+    return false;
+  }
+};
+
+const writeRepeatedSuggestions = (allowed: boolean) => {
+  try {
+    localStorage.setItem(REPEAT_SUGGESTIONS_KEY, allowed ? "1" : "0");
+  } catch {
+    /* The choice still applies until reload. */
+  }
+};
+
+const audibleBpm = (fileBpm: number | null, tempo: number) =>
+  fileBpm != null && tempo > 0 ? fileBpm * tempo : fileBpm;
+
+/** Key the deck is sounding: explicit key shift, or the tempo fader when key lock is off and no shift is set. */
+const audibleCamelot = (
+  camelot: string | null | undefined,
+  name: string | null | undefined,
+  pitchShift: number,
+  tempo: number,
+  keylock: boolean,
+) => {
+  const semitones = !keylock && pitchShift === 0 && tempo > 0 ? Math.round(12 * Math.log2(tempo)) : pitchShift;
+  return transposeKey(camelot, name, semitones).camelot;
+};
+
 function NextTracks({
   channels,
   loadedPaths,
@@ -165,7 +199,11 @@ function NextTracks({
     setQueueOn((current) => ({ ...current, 0: active }));
     setPlayOn((current) => ({ ...current, 0: active }));
   }), []);
-  const [manualOrder, setManualOrder] = useState<Record<string, string[]>>({});
+  const [nextQueue, setNextQueue] = useState(readNextQueueSnapshot);
+  useEffect(() => subscribeNextQueue(() => setNextQueue(readNextQueueSnapshot())), []);
+  const [folderOrders, setFolderOrders] = useState(readFolderOrders);
+  const [allowRepeats, setAllowRepeats] = useState(readRepeatedSuggestions);
+  useEffect(() => subscribeFolderOrders(() => setFolderOrders(readFolderOrders())), []);
   const [dropKey, setDropKey] = useState<string | null>(null);
   const draggingPath = useRef<string | null>(null);
   const playAfterLoad = useRef(new Map<number, string>());
@@ -190,22 +228,79 @@ function NextTracks({
     };
   }, []);
   const busyPaths = loadedPaths ?? channels.map((channel) => channel.ctrl.state.meta?.path);
-  const columns = useMemo(() => channels.map((channel) => {
-    const meta = channel.ctrl.state.meta;
-    const libraryBpm = tracks.find((track) => track.path === meta?.path)?.bpm ?? null;
-    const reference = libraryBpm != null && libraryBpm > 0 ? libraryBpm : (meta && meta.bpm > 0 ? meta.bpm : null);
-    const suggestions = meta
-      ? orderSuggestions(
-          suggestNextTracks(tracks, meta.path, reference, busyPaths.filter((path): path is string => Boolean(path)), limit, listening ? 0.2 : 1),
-          manualOrder[`${channel.ctrl.deck}:${meta.path}`],
-        )
-      : [];
-    return { channel, suggestions };
-  }), [channels, tracks, busyPaths, limit, manualOrder, listening]);
+  const loadedIdentityKey = channels.map((channel) => `${channel.ctrl.deck}:${channel.ctrl.state.meta?.path ?? ""}`).join("\0");
+  useEffect(() => {
+    for (const entry of loadedIdentityKey.split("\0")) {
+      const splitAt = entry.indexOf(":");
+      const deck = Number(entry.slice(0, splitAt));
+      const path = entry.slice(splitAt + 1);
+      if (path) forgetQueuedPath(deck, path);
+    }
+  }, [loadedIdentityKey]);
+  const columns = useMemo(() => {
+    const loaded = busyPaths.filter((path): path is string => Boolean(path));
+    return channels.reduce<{ rows: { channel: Channel; suggestions: DbTrack[] }[]; taken: ReadonlySet<string> }>((state, channel) => {
+      const meta = channel.ctrl.state.meta;
+      const libraryTrack = tracks.find((track) => track.path === meta?.path);
+      const fileBpm = libraryTrack?.bpm != null && libraryTrack.bpm > 0 ? libraryTrack.bpm : (meta && meta.bpm > 0 ? meta.bpm : null);
+      const reference = audibleBpm(fileBpm, channel.ctrl.state.tempo);
+      const referenceKey = meta
+        ? audibleCamelot(
+            libraryTrack?.key_camelot || meta.key_camelot,
+            libraryTrack?.key_name || meta.key_name,
+            channel.ctrl.state.pitchShift,
+            channel.ctrl.state.tempo,
+            channel.ctrl.state.keylock,
+          )
+        : null;
+      const blocked = allowRepeats ? loaded : [...loaded, ...state.taken];
+      const queuedPaths = nextQueue.queuedByDeck[channel.ctrl.deck] ?? [];
+      const queuedTracks = queuedPaths.flatMap((path) => {
+        if (path === meta?.path) return [];
+        const track = tracks.find((item) => item.path === path);
+        return track ? [track] : [];
+      });
+      const ranked = meta
+        ? suggestNextTracks(
+            tracks,
+            meta.path,
+            reference,
+            blocked,
+            limit,
+            listening ? 0.2 : 1,
+            listening ? null : referenceKey,
+            savedFolderOrder(folderOrders, directoryOf(meta.path)),
+          )
+        : [];
+      const suggestions = combineNextTracks(
+        ranked,
+        queuedTracks,
+        meta ? nextQueue.manualOrder[nextOrderKey(channel.ctrl.deck, meta.path)] : undefined,
+      );
+      const taken = allowRepeats
+        ? state.taken
+        : new Set([...state.taken, ...suggestions.map((track) => track.path), ...queuedPaths]);
+      return { rows: [...state.rows, { channel, suggestions }], taken };
+    }, { rows: [], taken: new Set() }).rows;
+  }, [channels, tracks, busyPaths, limit, nextQueue, listening, allowRepeats, folderOrders]);
 
   return (
     <div className={`mixer-next ${channels.length > 2 ? "mixer-next--quad" : ""}`}>
-      <h3 className="overline next-banner">Next</h3>
+      <div className="next-head">
+        <h3 className="overline">Next</h3>
+        <label className="next-repeat" title="Allow the same track to be suggested on more than one deck. Off, each track is offered to one deck.">
+          <input
+            type="checkbox"
+            checked={allowRepeats}
+            onChange={(event) => {
+              const allowed = event.target.checked;
+              setAllowRepeats(allowed);
+              writeRepeatedSuggestions(allowed);
+            }}
+          />
+          Repeat suggestions
+        </label>
+      </div>
       <div className="next-grid">
       {columns.map(({ channel, suggestions }) => (
         <section className="mixer-next-col" key={channel.letter} aria-label={`Next tracks for deck ${channel.letter}`}>
@@ -242,19 +337,25 @@ function NextTracks({
             play={!!playOn[channel.ctrl.deck]}
             playAfterLoad={playAfterLoad}
           />
-          {channel.ctrl.state.meta == null ? (
-            <p className="next-empty">Load a track on deck {channel.letter}.</p>
-          ) : suggestions.length === 0 ? (
-            <p className="next-empty">No other tracks in this folder.</p>
+          {suggestions.length === 0 ? (
+            <p className="next-empty">
+              {channel.ctrl.state.meta == null
+                ? `Load a track on deck ${channel.letter}.`
+                : "No other tracks in this folder."}
+            </p>
           ) : (
             <div className="next-list">
-              {suggestions.map((track) => (
+              {suggestions.map((track) => {
+                const queued = (nextQueue.queuedByDeck[channel.ctrl.deck] ?? []).includes(track.path);
+                return (
                 <NextCard
                   key={track.path}
                   track={track}
                   deck={channel.ctrl.deck}
                   letter={channel.letter}
+                  queued={queued}
                   dropping={dropKey === `${channel.ctrl.deck}:${track.path}`}
+                  onRemove={() => forgetQueuedPath(channel.ctrl.deck, track.path)}
                   onDragBegin={(event) => {
                     draggingPath.current = track.path;
                     event.dataTransfer.setData("application/x-compas-track", track.path);
@@ -277,15 +378,17 @@ function NextTracks({
                     event.preventDefault();
                     const from = event.dataTransfer.getData("application/x-compas-track") || draggingPath.current;
                     setDropKey(null);
-                    if (!from || from === track.path || !channel.ctrl.state.meta) return;
+                    if (!from || from === track.path) return;
                     if (!suggestions.some((item) => item.path === from)) return;
                     const next = reorderPaths(suggestions.map((item) => item.path), from, track.path);
                     if (!next) return;
-                    const loadedPath = channel.ctrl.state.meta.path;
-                    setManualOrder((current) => ({ ...current, [`${channel.ctrl.deck}:${loadedPath}`]: next }));
+                    const loadedPath = channel.ctrl.state.meta?.path;
+                    if (loadedPath) setManualNextOrder(channel.ctrl.deck, loadedPath, next);
+                    else replaceQueuedPaths(channel.ctrl.deck, next);
                   }}
                 />
-              ))}
+                );
+              })}
             </div>
           )}
         </section>
@@ -334,7 +437,9 @@ function NextCard({
   track,
   deck,
   letter,
+  queued,
   dropping,
+  onRemove,
   onDragBegin,
   onDragFinish,
   onDragHover,
@@ -343,7 +448,9 @@ function NextCard({
   track: DbTrack;
   deck: number;
   letter: string;
+  queued: boolean;
   dropping: boolean;
+  onRemove: () => void;
   onDragBegin: (event: DragEvent<HTMLDivElement>) => void;
   onDragFinish: () => void;
   onDragHover: (event: DragEvent<HTMLDivElement>) => void;
@@ -361,7 +468,7 @@ function NextCard({
       role="button"
       tabIndex={0}
       draggable
-      className={`next-card${dropping ? " next-card--drop" : ""}`}
+      className={`next-card${queued ? " next-card--queued" : ""}${dropping ? " next-card--drop" : ""}`}
       onClick={() => { if (!skipClick.current) load(); }}
       onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") {
@@ -380,7 +487,9 @@ function NextCard({
       onDragEnter={onDragHover}
       onDragOver={onDragHover}
       onDrop={onDropTrack}
-      title={`Load ${title} onto deck ${letter}. Drag onto a deck, or onto another suggestion to change what plays next.`}
+      title={queued
+        ? `Queued on deck ${letter}. With Queue or Play on, it loads when the track on that deck ends. Drag to reorder.`
+        : `Load ${title} onto deck ${letter}. Drag onto a deck, or onto another suggestion to change what plays next.`}
     >
       <span className="next-art" aria-hidden="true">
         {artwork ? <img src={artwork} alt="" draggable={false} /> : <span>♫</span>}
@@ -389,7 +498,24 @@ function NextCard({
         <span className="next-title">{title}</span>
         <span className="next-artist">{artist}</span>
       </span>
-      {tempo && <span className="next-bpm">{tempo}</span>}
+      <span className="next-side">
+        {tempo && <span className="next-bpm">{tempo}</span>}
+        {queued && (
+          <button
+            type="button"
+            className="next-queue-remove"
+            aria-label={`Remove ${title} from deck ${letter}'s queue`}
+            title="Remove from this deck's Next queue"
+            onMouseDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              onRemove();
+            }}
+          >
+            ×
+          </button>
+        )}
+      </span>
     </div>
   );
 }

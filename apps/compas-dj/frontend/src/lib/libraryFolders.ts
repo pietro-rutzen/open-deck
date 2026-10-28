@@ -131,9 +131,65 @@ export const childFolders = <Track extends { path: string; play_count?: number }
 export interface NextTrackCandidate {
   path: string;
   bpm: number | null;
+  key_camelot?: string | null;
 }
 
+const FOLDER_ORDER_KEY = "opendeck.library.folderOrder.v1";
+const folderOrderListeners = new Set<() => void>();
+
+export const readFolderOrders = (): Record<string, string[]> => {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FOLDER_ORDER_KEY) ?? "null") as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(parsed).flatMap(([folder, paths]) =>
+        Array.isArray(paths) && paths.every((path) => typeof path === "string") ? [[folder, paths]] : [],
+      ),
+    );
+  } catch {
+    return {};
+  }
+};
+
+export const writeFolderOrders = (orders: Record<string, string[]>) => {
+  try {
+    localStorage.setItem(FOLDER_ORDER_KEY, JSON.stringify(orders));
+  } catch {
+    return;
+  }
+  folderOrderListeners.forEach((listener) => listener());
+};
+
+export const subscribeFolderOrders = (listener: () => void) => {
+  folderOrderListeners.add(listener);
+  return () => {
+    folderOrderListeners.delete(listener);
+  };
+};
+
+/** Saved order for `folder`, including a key that only differs by a trailing slash. */
+export const savedFolderOrder = (orders: Readonly<Record<string, readonly string[]>>, folder: string) => {
+  const normalized = normalizeDir(folder);
+  const direct = orders[folder] ?? orders[normalized];
+  if (direct) return direct;
+  const key = Object.keys(orders).find((candidate) => normalizeDir(candidate) === normalized);
+  return key ? orders[key] : undefined;
+};
+
 const fileOrder = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+/** Saved folder order first, then numeric file name. Tracks listed in the saved order stay ahead of any new files. */
+export const folderOrderComparator = (folderOrder: readonly string[] | undefined) => {
+  const rank = new Map((folderOrder ?? []).map((path, index) => [path, index]));
+  return (leftPath: string, rightPath: string) => {
+    const leftRank = rank.get(leftPath);
+    const rightRank = rank.get(rightPath);
+    if (leftRank != null && rightRank != null && leftRank !== rightRank) return leftRank - rightRank;
+    if (leftRank != null) return -1;
+    if (rightRank != null) return 1;
+    return fileOrder.compare(baseName(leftPath), baseName(rightPath)) || leftPath.localeCompare(rightPath);
+  };
+};
 
 export const compareFileNames = (left: string, right: string) => fileOrder.compare(left, right);
 
@@ -161,6 +217,17 @@ export function orderSuggestions<Track extends { path: string }>(suggestions: re
   return [...kept, ...suggestions.filter((track) => !seen.has(track.path))];
 }
 
+/** Queued tracks play before ranked suggestions. A drag order, when present, wins. */
+export function combineNextTracks<Track extends { path: string }>(
+  suggestions: readonly Track[],
+  queued: readonly Track[],
+  preferred: readonly string[] | undefined,
+): Track[] {
+  const queuedPaths = new Set(queued.map((track) => track.path));
+  const pool = [...queued, ...suggestions.filter((track) => !queuedPaths.has(track.path))];
+  return orderSuggestions(pool, preferred);
+}
+
 const knownTempo = (bpm: number | null | undefined) =>
   bpm != null && Number.isFinite(bpm) && bpm > 0 ? bpm : null;
 
@@ -174,7 +241,42 @@ const tempoFraction = (bpm: number | null, reference: number | null) => {
   return Math.min(1, Math.abs(bpm - reference) / 32);
 };
 
-/** Closest analyzed BPM first when `tempoWeight` is 1. Lower weights follow folder order and only nudge for tempo. */
+const bpmDistance = (bpm: number | null, reference: number | null) => {
+  const tempo = knownTempo(bpm);
+  if (reference == null || tempo == null) return Number.POSITIVE_INFINITY;
+  return Math.abs(tempo - reference);
+};
+
+const parseCamelot = (value: string | null | undefined) => {
+  if (!value) return null;
+  const match = /^(\d{1,2})([AB])$/.exec(value.trim().toUpperCase());
+  if (!match) return null;
+  const number = Number(match[1]);
+  const letter = match[2];
+  if (number < 1 || number > 12 || (letter !== "A" && letter !== "B")) return null;
+  return { number, letter };
+};
+
+const wheelDistance = (left: number, right: number) => {
+  const delta = Math.abs(left - right) % 12;
+  return Math.min(delta, 12 - delta);
+};
+
+const UNKNOWN_KEY_DISTANCE = 100;
+
+/** Lower is closer on the Camelot wheel. Same key, then relative major/minor, then fewer steps. Unknown keys sort last. */
+const camelotDistance = (fromKey: string | null | undefined, toKey: string | null | undefined) => {
+  const from = parseCamelot(fromKey);
+  const to = parseCamelot(toKey);
+  if (!from || !to) return UNKNOWN_KEY_DISTANCE;
+  const steps = wheelDistance(from.number, to.number);
+  const modeChange = from.letter === to.letter ? 0 : 1;
+  if (steps === 0) return modeChange;
+  return steps * 2 + modeChange;
+};
+
+/** Performance order (`tempoWeight` >= 1): closest BPM, then Camelot proximity, then the next track in folder order.
+ *  Lower weights follow folder order and only nudge toward a closer tempo. */
 export function suggestNextTracks<Track extends NextTrackCandidate>(
   tracks: readonly Track[],
   currentPath: string,
@@ -182,12 +284,15 @@ export function suggestNextTracks<Track extends NextTrackCandidate>(
   busyPaths: readonly string[],
   limit: number,
   tempoWeight = 1,
+  currentKey: string | null = null,
+  folderOrder?: readonly string[],
 ): Track[] {
   if (limit <= 0) return [];
   const folder = directoryOf(currentPath);
+  const compareOrder = folderOrderComparator(folderOrder);
   const ordered = tracks
     .filter((track) => directoryOf(track.path) === folder)
-    .sort((left, right) => fileOrder.compare(baseName(left.path), baseName(right.path)) || left.path.localeCompare(right.path));
+    .sort((left, right) => compareOrder(left.path, right.path));
   const here = ordered.findIndex((track) => track.path === currentPath);
   const reference = knownTempo(currentBpm) ?? knownTempo(here >= 0 ? ordered[here]?.bpm : null);
   const busy = new Set([...busyPaths, currentPath]);
@@ -199,12 +304,16 @@ export function suggestNextTracks<Track extends NextTrackCandidate>(
       const leftSteps = stepsAhead(left.index, here, ordered.length);
       const rightSteps = stepsAhead(right.index, here, ordered.length);
       if (weight >= 1) {
-        const leftTempo = knownTempo(left.track.bpm);
-        const rightTempo = knownTempo(right.track.bpm);
-        const leftDistance = reference == null || leftTempo == null ? Number.POSITIVE_INFINITY : Math.abs(leftTempo - reference);
-        const rightDistance = reference == null || rightTempo == null ? Number.POSITIVE_INFINITY : Math.abs(rightTempo - reference);
-        if (leftDistance < rightDistance) return -1;
-        if (leftDistance > rightDistance) return 1;
+        const leftDistance = bpmDistance(left.track.bpm, reference);
+        const rightDistance = bpmDistance(right.track.bpm, reference);
+        const leftShown = Number.isFinite(leftDistance) ? Math.round(leftDistance * 100) : leftDistance;
+        const rightShown = Number.isFinite(rightDistance) ? Math.round(rightDistance * 100) : rightDistance;
+        if (leftShown < rightShown) return -1;
+        if (leftShown > rightShown) return 1;
+        const leftKey = camelotDistance(currentKey, left.track.key_camelot);
+        const rightKey = camelotDistance(currentKey, right.track.key_camelot);
+        if (leftKey < rightKey) return -1;
+        if (leftKey > rightKey) return 1;
         return leftSteps - rightSteps;
       }
       const span = Math.max(1, ordered.length);
