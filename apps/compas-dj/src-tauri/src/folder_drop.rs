@@ -10,6 +10,7 @@ use crate::is_audio_file;
 const MAX_DROPPED_FILES: usize = 200;
 const MAX_WALK_DEPTH: u32 = 6;
 
+#[derive(Debug)]
 pub struct PlannedMove {
     pub from: PathBuf,
     pub to: PathBuf,
@@ -340,7 +341,10 @@ mod tests {
         let planned = plan_remove_from_folder(&source, &music).unwrap();
         commit_move(&planned.from, &planned.to).unwrap();
         let landed = removed_playlists_dir(&music).join("Song.mp3");
-        assert_eq!(planned.to, landed);
+        assert_eq!(
+            fs::canonicalize(&planned.to).unwrap(),
+            fs::canonicalize(&landed).unwrap()
+        );
         assert!(landed.is_file());
         assert!(!source.exists());
         let again = plan_remove_from_folder(&landed, &music).unwrap_err();

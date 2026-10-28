@@ -75,6 +75,55 @@ const parentDirectory = (folder: string) => {
 export const containingRoot = (folder: string, roots: readonly string[]) =>
   roots.find((root) => isInside(root, folder)) ?? null;
 
+/** Point `path` at `to` when it is `from` or a file/folder inside `from`. */
+export const retargetFolderPath = (path: string, from: string, to: string) => {
+  const root = normalizeDir(from);
+  const next = normalizeDir(to);
+  const target = normalizeDir(path);
+  if (target === root) return next;
+  const prefix = `${root}${separatorOf(root)}`;
+  if (!target.startsWith(prefix)) return path;
+  return `${next}${separatorOf(next)}${target.slice(prefix.length)}`;
+};
+
+export const folderOrdersAfterRename = (
+  orders: Readonly<Record<string, readonly string[]>>,
+  from: string,
+  to: string,
+): Record<string, string[]> =>
+  Object.entries(orders).reduce<Record<string, string[]>>((merged, [folder, paths]) => {
+    const key = retargetFolderPath(folder, from, to);
+    const moved = paths.map((path) => retargetFolderPath(path, from, to));
+    const existing = merged[key] ?? [];
+    return {
+      ...merged,
+      [key]: [...existing, ...moved.filter((path) => !existing.includes(path))],
+    };
+  }, {});
+
+export const folderOrdersAfterDelete = (
+  orders: Readonly<Record<string, readonly string[]>>,
+  deleted: string,
+): Record<string, string[]> =>
+  Object.fromEntries(
+    Object.entries(orders).flatMap(([folder, paths]) => {
+      if (isInside(deleted, folder)) return [];
+      return [[folder, paths.filter((path) => !isInside(deleted, path))]];
+    }),
+  );
+
+/** Where to land after `deleted` leaves the library. A parent still inside a watched root stays open. */
+export const folderAfterDelete = (
+  current: string | null,
+  deleted: string,
+  roots: readonly string[],
+): string | null => {
+  if (!current || !isInside(deleted, current)) return current;
+  const parent = directoryOf(deleted);
+  const remaining = roots.filter((root) => !isInside(deleted, root));
+  return remaining.some((root) => isInside(root, parent)) ? parent : null;
+};
+
 /** Parent folder within an imported root. The imported root itself steps back out to the whole library. */
 export const ascendFolder = (folder: string, roots: readonly string[]) => {
   const root = containingRoot(folder, roots);

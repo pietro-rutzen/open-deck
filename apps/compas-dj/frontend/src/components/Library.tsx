@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
   type DragEvent,
+  type MouseEvent,
 } from 'react';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import type { PhysicalPosition } from '@tauri-apps/api/dpi';
@@ -17,9 +18,11 @@ import {
   dbAddTag,
   dbRemoveTag,
   dbResetPlayCounts,
+  deleteLibraryFolder,
   inTauri,
   listWatchFolders,
   moveIntoFolder,
+  renameLibraryFolder,
   onLibraryChanged,
   onLibraryPathsMoved,
   onControllerUpdate,
@@ -35,6 +38,7 @@ import {
   formatKey,
   prioritizeAnalysis,
   type DbTrack,
+  type FolderEdit,
   type KeyNotation,
 } from '../lib/ipc';
 import {
@@ -49,10 +53,14 @@ import {
   childFolders,
   directoryOf,
   directTracks,
+  folderAfterDelete,
   folderCrumbs,
   folderOrderComparator,
+  folderOrdersAfterDelete,
+  folderOrdersAfterRename,
   folderPlayCounts,
   isInside,
+  retargetFolderPath,
   playProgressTone,
   readFolderOrders,
   reorderPaths,
@@ -60,9 +68,9 @@ import {
 } from '../lib/libraryFolders';
 import { filterLibraryTracks } from '../lib/librarySearch';
 import { listeningModeActive, setListeningMode } from '../lib/listeningMode';
-import { enqueueOnDeck, readQueuedPaths, retargetNextQueuePaths, subscribeNextQueue } from '../lib/nextQueue';
+import { enqueueOnDeck, forgetQueuedPaths, readQueuedPaths, retargetNextQueuePaths, subscribeNextQueue } from '../lib/nextQueue';
 import { PaneDivider, useStoredSize } from './WorkspaceSplit';
-import { TrackMenu, type TrackMenuItem } from './TrackMenu';
+import { FolderNamePrompt, TrackMenu, type TrackMenuItem } from './TrackMenu';
 import { useLibrary } from '../hooks/useLibrary';
 import { Icon } from './icons';
 import { MiniWaveform, TrackCells, useTrackVisuals } from './LibraryVisuals';
@@ -94,6 +102,35 @@ const readStoredView = (): 'unset' | 'library' | string => {
 const storedFolderPath = () => {
   const view = readStoredView();
   return view !== 'unset' && view !== 'library' ? view : null;
+};
+
+const retargetStoredFolder = (key: string, from: string, to: string | null) => {
+  try {
+    const value = localStorage.getItem(key);
+    if (!value || value === 'library') return;
+    if (to == null) {
+      if (isInside(from, value)) localStorage.removeItem(key);
+      return;
+    }
+    const next = retargetFolderPath(value, from, to);
+    if (next !== value) localStorage.setItem(key, next);
+  } catch {
+    /* The open folder still updates on screen. */
+  }
+};
+
+const retargetBrowseKey = (key: string | null, from: string, to: string | null) => {
+  if (!key) return key;
+  const marker = key.startsWith('folder:')
+    ? 'folder:'
+    : key.startsWith('up:')
+      ? 'up:'
+      : null;
+  if (!marker) return key;
+  const path = key.slice(marker.length);
+  if (to == null) return isInside(from, path) ? null : key;
+  const next = retargetFolderPath(path, from, to);
+  return next === path ? key : `${marker}${next}`;
 };
 
 const pointerOverElement = (element: Element, position: PhysicalPosition) => {
@@ -258,6 +295,23 @@ export const Library = memo(
       y: number;
     } | null>(null);
     const closeTrackMenu = useCallback(() => setTrackMenu(null), []);
+    const [folderMenu, setFolderMenu] = useState<{
+      path: string;
+      name: string;
+      x: number;
+      y: number;
+    } | null>(null);
+    const [folderRename, setFolderRename] = useState<{
+      path: string;
+      name: string;
+    } | null>(null);
+    const [folderRenameError, setFolderRenameError] = useState<string | null>(
+      null,
+    );
+    const folderEditBusy = useRef(false);
+    const [folderRenameBusy, setFolderRenameBusy] = useState(false);
+    const closeFolderMenu = useCallback(() => setFolderMenu(null), []);
+    const [browseKey, setBrowseKey] = useState<string | null>(null);
     const openedInitialFolder = useRef(readStoredView() !== 'unset');
     const reportError = (error: unknown) => setActionError(String(error));
     const load = async (deck: number, path: string) => {
@@ -641,6 +695,136 @@ export const Library = memo(
         reportError(error);
       }
     };
+    const followFolderEdit = (edit: FolderEdit) => {
+      if (edit.to) {
+        const next = edit.to;
+        setFolderPath((current) =>
+          current ? retargetFolderPath(current, edit.from, next) : current,
+        );
+        const updatedOrders = folderOrdersAfterRename(
+          folderOrders,
+          edit.from,
+          next,
+        );
+        writeFolderOrders(updatedOrders);
+        setFolderOrders(updatedOrders);
+        setFolders((current) =>
+          current.map((folder) => retargetFolderPath(folder, edit.from, next)),
+        );
+        setSelectedPath((path) =>
+          path ? retargetFolderPath(path, edit.from, next) : path,
+        );
+        setBrowseKey((key) => retargetBrowseKey(key, edit.from, next));
+        retargetStoredFolder(PLAYING_FOLDER_KEY, edit.from, next);
+        retargetStoredFolder(VIEW_FOLDER_KEY, edit.from, next);
+      } else {
+        const remaining = folders.filter(
+          (folder) => !isInside(edit.from, folder),
+        );
+        setFolders(remaining);
+        setFolderPath((current) =>
+          folderAfterDelete(current, edit.from, remaining),
+        );
+        const updatedOrders = folderOrdersAfterDelete(folderOrders, edit.from);
+        writeFolderOrders(updatedOrders);
+        setFolderOrders(updatedOrders);
+        setSelectedPath((path) =>
+          path && isInside(edit.from, path) ? null : path,
+        );
+        setBrowseKey((key) => retargetBrowseKey(key, edit.from, null));
+        retargetStoredFolder(PLAYING_FOLDER_KEY, edit.from, null);
+        retargetStoredFolder(VIEW_FOLDER_KEY, edit.from, null);
+        forgetQueuedPaths(edit.removed);
+      }
+      lib.refresh();
+      refreshFolders();
+    };
+    const openFolderMenu = (
+      path: string,
+      name: string,
+      event: MouseEvent,
+    ) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setTrackMenu(null);
+      setFolderMenu({ path, name, x: event.clientX, y: event.clientY });
+    };
+    const folderMenuGroups = (path: string, name: string): TrackMenuItem[][] => [
+      [
+        {
+          id: 'rename-folder',
+          label: 'Rename',
+          onSelect: () => {
+            setFolderRenameError(null);
+            setFolderRename({ path, name });
+          },
+        },
+      ],
+      [
+        {
+          id: 'delete-folder',
+          label: 'Delete folder',
+          detail: 'Moves the folder to the Trash',
+          danger: true,
+          onSelect: () => {
+            void deleteFolderFromDisk(path, name);
+          },
+        },
+      ],
+    ];
+    const deleteFolderFromDisk = async (path: string, name: string) => {
+      if (!inTauri()) {
+        setActionError('Open the desktop app to change folders on disk');
+        return;
+      }
+      const accepted = await ask(
+        `Move “${name}” to the Trash? The folder and everything inside it leave the library.`,
+        {
+          title: 'Delete folder',
+          kind: 'warning',
+          okLabel: 'Move to Trash',
+          cancelLabel: 'Cancel',
+        },
+      );
+      if (!accepted || folderEditBusy.current) return;
+      folderEditBusy.current = true;
+      try {
+        const edit = await deleteLibraryFolder(path);
+        followFolderEdit(edit);
+        setActionError(null);
+      } catch (error) {
+        reportError(error);
+      } finally {
+        folderEditBusy.current = false;
+      }
+    };
+    const submitFolderRename = async (name: string) => {
+      if (!folderRename || folderEditBusy.current) return;
+      const trimmed = name.trim();
+      if (!trimmed || trimmed === folderRename.name) {
+        setFolderRename(null);
+        setFolderRenameError(null);
+        return;
+      }
+      if (!inTauri()) {
+        setFolderRenameError('Open the desktop app to change folders on disk');
+        return;
+      }
+      folderEditBusy.current = true;
+      setFolderRenameBusy(true);
+      setFolderRenameError(null);
+      try {
+        const edit = await renameLibraryFolder(folderRename.path, trimmed);
+        followFolderEdit(edit);
+        setFolderRename(null);
+        setActionError(null);
+      } catch (error) {
+        setFolderRenameError(String(error));
+      } finally {
+        folderEditBusy.current = false;
+        setFolderRenameBusy(false);
+      }
+    };
 
     const sourceTracks = results ?? lib.tracks;
     const filtered = useMemo(
@@ -830,7 +1014,6 @@ export const Library = memo(
         })),
       ];
     }, [browsingFolder, folderPath, folders, folderEntries, folderTracks]);
-    const [browseKey, setBrowseKey] = useState<string | null>(null);
     const selected =
       folderTracks.find((track) => track.path === selectedPath) ?? null;
     const selectedBrowse =
@@ -1018,6 +1201,11 @@ export const Library = memo(
                 className={`src-row ${folderPath && isInside(f, folderPath) ? 'src-row--active' : ''}`}
                 title={f}
                 onClick={() => openFolder(f)}
+                onMouseDown={(event) => {
+                  if (event.button !== 2) return;
+                  openFolderMenu(f, baseName(f), event);
+                }}
+                onContextMenu={(event) => openFolderMenu(f, baseName(f), event)}
                 role="button"
                 tabIndex={0}
                 onKeyDown={(e) => {
@@ -1089,6 +1277,9 @@ export const Library = memo(
                           crumbIndex === crumbs.length - 1 ? 'page' : undefined
                         }
                         onClick={() => openFolder(crumb.path)}
+                        onContextMenu={(event) =>
+                          openFolderMenu(crumb.path, crumb.name, event)
+                        }
                       >
                         {crumb.name}
                       </button>
@@ -1244,6 +1435,16 @@ export const Library = memo(
                           selectedRow || (!browseKey && index === 0) ? 0 : -1
                         }
                         data-browse-key={row.key}
+                        onMouseDown={(event) => {
+                          if (row.kind !== 'folder' || event.button !== 2) return;
+                          selectBrowse(index);
+                          openFolderMenu(row.path, row.name, event);
+                        }}
+                        onContextMenu={(event) => {
+                          if (row.kind !== 'folder') return;
+                          selectBrowse(index);
+                          openFolderMenu(row.path, row.name, event);
+                        }}
                         onClick={() => {
                           selectBrowse(index);
                           enterBrowse(row);
@@ -1320,6 +1521,7 @@ export const Library = memo(
                         if (event.button !== 2) return;
                         event.preventDefault();
                         selectBrowse(index);
+                        setFolderMenu(null);
                         setTrackMenu({
                           track: t,
                           x: event.clientX,
@@ -1329,6 +1531,7 @@ export const Library = memo(
                       onContextMenu={(event) => {
                         event.preventDefault();
                         selectBrowse(index);
+                        setFolderMenu(null);
                         setTrackMenu({
                           track: t,
                           x: event.clientX,
@@ -1702,6 +1905,7 @@ export const Library = memo(
               <Icon name="folder" size={28} />
               <h3>{selectedBrowse.name}</h3>
               <p>{selectedBrowse.trackCount} tracks in this folder.</p>
+              <p>Right-click the folder to rename it or move it to the Trash.</p>
             </div>
           ) : (
             <div className="inspector-empty">
@@ -1722,6 +1926,28 @@ export const Library = memo(
                 trackMenu.track,
             )}
             onClose={closeTrackMenu}
+          />
+        )}
+        {folderMenu && (
+          <TrackMenu
+            x={folderMenu.x}
+            y={folderMenu.y}
+            groups={folderMenuGroups(folderMenu.path, folderMenu.name)}
+            onClose={closeFolderMenu}
+          />
+        )}
+        {folderRename && (
+          <FolderNamePrompt
+            initialName={folderRename.name}
+            busy={folderRenameBusy}
+            error={folderRenameError}
+            onCancel={() => {
+              setFolderRename(null);
+              setFolderRenameError(null);
+            }}
+            onSubmit={(name) => {
+              void submitFolderRename(name);
+            }}
           />
         )}
       </section>

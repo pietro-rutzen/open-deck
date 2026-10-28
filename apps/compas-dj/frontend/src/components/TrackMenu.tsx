@@ -1,4 +1,12 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { createPortal } from "react-dom";
 
 export interface TrackMenuItem {
@@ -88,6 +96,77 @@ export function TrackMenu({
           ))}
         </div>
       ))}
+    </div>,
+    document.body,
+  );
+}
+
+export function FolderNamePrompt({
+  initialName,
+  busy,
+  error,
+  onCancel,
+  onSubmit,
+}: {
+  initialName: string;
+  busy: boolean;
+  error: string | null;
+  onCancel: () => void;
+  onSubmit: (name: string) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [name, setName] = useState(initialName);
+  useLayoutEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+  const cancel = () => {
+    if (!busy) onCancel();
+  };
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    if (!busy) onSubmit(name);
+  };
+  const onKeyDown = (event: ReactKeyboardEvent) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancel();
+    }
+  };
+  const keepOpen = (event: ReactMouseEvent) => event.stopPropagation();
+  return createPortal(
+    <div className="folder-prompt" onMouseDown={cancel} role="presentation">
+      <form
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="folder-rename-title"
+        onMouseDown={keepOpen}
+        onSubmit={submit}
+        onKeyDown={onKeyDown}
+      >
+        <h3 id="folder-rename-title">Rename folder</h3>
+        <p>This changes the folder name on disk. Tracks inside it stay in the library.</p>
+        <input
+          ref={inputRef}
+          aria-label="Folder name"
+          value={name}
+          disabled={busy}
+          onChange={(event) => setName(event.target.value)}
+        />
+        {error && (
+          <p className="folder-prompt-error" role="alert">
+            {error}
+          </p>
+        )}
+        <div className="folder-prompt-actions">
+          <button type="button" className="add-btn" onClick={cancel} disabled={busy}>
+            Cancel
+          </button>
+          <button type="submit" className="add-btn" disabled={busy || name.trim().length === 0}>
+            {busy ? "Renaming…" : "Rename"}
+          </button>
+        </div>
+      </form>
     </div>,
     document.body,
   );

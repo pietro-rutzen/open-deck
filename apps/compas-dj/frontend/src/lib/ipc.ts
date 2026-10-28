@@ -327,6 +327,21 @@ export const moveIntoFolder = (folder: string, paths: string[]) =>
 /** Move a track out of its current folder into ~/Music/removed from playlists. */
 export const removeFromFolder = (path: string) => invoke("remove_from_folder", { path });
 
+export interface FolderEdit {
+  from: string;
+  to: string | null;
+  moves: PathMove[];
+  removed: string[];
+}
+
+/** Rename a library folder on disk. Tracks, cues and watched roots inside it follow. */
+export const renameLibraryFolder = (folder: string, name: string) =>
+  invoke<FolderEdit>("rename_library_folder", { folder, name });
+
+/** Move a library folder to the Trash and drop its tracks from the library. */
+export const deleteLibraryFolder = (folder: string) =>
+  invoke<FolderEdit>("delete_library_folder", { folder });
+
 export const onLibraryPathsMoved = (cb: (moves: PathMove[]) => void): Promise<UnlistenFn> =>
   listen<PathMove[]>("library:paths-moved", (event) => cb(event.payload));
 export const dbTrackState = (path: string) => invoke<DbTrackState>("db_track_state", { path });

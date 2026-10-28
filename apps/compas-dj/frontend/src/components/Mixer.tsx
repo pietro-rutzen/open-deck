@@ -288,18 +288,6 @@ function NextTracks({
     <div className={`mixer-next ${channels.length > 2 ? "mixer-next--quad" : ""}`}>
       <div className="next-head">
         <h3 className="overline">Next</h3>
-        <label className="next-repeat" title="Allow the same track to be suggested on more than one deck. Off, each track is offered to one deck.">
-          <input
-            type="checkbox"
-            checked={allowRepeats}
-            onChange={(event) => {
-              const allowed = event.target.checked;
-              setAllowRepeats(allowed);
-              writeRepeatedSuggestions(allowed);
-            }}
-          />
-          Repeat suggestions
-        </label>
       </div>
       <div className="next-grid">
       {columns.map(({ channel, suggestions }) => (
@@ -394,6 +382,18 @@ function NextTracks({
         </section>
       ))}
       </div>
+      <label className="next-repeat" title="Allow the same track to be suggested on more than one deck. Off, each track is offered to one deck.">
+        <input
+          type="checkbox"
+          checked={allowRepeats}
+          onChange={(event) => {
+            const allowed = event.target.checked;
+            setAllowRepeats(allowed);
+            writeRepeatedSuggestions(allowed);
+          }}
+        />
+        Repeat suggestions
+      </label>
     </div>
   );
 }

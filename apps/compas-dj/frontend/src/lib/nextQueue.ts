@@ -93,6 +93,33 @@ export const setManualNextOrder = (deck: number, loadedPath: string, paths: read
   publish();
 };
 
+export const forgetQueuedPaths = (paths: readonly string[]) => {
+  if (paths.length === 0) return;
+  const dropped = new Set(paths);
+  const queueChanged = Object.values(queuedByDeck).some((queued) =>
+    queued.some((path) => dropped.has(path)),
+  );
+  const manualChanged = Object.entries(manualOrder).some(([key, queued]) => {
+    const loaded = key.slice(key.indexOf(":") + 1);
+    return dropped.has(loaded) || queued.some((path) => dropped.has(path));
+  });
+  if (!queueChanged && !manualChanged) return;
+  queuedByDeck = Object.fromEntries(
+    Object.entries(queuedByDeck).map(([deck, queued]) => [
+      Number(deck),
+      queued.filter((path) => !dropped.has(path)),
+    ]),
+  );
+  manualOrder = Object.fromEntries(
+    Object.entries(manualOrder).flatMap(([key, queued]) => {
+      const loaded = key.slice(key.indexOf(":") + 1);
+      if (dropped.has(loaded)) return [];
+      return [[key, queued.filter((path) => !dropped.has(path))]];
+    }),
+  );
+  publish();
+};
+
 export const retargetNextQueuePaths = (moved: ReadonlyMap<string, string>) => {
   if (moved.size === 0) return;
   const retarget = (path: string) => moved.get(path) ?? path;

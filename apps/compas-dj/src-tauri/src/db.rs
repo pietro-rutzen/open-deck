@@ -347,6 +347,27 @@ pub fn list_watch_folders(c: &Connection) -> rusqlite::Result<Vec<String>> {
     rows.collect()
 }
 
+pub fn list_track_paths(c: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = c.prepare("SELECT path FROM tracks")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    rows.collect()
+}
+
+pub fn rename_watch_folder(c: &Connection, from: &str, to: &str) -> rusqlite::Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    let updated = c.execute(
+        "UPDATE watch_folders SET path = ?2 WHERE path = ?1",
+        params![from, to],
+    )?;
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::QueryReturnedNoRows)
+    }
+}
+
 pub fn remove_track(c: &Connection, path: &str) -> rusqlite::Result<()> {
     // Children cascade via the FK; history is intentionally a standalone log and kept.
     c.execute("DELETE FROM tracks WHERE path = ?1", params![path])?;

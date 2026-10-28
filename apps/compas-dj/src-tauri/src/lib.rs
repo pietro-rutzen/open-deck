@@ -21,6 +21,7 @@ mod export;
 mod flx4_jog;
 mod flx4_runtime;
 mod folder_drop;
+mod folder_edit;
 mod folder_order;
 mod headphone;
 mod hid;
@@ -1650,6 +1651,99 @@ fn remove_from_folder(app: AppHandle, db: State<'_, db::Db>, path: String) -> Re
             )),
         },
     }
+}
+
+#[derive(serde::Serialize, Clone)]
+struct FolderEdit {
+    from: String,
+    to: Option<String>,
+    moves: Vec<PathMove>,
+    removed: Vec<String>,
+}
+
+fn publish_folder_edit(app: &AppHandle, edit: &folder_edit::LibraryFolderEdit) {
+    if !edit.moves.is_empty() {
+        let payload: Vec<PathMove> = edit
+            .moves
+            .iter()
+            .map(|(from, to)| PathMove {
+                from: from.clone(),
+                to: to.clone(),
+            })
+            .collect();
+        let _ = app.emit("library:paths-moved", &payload);
+    }
+    let _ = app.emit("library:changed", ());
+}
+
+fn retarget_watched_paths(watch: &FolderWatch, changes: &[(String, Option<String>)]) {
+    let mut ordered: Vec<&(String, Option<String>)> = changes.iter().collect();
+    ordered.sort_by_key(|change| std::cmp::Reverse(change.0.len()));
+    let Ok(mut guard) = watch.watcher.lock() else {
+        return;
+    };
+    let Some(watcher) = guard.as_mut() else {
+        return;
+    };
+    for change in ordered {
+        let _ = watcher.unwatch(std::path::Path::new(&change.0));
+        if let Some(to) = change.1.as_deref() {
+            if let Err(error) =
+                watcher.watch(std::path::Path::new(to), notify::RecursiveMode::Recursive)
+            {
+                tracing::warn!("watch {to}: {error}");
+            }
+        }
+    }
+}
+
+fn folder_edit_payload(edit: folder_edit::LibraryFolderEdit) -> FolderEdit {
+    FolderEdit {
+        from: edit.from,
+        to: edit.to,
+        moves: edit
+            .moves
+            .iter()
+            .map(|(from, to)| PathMove {
+                from: from.clone(),
+                to: to.clone(),
+            })
+            .collect(),
+        removed: edit.removed,
+    }
+}
+
+/// Rename a watched folder, or a folder inside one, and point library rows at the new paths.
+#[tauri::command]
+fn rename_library_folder(
+    app: AppHandle,
+    db: State<'_, db::Db>,
+    watch: State<'_, FolderWatch>,
+    folder: String,
+    name: String,
+) -> Result<FolderEdit, String> {
+    let connection = db.0.lock().map_err(|error| error.to_string())?;
+    let edit = folder_edit::rename_library_folder(&connection, &folder, &name)?;
+    drop(connection);
+    retarget_watched_paths(&watch, &edit.watches);
+    publish_folder_edit(&app, &edit);
+    Ok(folder_edit_payload(edit))
+}
+
+/// Move a library folder to the Trash and drop its tracks from the library.
+#[tauri::command]
+fn delete_library_folder(
+    app: AppHandle,
+    db: State<'_, db::Db>,
+    watch: State<'_, FolderWatch>,
+    folder: String,
+) -> Result<FolderEdit, String> {
+    let connection = db.0.lock().map_err(|error| error.to_string())?;
+    let edit = folder_edit::delete_library_folder(&connection, &folder)?;
+    drop(connection);
+    retarget_watched_paths(&watch, &edit.watches);
+    publish_folder_edit(&app, &edit);
+    Ok(folder_edit_payload(edit))
 }
 
 fn dropped_file_title(path: &str) -> String {
@@ -3430,6 +3524,8 @@ pub fn run() {
             reorder_folder_tracks,
             move_into_open_folder,
             remove_from_folder,
+            rename_library_folder,
+            delete_library_folder,
             db_add_tag,
             db_remove_tag,
             list_watch_folders,
