@@ -245,6 +245,8 @@ pub enum AudioCommand {
     SetCueMix(f32),
     /// Headphone output level (0..~1).
     SetCueVolume(f32),
+    /// Delay the headphone mix so it lines up with a slower speaker path. Milliseconds, 0–200.
+    SetHeadphoneDelay(f32),
     /// Begin pushing the headphone cue mix into `sink` (interleaved stereo f32 at device
     /// rate). The control thread owns the matching consumer + the 2nd output stream.
     StartCueOutput {
@@ -1318,6 +1320,62 @@ struct CueRouting {
     mix: f32,
     volume: GainSmoother,
     sink: Option<Producer<f32>>,
+    delay: HeadphoneDelay,
+}
+
+/// Preallocated headphone delay. The line is filled on the audio thread and never resized there.
+struct HeadphoneDelay {
+    left: Vec<f32>,
+    right: Vec<f32>,
+    write: usize,
+    delay_samples: usize,
+}
+
+impl HeadphoneDelay {
+    const MAX_MS: f32 = 200.0;
+
+    fn new(device_rate: f32) -> Self {
+        let rate = device_rate.max(1.0) as f64;
+        let capacity = (rate * f64::from(Self::MAX_MS) / 1000.0).ceil() as usize + 1;
+        Self {
+            left: vec![0.0; capacity],
+            right: vec![0.0; capacity],
+            write: 0,
+            delay_samples: 0,
+        }
+    }
+
+    fn set_milliseconds(&mut self, milliseconds: f32, device_rate: f32) {
+        let milliseconds = if milliseconds.is_finite() {
+            milliseconds.clamp(0.0, Self::MAX_MS)
+        } else {
+            0.0
+        };
+        let samples = (f64::from(milliseconds) * f64::from(device_rate.max(1.0)) / 1000.0).round()
+            as usize;
+        self.delay_samples = samples.min(self.left.len().saturating_sub(1));
+    }
+
+    #[inline]
+    fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let len = self.left.len();
+        if len == 0 {
+            return (left, right);
+        }
+        self.left[self.write] = left;
+        self.right[self.write] = right;
+        let delayed = if self.delay_samples == 0 {
+            (left, right)
+        } else {
+            let read = (self.write + len - self.delay_samples) % len;
+            (self.left[read], self.right[read])
+        };
+        self.write += 1;
+        if self.write == len {
+            self.write = 0;
+        }
+        delayed
+    }
 }
 
 struct BoothRouting {
@@ -1349,6 +1407,7 @@ impl OutputRouting {
                 mix: 0.0,
                 volume: GainSmoother::new(0.8, device_rate, 10.0),
                 sink: None,
+                delay: HeadphoneDelay::new(device_rate),
             },
             booth: BoothRouting {
                 volume: GainSmoother::new(0.8, device_rate, 10.0),
@@ -1892,6 +1951,12 @@ impl Mixer {
                 }
                 AudioCommand::SetCueMix(m) => self.routing.cue.mix = m.clamp(0.0, 1.0),
                 AudioCommand::SetCueVolume(v) => self.routing.cue.volume.set_target(v.max(0.0)),
+                AudioCommand::SetHeadphoneDelay(milliseconds) => {
+                    self.routing
+                        .cue
+                        .delay
+                        .set_milliseconds(milliseconds, self.device_rate);
+                }
                 AudioCommand::StartCueOutput { sink } => {
                     let old = self.routing.cue.sink.replace(sink);
                     self.retire_monitor(old);
@@ -2312,8 +2377,10 @@ impl Mixer {
         // (click-free) whether or not the sink is connected. RT-safe.
         let cvol = self.routing.cue.volume.next_gain();
         let mix = self.routing.cue.mix;
-        let hl = (cl * (1.0 - mix) + ol * mix) * cvol;
-        let hr = (cr * (1.0 - mix) + or * mix) * cvol;
+        let (hl, hr) = self.routing.cue.delay.process(
+            (cl * (1.0 - mix) + ol * mix) * cvol,
+            (cr * (1.0 - mix) + or * mix) * cvol,
+        );
         if let Some(sink) = self.routing.cue.sink.as_mut() {
             if sink.slots() >= 2 {
                 let _ = sink.push(hl);
@@ -3299,6 +3366,25 @@ mod tests {
             buses = mixer.next_buses();
         }
         assert!(buses.cue.0.abs() < 1e-5 && buses.cue.1.abs() < 1e-5);
+    }
+
+    #[test]
+    fn headphone_delay_holds_the_cue_and_leaves_the_master_immediate() {
+        let (mut tx, mut mixer) = pfl_fixture();
+        let immediate = mixer.next_buses();
+        assert!(immediate.master.0.abs() > 0.01);
+        assert!(immediate.cue.0.abs() > 0.01);
+
+        tx.push(AudioCommand::SetHeadphoneDelay(10.0)).ok();
+        mixer.drain_commands();
+        let delay_samples = (10.0_f64 * 48_000.0 / 1000.0).round() as usize;
+        for _ in 0..delay_samples - 1 {
+            let buses = mixer.next_buses();
+            assert!(buses.master.0.abs() > 0.01);
+            assert!(buses.cue.0.abs() < 1e-5);
+        }
+        let released = mixer.next_buses();
+        assert!((released.cue.0 - immediate.cue.0).abs() < 1e-4);
     }
 
     #[test]

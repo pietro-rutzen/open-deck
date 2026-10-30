@@ -4,7 +4,7 @@ import type { BoothApi } from "../hooks/useBooth";
 import type { CueApi } from "../hooks/useCue";
 import type { InternalClockApi } from "../hooks/useInternalClock";
 import { useMasterOutput } from "../hooks/useMasterOutput";
-import { engineStatus, type EngineStatus, exportDiagnostics, type KeyNotation, type OutputDeviceInfo } from "../lib/ipc";
+import { engineStatus, headphoneDelay, setHeadphoneDelay, type EngineStatus, exportDiagnostics, type KeyNotation, type OutputDeviceInfo } from "../lib/ipc";
 import { Aux, Booth, InternalClock } from "./Mixer";
 import { Icon } from "./icons";
 
@@ -122,6 +122,8 @@ export function SettingsPanel({
                 {cue.enabled ? "Stop headphones" : "Start headphones"}
               </button>
             </div>
+            <HeadphoneDelayControl />
+            <p className="ctrl-hint">Raise headphone delay until the cans line up with the speakers. The speaker path keeps its own delay.</p>
             <p className="ctrl-hint">Speakers follow the Mac’s current output until you pick another device. Choose DDJ-FLX4 to send the master mix to the controller’s outputs 1/2, with headphones on 3/4. MacBook speakers and other outputs are listed separately. Choose speakers before the set: switching restarts playback and clears the loaded decks.</p>
             {speakers.error && <p role="alert" className="ctrl-hint">{speakers.error}</p>}
             {cue.error && <p role="alert" className="ctrl-hint">{cue.error}</p>}
@@ -248,6 +250,39 @@ function speakerOptionLabel(device: OutputDeviceInfo): string {
   return device.name;
 }
 
+function HeadphoneDelayControl() {
+  const [milliseconds, setMilliseconds] = useState(0);
+  useEffect(() => {
+    let disposed = false;
+    void headphoneDelay()
+      .then((value) => {
+        if (!disposed && Number.isFinite(value)) setMilliseconds(value);
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+    };
+  }, []);
+  return (
+    <div className="settings-headphone-delay">
+      <label className="settings-device-title" htmlFor="headphone-delay">Headphone delay</label>
+      <input
+        id="headphone-delay"
+        type="range"
+        min={0}
+        max={200}
+        step={1}
+        value={milliseconds}
+        onChange={(event) => {
+          const next = Number(event.target.value);
+          setMilliseconds(next);
+          void setHeadphoneDelay(next);
+        }}
+      />
+      <span className="settings-device-status">{milliseconds} ms</span>
+    </div>
+  );
+}
 
 function AudioHealth({ headphonesEnabled }: { headphonesEnabled: boolean }) {
   const [status, setStatus] = useState<EngineStatus | null>(null);

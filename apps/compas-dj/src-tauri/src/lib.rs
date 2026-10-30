@@ -237,6 +237,7 @@ enum EngineMsg {
     },
     CueMix(f32),
     CueVolume(f32),
+    HeadphoneDelay(f32),
     StartCueOutput {
         sink: Producer<f32>,
     },
@@ -332,6 +333,7 @@ struct AudioRuntimeStatus {
     route_generation: AtomicU64,
     applied_route_generation: AtomicU64,
     last_error: Mutex<Option<String>>,
+    headphone_delay_ms: AtomicU32,
 }
 
 impl AudioRuntimeStatus {
@@ -351,6 +353,7 @@ impl AudioRuntimeStatus {
             route_generation: AtomicU64::new(0),
             applied_route_generation: AtomicU64::new(0),
             last_error: Mutex::new(None),
+            headphone_delay_ms: AtomicU32::new(0),
         }
     }
 
@@ -427,7 +430,7 @@ fn open_master_output(
         Err(error) => Err(error.to_string()),
     };
     match opened {
-        Ok((engine, fallback_from)) => {
+        Ok((mut engine, fallback_from)) => {
             if is_restart {
                 audio.count_restart();
             }
@@ -458,6 +461,9 @@ fn open_master_output(
                 format!("{name} is not available. Speakers are using the macOS default output.")
             });
             audio.mark_online(sample_rate, notice);
+            let _ = engine.send(AudioCommand::SetHeadphoneDelay(
+                audio.headphone_delay_ms.load(Ordering::Relaxed) as f32,
+            ));
             Some(engine)
         }
         Err(message) => {
@@ -796,6 +802,9 @@ fn spawn_engine() -> EngineHandle {
                     }
                     EngineMsg::CueMix(m) => AudioCommand::SetCueMix(m),
                     EngineMsg::CueVolume(v) => AudioCommand::SetCueVolume(v),
+                    EngineMsg::HeadphoneDelay(milliseconds) => {
+                        AudioCommand::SetHeadphoneDelay(milliseconds)
+                    }
                     EngineMsg::StartCueOutput { sink } => AudioCommand::StartCueOutput { sink },
                     EngineMsg::StopCueOutput => AudioCommand::StopCueOutput,
                     EngineMsg::BoothVolume(v) => AudioCommand::SetBoothVolume(v),
@@ -3959,6 +3968,8 @@ pub fn run() {
             headphone::set_deck_cue,
             headphone::set_cue_mix,
             headphone::set_cue_volume,
+            headphone::headphone_delay,
+            headphone::set_headphone_delay,
             start_booth_output,
             stop_booth_output,
             set_booth_volume,

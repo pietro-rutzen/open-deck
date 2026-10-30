@@ -10,6 +10,8 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 const ROUTE_FILE: &str = "headphone-route.json";
+const DELAY_FILE: &str = "headphone-delay.json";
+const MAX_HEADPHONE_DELAY_MS: f32 = 200.0;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Serialize)]
@@ -229,6 +231,7 @@ pub(crate) fn initialize(app: &AppHandle) {
         }
     });
     arm_saved_headphones(app);
+    apply_saved_headphone_delay(app);
 }
 fn arm_saved_headphones(app: &AppHandle) {
     let app = app.clone();
@@ -820,6 +823,100 @@ pub(crate) fn set_cue_mix(app: AppHandle, value: f32) -> Result<(), String> {
 #[tauri::command]
 pub(crate) fn set_cue_volume(app: AppHandle, value: f32) -> Result<(), String> {
     with_error(&app, set_parameter(&app, value, true))
+}
+
+#[derive(Serialize, Deserialize)]
+struct HeadphoneDelayFile {
+    milliseconds: f32,
+}
+
+fn clamp_delay_ms(milliseconds: f32) -> Result<u32, String> {
+    if !milliseconds.is_finite() {
+        return Err("Headphone delay must be a finite number of milliseconds".into());
+    }
+    Ok(milliseconds.round().clamp(0.0, MAX_HEADPHONE_DELAY_MS) as u32)
+}
+
+fn delay_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let base = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&base).map_err(|error| error.to_string())?;
+    Ok(base.join(DELAY_FILE))
+}
+
+fn load_delay_ms(app: &AppHandle) -> u32 {
+    let Ok(path) = delay_path(app) else {
+        return 0;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return 0;
+    };
+    if bytes.len() > 256 {
+        return 0;
+    }
+    serde_json::from_slice::<HeadphoneDelayFile>(&bytes)
+        .ok()
+        .and_then(|file| clamp_delay_ms(file.milliseconds).ok())
+        .unwrap_or(0)
+}
+
+fn save_delay_ms(app: &AppHandle, milliseconds: u32) -> Result<(), String> {
+    let path = delay_path(app)?;
+    let temporary = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let bytes = serde_json::to_vec(&HeadphoneDelayFile {
+        milliseconds: milliseconds as f32,
+    })
+    .map_err(|error| error.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    let result = (|| {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|error: std::io::Error| error.to_string())
+}
+
+fn publish_delay(app: &AppHandle, milliseconds: u32) -> Result<(), String> {
+    app.state::<EngineHandle>()
+        .audio
+        .headphone_delay_ms
+        .store(milliseconds, Ordering::Relaxed);
+    app.state::<EngineHandle>()
+        .send(EngineMsg::HeadphoneDelay(milliseconds as f32))
+}
+
+fn apply_saved_headphone_delay(app: &AppHandle) {
+    let milliseconds = load_delay_ms(app);
+    if milliseconds > 0 {
+        let _ = publish_delay(app, milliseconds);
+    }
+}
+
+#[tauri::command]
+pub(crate) fn headphone_delay(app: AppHandle) -> u32 {
+    app.state::<EngineHandle>()
+        .audio
+        .headphone_delay_ms
+        .load(Ordering::Relaxed)
+        .max(load_delay_ms(&app))
+}
+
+#[tauri::command]
+pub(crate) fn set_headphone_delay(app: AppHandle, milliseconds: f32) -> Result<u32, String> {
+    let milliseconds = clamp_delay_ms(milliseconds)?;
+    save_delay_ms(&app, milliseconds)?;
+    publish_delay(&app, milliseconds)?;
+    Ok(milliseconds)
 }
 
 #[cfg(test)]

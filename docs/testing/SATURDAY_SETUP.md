@@ -23,6 +23,7 @@ Start at low speaker/headphone volume. Use the actual cables and speaker for the
 - [ ] Engage and disengage each effect and key shift. Load a different track and confirm no previous effect stays unexpectedly active.
 - [ ] Play a loaded sample; stop/clear it and verify no unexpected repeat.
 - [ ] Mix for at least the planned set duration with the actual library. Note dropouts or unexpected level changes. Check Audio health before/after; increasing headphone buffer shortages or discarded frames need investigation.
+- [ ] If the speakers lag the headphones, raise Settings → Headphone delay until they line up. Leave it at 0 when they already match. This delays the headphones; it does not make the speakers earlier.
 - [ ] Stop playback, switch to the other output setup, reload tracks and repeat the routing checks.
 
 Keep a tested backup player and local copies of the set available. This build has not been qualified for unattended device recovery; an audio restart requires reloading/checking routes, and relaunching if state is inconsistent.
