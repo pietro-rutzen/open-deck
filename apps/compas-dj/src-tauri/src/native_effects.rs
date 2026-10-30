@@ -209,6 +209,58 @@ impl NativeEffects {
     pub(crate) fn snapshot(&self) -> Result<EffectsSnapshot, String> {
         Ok(self.0.lock().map_err(|e| e.to_string())?.clone())
     }
+    /// Reset transport-owned FX state after load/eject. Re-send bypass and pitch reset while
+    /// holding the authority lock, so a racing controller change cannot survive only in audio.
+    /// The caller publishes the returned snapshot after enqueueing the load/unload command.
+    pub(crate) fn reset_deck(
+        &self,
+        deck: usize,
+        mut send: impl FnMut(EngineMsg) -> Result<(), String>,
+    ) -> Result<EffectsSnapshot, String> {
+        if deck >= NUM_DECKS {
+            return Err("Invalid effects deck".into());
+        }
+        let mut state = self.0.lock().map_err(|e| e.to_string())?;
+        let mut next = state.clone();
+        let d = &mut next.decks[deck];
+        for effect in [
+            Effect::Echo,
+            Effect::Flanger,
+            Effect::Reverb,
+            Effect::Crusher,
+        ] {
+            d.set_active(effect, false);
+            send(d.command(deck, effect))?;
+        }
+        d.pitch_shift = 0.0;
+        send(EngineMsg::DeckPitchShift {
+            deck,
+            semitones: 0.0,
+        })?;
+        next.revision = state.revision.wrapping_add(1);
+        *state = next;
+        Ok(state.clone())
+    }
+
+    /// Mirror a newly created mixer. Lifecycle code must exclude controller commands while
+    /// replacing the engine and resetting this memory; no engine commands are sent here.
+    pub(crate) fn reset_all(&self) -> Result<EffectsSnapshot, String> {
+        let mut state = self.0.lock().map_err(|e| e.to_string())?;
+        for d in &mut state.decks {
+            for effect in [
+                Effect::Echo,
+                Effect::Flanger,
+                Effect::Reverb,
+                Effect::Crusher,
+            ] {
+                d.set_active(effect, false);
+            }
+            d.pitch_shift = 0.0;
+        }
+        state.revision = state.revision.wrapping_add(1);
+        Ok(state.clone())
+    }
+
     /// Enqueue under the same lock as controller changes. The caller must emit the returned
     /// snapshot (effects:update) and the frontend must ignore older/equal revisions.
     pub(crate) fn update(
@@ -411,10 +463,10 @@ impl NativeEffects {
                             Effect::Reverb,
                             Effect::Crusher,
                         ] {
-                            if d.active(e) {
-                                d.set_active(e, false);
-                                send(d.command(deck, e))?;
-                            }
+                            // Macro/legacy controls may have enabled slots outside this state.
+                            // Panic-off must bypass every slot, even when already marked off.
+                            d.set_active(e, false);
+                            send(d.command(deck, e))?;
                         }
                     }
                 }
@@ -430,6 +482,103 @@ impl NativeEffects {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn load_reset_preserves_knobs_bypasses_slots_and_next_toggle_engages() {
+        let state = NativeEffects::default();
+        state
+            .update(
+                0,
+                EffectUpdate::Echo {
+                    active: true,
+                    beats: 2.0,
+                    depth: 0.9,
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        state
+            .update(0, EffectUpdate::Pitch { semitones: 4.0 }, |_| Ok(()))
+            .unwrap();
+        let prior = state.snapshot().unwrap().revision;
+        let mut sent = Vec::new();
+        let s = state
+            .reset_deck(0, |m| {
+                sent.push(m);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(sent.len(), 5);
+        assert!(matches!(
+            sent[0],
+            EngineMsg::DeckEcho {
+                active: false,
+                mix: 0.0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            sent[4],
+            EngineMsg::DeckPitchShift { semitones: 0.0, .. }
+        ));
+        assert!(!s.decks[0].echo.active);
+        assert_eq!(s.decks[0].echo.depth, 0.9);
+        assert_eq!(s.decks[0].echo.beats, 2.0);
+        assert_eq!(s.decks[0].pitch_shift, 0.0);
+        assert!(s.revision > prior);
+        assert!(
+            state
+                .handle("fx.toggle.0", 1.0, |_| Ok(()))
+                .unwrap()
+                .unwrap()
+                .decks[0]
+                .echo
+                .active
+        );
+    }
+
+    #[test]
+    fn reset_all_preserves_parameters_and_invalid_or_failed_reset_does_not_commit() {
+        let state = NativeEffects::default();
+        state
+            .update(
+                1,
+                EffectUpdate::Reverb {
+                    active: true,
+                    size: 0.8,
+                    mix: 0.2,
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        state
+            .update(1, EffectUpdate::Pitch { semitones: -2.0 }, |_| Ok(()))
+            .unwrap();
+        let prior = state.snapshot().unwrap().revision;
+        assert!(state
+            .reset_deck(NUM_DECKS, |_| panic!("invalid deck sent"))
+            .is_err());
+        assert!(state.reset_deck(1, |_| Err("offline".into())).is_err());
+        assert_eq!(state.snapshot().unwrap().revision, prior);
+        let s = state.reset_all().unwrap();
+        assert_eq!(s.revision, prior + 1);
+        assert!(!s.decks[1].reverb.active);
+        assert_eq!(s.decks[1].reverb.size, 0.8);
+        assert_eq!(s.decks[1].pitch_shift, 0.0);
+    }
+
+    #[test]
+    fn off_all_sends_bypass_even_when_authority_already_reports_inactive() {
+        let state = NativeEffects::default();
+        let mut count = 0;
+        state
+            .handle("fx.off_all", 1.0, |_| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, NUM_DECKS * 4);
+    }
+
     #[test]
     fn defaults_and_echo_toggle_match_ui_parameters() {
         let state = NativeEffects::default();

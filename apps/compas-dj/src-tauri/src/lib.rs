@@ -57,6 +57,10 @@ const TELEMETRY_HZ: u64 = 30;
 
 /// Coarse, `Send` control messages from Tauri commands to the audio thread.
 enum EngineMsg {
+    /// Software MIDI receipt to ordered audio callback barrier; excludes hardware latency.
+    LatencyProbe {
+        received: Instant,
+    },
     SetCrossfader(f32),
     SetCrossfaderConfig {
         curve: f32,
@@ -490,10 +494,12 @@ fn spawn_engine() -> EngineHandle {
             let mut engine: Option<AudioEngine> = None;
             let mut jog_applied = [flx4_runtime::INACTIVE; 2];
             let mut next_retry = Instant::now();
+            let mut pending_command: Option<AudioCommand> = None;
 
             loop {
                 let generation = audio_for_thread.route_generation.load(Ordering::Acquire);
                 if generation != applied {
+                    pending_command = None; // old route commands cannot target the new mixer
                     engine = None;
                 }
                 if let Some(active) = engine.as_ref() {
@@ -503,6 +509,7 @@ fn spawn_engine() -> EngineHandle {
                             .unwrap_or_else(|| "audio stream error".to_string());
                         tracing::warn!("audio stream unhealthy; restarting: {msg}");
                         audio_for_thread.mark_error(msg);
+                        pending_command = None;
                         engine = None;
                         next_retry = Instant::now();
                     }
@@ -534,6 +541,15 @@ fn spawn_engine() -> EngineHandle {
 
                 if let Some(active) = engine.as_mut() {
                     active.drain_reclaimed();
+                    // Preserve ownership and FIFO order on pressure. Retry on this control
+                    // thread, never blocking or destroying an owned buffer in the callback.
+                    if let Some(command) = pending_command.take() {
+                        if let Err(command) = active.try_send_command(command) {
+                            pending_command = Some(command);
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                    }
                     for deck in 0..2 {
                         let bits = jog_for_thread[deck].load(Ordering::Acquire);
                         if bits != jog_applied[deck] {
@@ -579,6 +595,7 @@ fn spawn_engine() -> EngineHandle {
                 };
 
                 let cmd = match msg {
+                    EngineMsg::LatencyProbe { received } => AudioCommand::LatencyProbe { received },
                     EngineMsg::SetCrossfader(p) => AudioCommand::SetCrossfader(p),
                     EngineMsg::SetCrossfaderConfig {
                         curve,
@@ -815,9 +832,7 @@ fn spawn_engine() -> EngineHandle {
                     }
                     EngineMsg::SamplerGain { gain } => AudioCommand::SetSamplerGain { gain },
                 };
-                if let Err(e) = engine.send(cmd) {
-                    tracing::warn!("dropped audio command: {e}");
-                }
+                pending_command = engine.try_send_command(cmd).err();
             }
         });
 
@@ -918,6 +933,10 @@ struct DeckErrorEvent {
 
 #[derive(Serialize)]
 struct EngineStatus {
+    controller_probe_count: u64,
+    controller_probe_last_us: u64,
+    controller_probe_max_us: u64,
+    controller_probe_histogram: [u64; 8],
     sample_rate: u32,
     audio_online: bool,
     audio_restarting: bool,
@@ -998,6 +1017,10 @@ fn engine_status_snapshot(
         .collect();
     let master = master_route::session(&state.audio);
     EngineStatus {
+        controller_probe_count: state.telemetry.controller_probe_count(),
+        controller_probe_last_us: state.telemetry.controller_probe_last_us(),
+        controller_probe_max_us: state.telemetry.controller_probe_max_us(),
+        controller_probe_histogram: state.telemetry.controller_probe_histogram(),
         sample_rate,
         audio_online: state.audio.online.load(Ordering::Relaxed),
         audio_restarting: state.audio.restarting.load(Ordering::Relaxed),
@@ -3625,6 +3648,7 @@ fn connect_midi_port(
             &port,
             "compas-in",
             move |_t, message, _| {
+                let received = Instant::now();
                 if !input_enabled.load(Ordering::Acquire) || message.len() < 2 {
                     return;
                 }
@@ -3637,6 +3661,7 @@ fn connect_midi_port(
                     message[0],
                     message[1],
                     *message.get(2).unwrap_or(&0),
+                    received,
                 ));
                 // Notes additionally drive the synth when the instrument panel enables routing.
                 if synth.load(Ordering::Relaxed) {

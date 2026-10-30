@@ -153,6 +153,15 @@ export interface DeckError {
 }
 
 export interface EngineStatus {
+  controller_probe_count: number;
+  controller_probe_last_us: number;
+  controller_probe_max_us: number;
+  controller_probe_histogram: number[];
+  cue_underruns: number;
+  cue_discarded_frames: number;
+  cue_queued_frames: number;
+  cue_primed: boolean;
+
   sample_rate: number;
   audio_online: boolean;
   audio_restarting: boolean;

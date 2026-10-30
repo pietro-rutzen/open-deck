@@ -369,7 +369,12 @@ fn stream_embeds(app: &AppHandle, route: &Route) -> bool {
 }
 fn enable_embedded(app: &AppHandle, route: &Route) -> Result<String, String> {
     validate_safe_route(app, route)?;
+    let desired = snapshot(app)?;
     release_monitor_worker(app)?;
+    if let Err(error) = replay_monitor_state(app, &desired) {
+        let _ = stop_locked(app, true);
+        return Err(error);
+    }
     app.state::<EngineHandle>()
         .audio
         .embed_cue_live
@@ -390,6 +395,41 @@ fn enable_embedded(app: &AppHandle, route: &Route) -> Result<String, String> {
         );
     }
     Ok(route.device.clone())
+}
+// Reapply the native session after a fresh mixer is created. Replay false PFL
+// states too so a reused mixer cannot retain a cue absent from the session.
+fn send_monitor_state(
+    desired: &CueSession,
+    mut send: impl FnMut(EngineMsg) -> Result<(), String>,
+) -> Result<(), String> {
+    send(EngineMsg::CueMix(desired.mix))?;
+    send(EngineMsg::CueVolume(desired.volume))?;
+    for (deck, active) in remember_cued(desired).into_iter().enumerate() {
+        send(EngineMsg::DeckCue { deck, active })?;
+    }
+    Ok(())
+}
+fn restore_monitor_session(app: &AppHandle, desired: &CueSession) -> Result<(), String> {
+    let cued = remember_cued(desired);
+    {
+        let cue = app.state::<CueState>();
+        let mut inner = cue.inner.lock().map_err(|error| error.to_string())?;
+        inner.session.mix = desired.mix;
+        inner.session.volume = desired.volume;
+        inner.session.cued = cued
+            .iter()
+            .enumerate()
+            .filter_map(|(deck, active)| active.then_some(deck))
+            .collect();
+    }
+    for (deck, active) in cued.into_iter().enumerate() {
+        feedback(app, deck, active);
+    }
+    Ok(())
+}
+fn replay_monitor_state(app: &AppHandle, desired: &CueSession) -> Result<(), String> {
+    send_monitor_state(desired, |message| app.state::<EngineHandle>().send(message))?;
+    restore_monitor_session(app, desired)
 }
 pub(crate) fn rearm_after_master_change(
     app: &AppHandle,
@@ -424,13 +464,13 @@ fn start_locked(app: &AppHandle, route: &Route) -> Result<String, String> {
     if source_rate == 0 {
         return Err("Master audio sample rate is unavailable".into());
     }
-    stop_locked(app, false)?;
+    let desired = snapshot(app)?;
+    stop_locked(app, true)?;
     let cue = app.state::<CueState>();
     let generation = cue.inner.lock().map_err(|e| e.to_string())?.generation;
     let (producer, consumer) = rtrb::RingBuffer::<f32>::new(CUE_RING_CAPACITY);
     engine.send(EngineMsg::StartCueOutput { sink: producer })?;
-    engine.send(EngineMsg::CueMix(snapshot(app)?.mix))?;
-    engine.send(EngineMsg::CueVolume(snapshot(app)?.volume))?;
+    send_monitor_state(&desired, |message| engine.send(message))?;
     let (stop_tx, stop_rx) = channel();
     let (ready_tx, ready_rx) = channel();
     let worker_app = app.clone();
@@ -509,6 +549,9 @@ fn start_locked(app: &AppHandle, route: &Route) -> Result<String, String> {
     }
     match ready_rx.recv_timeout(Duration::from_secs(4)) {
         Ok(Ok(name)) => {
+            // The worker is live; reconcile the session and every PFL LED with the
+            // state already sent before its stream started.
+            restore_monitor_session(app, &desired)?;
             {
                 let mut inner = cue.inner.lock().map_err(|e| e.to_string())?;
                 inner.stop = Some(stop_tx);
@@ -801,5 +844,39 @@ mod tests {
         assert!(!session.enabled);
         assert!(session.cued.is_empty());
         assert_eq!(session.mix, 0.0);
+    }
+    #[test]
+    fn route_replay_preserves_levels_and_all_pfl_states() {
+        let mut desired = CueSession::default();
+        desired.mix = 0.25;
+        desired.volume = 0.15;
+        desired.cued = vec![0, 2];
+        let mut messages = Vec::new();
+        send_monitor_state(&desired, |message| {
+            messages.push(message);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(messages.len(), 6);
+        assert!(matches!(messages[0], EngineMsg::CueMix(v) if v == 0.25));
+        assert!(matches!(messages[1], EngineMsg::CueVolume(v) if v == 0.15));
+        for (index, message) in messages[2..].iter().enumerate() {
+            assert!(matches!(message, EngineMsg::DeckCue { deck, active }
+                if *deck == index && *active == (index == 0 || index == 2)));
+        }
+    }
+    #[test]
+    fn route_replay_propagates_queue_failure_without_sending_later_controls() {
+        let mut sent = 0;
+        let result = send_monitor_state(&CueSession::default(), |_| {
+            sent += 1;
+            if sent == 2 {
+                Err("offline".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result, Err("offline".into()));
+        assert_eq!(sent, 2);
     }
 }

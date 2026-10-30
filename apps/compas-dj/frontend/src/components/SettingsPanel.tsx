@@ -1,9 +1,10 @@
+import { useEffect, useState } from "react";
 import type { AuxApi } from "../hooks/useAux";
 import type { BoothApi } from "../hooks/useBooth";
 import type { CueApi } from "../hooks/useCue";
 import type { InternalClockApi } from "../hooks/useInternalClock";
 import { useMasterOutput } from "../hooks/useMasterOutput";
-import { exportDiagnostics, type KeyNotation, type OutputDeviceInfo } from "../lib/ipc";
+import { engineStatus, type EngineStatus, exportDiagnostics, type KeyNotation, type OutputDeviceInfo } from "../lib/ipc";
 import { Aux, Booth, InternalClock } from "./Mixer";
 import { Icon } from "./icons";
 
@@ -194,6 +195,7 @@ export function SettingsPanel({
             <span>Diagnostics</span>
           </button>
         </div>
+        <AudioHealth headphonesEnabled={cue.enabled} />
       </div>
     </div>
   );
@@ -244,4 +246,36 @@ function speakerOptionLabel(device: OutputDeviceInfo): string {
   if (controller && device.channels >= 4) return `${device.name} · speakers 1/2, headphones 3/4`;
   if (device.channels >= 2) return `${device.name} · ${device.channels} channels`;
   return device.name;
+}
+
+
+function AudioHealth({ headphonesEnabled }: { headphonesEnabled: boolean }) {
+  const [status, setStatus] = useState<EngineStatus | null>(null);
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const next = await engineStatus();
+        if (!disposed) { setStatus(next); setError(false); }
+      } catch { if (!disposed) setError(true); }
+      if (!disposed) timer = setTimeout(poll, 1000);
+    };
+    void poll();
+    return () => { disposed = true; clearTimeout(timer); };
+  }, []);
+  return <details className="ctrl-hint" style={{ marginTop: 16 }}>
+    <summary>Audio health</summary>
+    {error ? <p role="alert">Audio status unavailable.</p> : status ? <>
+      <p>{status.audio_online ? "Online" : "Offline"} · {status.master_device ?? "No speaker output"} · {status.sample_rate.toLocaleString()} Hz</p>
+      {status.audio_error && <p role="alert">{status.audio_error}</p>}
+      <p>Output restarts: {status.audio_restarts}. A restarted output requires tracks to be reloaded and routing checked.</p>
+      <p>{!headphonesEnabled ? "Headphones off." : status.master_embedded_headphones ? "Headphones share the FLX4 output stream (3/4)." : `Separate headphone stream: ${status.cue_underruns} buffer shortages, ${status.cue_discarded_frames} discarded frames. Counts are since this headphone stream opened; increasing counts during playback need attention.`}</p>
+      <p>Controller software delay: {status.controller_probe_count > 0
+        ? `${(status.controller_probe_last_us / 1000).toFixed(1)} ms latest · ${(status.controller_probe_max_us / 1000).toFixed(1)} ms highest · ${status.controller_probe_count} samples`
+        : "Move a channel fader or press a transport button to collect samples."}</p>
+      <p>Measured from MIDI receipt to the audio callback. Excludes USB input, speaker latency, jog wheels and headphone controls; this is not a physical latency measurement.</p>
+    </> : <p>Reading audio status…</p>}
+  </details>;
 }

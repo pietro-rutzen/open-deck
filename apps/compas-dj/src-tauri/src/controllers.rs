@@ -319,6 +319,7 @@ struct LoopInHold {
 /// Routes resolved controller updates: natively owned controls go straight to the engine queue,
 /// continuous UI-owned controls are coalesced, discrete actions are delivered immediately.
 struct Router {
+    midi_received: Option<Instant>,
     app: AppHandle,
     telemetry: Arc<DeckTelemetry>,
     batch: ControllerBatchEvent,
@@ -326,6 +327,15 @@ struct Router {
 }
 
 impl Router {
+    fn probe(&self) {
+        if let Some(received) = self.midi_received {
+            let _ = self
+                .app
+                .state::<crate::EngineHandle>()
+                .send(crate::EngineMsg::LatencyProbe { received });
+        }
+    }
+
     fn route(&mut self, registry: &Registry, mut update: ControllerUpdateEvent) {
         if let Some(deck) = tempo_deck(&update.control) {
             if let Some(range) = self.tempo_range.get(deck).copied() {
@@ -338,6 +348,7 @@ impl Router {
                 .state::<crate::EngineHandle>()
                 .send(crate::EngineMsg::SetCrossfader(update.value as f32));
             upsert_latest(&mut self.batch.mirror, update);
+            self.probe();
             return;
         }
         if super::headphone::controller_update(&self.app, &update.control, update.value) {
@@ -353,6 +364,7 @@ impl Router {
             }) {
             Ok(Some(snapshot)) => {
                 let _ = self.app.emit("effects:update", snapshot);
+                self.probe();
                 return;
             }
             Err(error) => {
@@ -381,11 +393,15 @@ impl Router {
             captured,
         ) {
             let engine = self.app.state::<crate::EngineHandle>();
+            let commanded = action.message.is_some() || !action.messages.is_empty();
             if let Some(message) = action.message {
                 let _ = engine.send(message);
             }
             for message in action.messages {
                 let _ = engine.send(message);
+            }
+            if commanded {
+                self.probe();
             }
             if let Some(value) = action.mirror_value {
                 update.value = value;
@@ -462,7 +478,7 @@ fn is_native_transport_led(control: &str) -> bool {
 /// Messages to the controller engine thread.
 pub enum ControllerMsg {
     /// A raw MIDI message (status, data1, data2) forwarded from the input port.
-    Midi(u8, u8, u8),
+    Midi(u8, u8, u8, Instant),
     /// A changed byte in an HID input report (`byte` index, absolute `value`), forwarded from the
     /// HID reader. Resolved through the active mapping's `InputKind::Hid` bindings (channel 0).
     Hid { byte: u8, value: u8 },
@@ -524,6 +540,7 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
 
     let telemetry = app.state::<crate::EngineHandle>().telemetry.clone();
     let mut router = Router {
+        midi_received: None,
         app: app.clone(),
         telemetry: telemetry.clone(),
         batch: ControllerBatchEvent::default(),
@@ -754,7 +771,8 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 current.clear();
                 fb_last.clear();
             }
-            ControllerMsg::Midi(status, d1, raw_d2) => {
+            ControllerMsg::Midi(status, d1, raw_d2, received) => {
+                router.midi_received = Some(received);
                 // Special FLX4 handlers must see the same release semantics as mappings.
                 let (status, raw_d2) = if flx4_profile {
                     normalize_note_release(status, raw_d2)
@@ -917,6 +935,7 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                         [status, d1, raw_d2],
                     )
                 };
+                router.midi_received = None;
                 if learning || !consumed {
                     emit_raw_midi(&app, status, d1, raw_d2, consumed);
                 }
