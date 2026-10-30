@@ -1,7 +1,7 @@
 //! Bounded library previews, isolated from playback and the real-time callback.
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use compas_sources::{AudioSource, LocalFileSource, PcmSource};
@@ -108,7 +108,7 @@ fn file_stamp(path: &Path) -> Option<(i64, i64)> {
     let modified_ms = meta
         .modified()
         .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
+        .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())?;
     Some((size, modified_ms))
@@ -409,6 +409,202 @@ fn embedded_metadata(path: &Path) -> Result<TrackVisuals, String> {
     Ok(result)
 }
 
+/// Header-level file facts for the library inspector. No PCM decode.
+#[derive(Default, Serialize)]
+pub struct TrackFileFacts {
+    size_bytes: u64,
+    created_ms: Option<i64>,
+    modified_ms: Option<i64>,
+    sample_rate_hz: Option<u32>,
+    channels: Option<u16>,
+    bits_per_sample: Option<u32>,
+    bitrate_kbps: Option<u32>,
+    bitrate_is_average: bool,
+    album: Option<String>,
+    album_artist: Option<String>,
+    genre: Option<String>,
+    recorded_date: Option<String>,
+    track_number: Option<String>,
+    track_total: Option<String>,
+    disc_number: Option<String>,
+    disc_total: Option<String>,
+    composer: Option<String>,
+    lyricist: Option<String>,
+    comment: Option<String>,
+    label: Option<String>,
+    remixer: Option<String>,
+    original_artist: Option<String>,
+}
+
+#[tauri::command]
+pub async fn track_file_facts(
+    db: State<'_, crate::db::Db>,
+    path: String,
+) -> Result<TrackFileFacts, String> {
+    if path.len() > 4096 || !Path::new(&path).is_absolute() {
+        return Err("Track path must be an absolute library path".into());
+    }
+    {
+        let connection = db.0.lock().map_err(|e| e.to_string())?;
+        if !crate::db::track_exists(&connection, &path).map_err(|e| e.to_string())? {
+            return Err("Import this track into the library before reading file details".into());
+        }
+    }
+    tauri::async_runtime::spawn_blocking(move || read_file_facts(Path::new(&path)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn system_time_ms(time: Option<SystemTime>) -> Option<i64> {
+    time.and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
+fn clean_tag(raw: &str) -> Option<String> {
+    let text: String = raw.chars().filter(|c| !c.is_control()).take(1024).collect();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+/// PCM bit depth yields an exact bitrate. Compressed files get an average from
+/// size and duration, which is not the encoder's nominal CBR/VBR setting.
+fn pcm_bitrate_kbps(sample_rate: u32, channels: u16, bits: u32) -> Option<u32> {
+    if !matches!(bits, 8 | 16 | 24 | 32) || sample_rate == 0 || channels == 0 {
+        return None;
+    }
+    u32::try_from(u64::from(sample_rate) * u64::from(channels) * u64::from(bits) / 1000).ok()
+}
+
+fn average_bitrate_kbps(size_bytes: u64, duration_ms: u64) -> Option<u32> {
+    if size_bytes == 0 || duration_ms == 0 {
+        return None;
+    }
+    u32::try_from(size_bytes.saturating_mul(8) / duration_ms).ok()
+}
+
+fn read_file_facts(path: &Path) -> Result<TrackFileFacts, String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("Track details require a regular file".into());
+    }
+    let mut facts = TrackFileFacts {
+        size_bytes: meta.len(),
+        created_ms: system_time_ms(meta.created().ok()),
+        modified_ms: system_time_ms(meta.modified().ok()),
+        ..TrackFileFacts::default()
+    };
+    if meta.len() <= MAX_FILE_BYTES {
+        let _ = fill_container_facts(path, &mut facts);
+    }
+    Ok(facts)
+}
+
+fn fill_container_facts(path: &Path, facts: &mut TrackFileFacts) -> Result<(), String> {
+    use symphonia::core::codecs::CODEC_TYPE_NULL;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::probe::Hint;
+
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(extension);
+    }
+    let options = MetadataOptions {
+        limit_metadata_bytes: Limit::Maximum(64 * 1024),
+        limit_visual_bytes: Limit::Maximum(0),
+    };
+    let mut probe = symphonia::default::get_probe()
+        .format(
+            &hint,
+            MediaSourceStream::new(Box::new(file), Default::default()),
+            &FormatOptions::default(),
+            &options,
+        )
+        .map_err(|e| e.to_string())?;
+    if let Some(metadata) = probe.metadata.get() {
+        if let Some(revision) = metadata.current() {
+            absorb_file_tags(facts, revision);
+        }
+    }
+    if let Some(revision) = probe.format.metadata().current() {
+        absorb_file_tags(facts, revision);
+    }
+    let Some(track) = probe
+        .format
+        .tracks()
+        .iter()
+        .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+    else {
+        return Ok(());
+    };
+    let params = &track.codec_params;
+    facts.sample_rate_hz = params
+        .sample_rate
+        .filter(|rate| (1..=384_000).contains(rate));
+    facts.channels = params
+        .channels
+        .map(|channels| channels.count() as u16)
+        .filter(|count| (1..=32).contains(count));
+    facts.bits_per_sample = params
+        .bits_per_sample
+        .filter(|bits| matches!(bits, 8 | 16 | 24 | 32));
+    if let (Some(rate), Some(channels), Some(bits)) =
+        (facts.sample_rate_hz, facts.channels, facts.bits_per_sample)
+    {
+        facts.bitrate_kbps = pcm_bitrate_kbps(rate, channels, bits);
+        facts.bitrate_is_average = false;
+    }
+    if facts.bitrate_kbps.is_none() {
+        let duration_ms = match (params.n_frames, facts.sample_rate_hz) {
+            (Some(frames), Some(rate)) if rate > 0 && frames > 0 => {
+                Some(frames.saturating_mul(1000) / u64::from(rate))
+            }
+            _ => None,
+        };
+        if let Some(duration_ms) = duration_ms {
+            facts.bitrate_kbps = average_bitrate_kbps(facts.size_bytes, duration_ms);
+            facts.bitrate_is_average = facts.bitrate_kbps.is_some();
+        }
+    }
+    Ok(())
+}
+
+fn absorb_file_tags(facts: &mut TrackFileFacts, revision: &MetadataRevision) {
+    for tag in revision.tags() {
+        let slot = match tag.std_key {
+            Some(StandardTagKey::Album) => &mut facts.album,
+            Some(StandardTagKey::AlbumArtist) => &mut facts.album_artist,
+            Some(StandardTagKey::Genre) => &mut facts.genre,
+            Some(StandardTagKey::Date) => {
+                if let Some(text) = clean_tag(&tag.value.to_string()) {
+                    facts.recorded_date = Some(text);
+                }
+                continue;
+            }
+            Some(StandardTagKey::OriginalDate) => &mut facts.recorded_date,
+            Some(StandardTagKey::TrackNumber) => &mut facts.track_number,
+            Some(StandardTagKey::TrackTotal) => &mut facts.track_total,
+            Some(StandardTagKey::DiscNumber) => &mut facts.disc_number,
+            Some(StandardTagKey::DiscTotal) => &mut facts.disc_total,
+            Some(StandardTagKey::Composer) => &mut facts.composer,
+            Some(StandardTagKey::Lyricist) => &mut facts.lyricist,
+            Some(StandardTagKey::Comment) => &mut facts.comment,
+            Some(StandardTagKey::Label) => &mut facts.label,
+            Some(StandardTagKey::Remixer) => &mut facts.remixer,
+            Some(StandardTagKey::OriginalArtist) => &mut facts.original_artist,
+            _ => continue,
+        };
+        if slot.is_none() {
+            *slot = clean_tag(&tag.value.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +742,55 @@ mod tests {
         assert_eq!(result.band_peaks.len(), result.peaks.len());
         assert!(result.artwork_data_url.is_none());
         assert!(result.title.is_none());
+    }
+
+    #[test]
+    fn file_facts_read_pcm_bitrate_from_wav_header() {
+        use std::io::Write;
+        let path =
+            std::env::temp_dir().join(format!("opendeck-file-facts-{}.wav", std::process::id()));
+        let frames = 48_u32;
+        let data_len = frames * 4;
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&192_000_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes.extend(std::iter::repeat(0).take(data_len as usize));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let facts = read_file_facts(&path);
+        std::fs::remove_file(&path).unwrap();
+        let facts = facts.unwrap();
+        assert_eq!(facts.size_bytes, bytes.len() as u64);
+        assert!(facts.modified_ms.is_some());
+        assert_eq!(facts.sample_rate_hz, Some(48_000));
+        assert_eq!(facts.channels, Some(2));
+        assert_eq!(facts.bits_per_sample, Some(16));
+        assert_eq!(facts.bitrate_kbps, Some(1_536));
+        assert!(!facts.bitrate_is_average);
+    }
+
+    #[test]
+    fn bitrate_helpers_distinguish_pcm_from_average() {
+        assert_eq!(pcm_bitrate_kbps(48_000, 2, 16), Some(1_536));
+        assert_eq!(pcm_bitrate_kbps(44_100, 2, 12), None);
+        assert_eq!(average_bitrate_kbps(180_000, 8_000), Some(180));
+        assert_eq!(average_bitrate_kbps(0, 8_000), None);
+    }
+
+    #[test]
+    fn file_facts_missing_file_returns_error() {
+        assert!(read_file_facts(Path::new("/nonexistent/opendeck-file-facts.wav")).is_err());
     }
 }

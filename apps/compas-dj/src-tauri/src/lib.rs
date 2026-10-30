@@ -8,7 +8,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,11 +26,15 @@ mod folder_edit;
 mod folder_order;
 mod headphone;
 mod hid;
+mod master_route;
 use headphone::CueState;
+mod deck_loads;
 mod library_analysis;
 #[cfg(target_os = "macos")]
 mod macos_drag;
 mod native_controls;
+mod native_effects;
+mod sampler_loading;
 mod track_visuals;
 
 use compas_audio::{
@@ -315,6 +319,14 @@ struct AudioRuntimeStatus {
     restarts: AtomicU64,
     sample_rate: AtomicU32,
     master_device: Mutex<Option<String>>,
+    requested_device: Mutex<Option<String>>,
+    preferred_device: Mutex<Option<String>>,
+    fallback_from: Mutex<Option<String>>,
+    embedded_cue_channel: AtomicU16,
+    embedded_active: AtomicBool,
+    embed_cue_live: Arc<AtomicBool>,
+    route_generation: AtomicU64,
+    applied_route_generation: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
 
@@ -326,16 +338,24 @@ impl AudioRuntimeStatus {
             restarts: AtomicU64::new(0),
             sample_rate: AtomicU32::new(0),
             master_device: Mutex::new(None),
+            requested_device: Mutex::new(None),
+            preferred_device: Mutex::new(None),
+            fallback_from: Mutex::new(None),
+            embedded_cue_channel: AtomicU16::new(master_route::NO_EMBEDDED_CUE),
+            embedded_active: AtomicBool::new(false),
+            embed_cue_live: Arc::new(AtomicBool::new(false)),
+            route_generation: AtomicU64::new(0),
+            applied_route_generation: AtomicU64::new(0),
             last_error: Mutex::new(None),
         }
     }
 
-    fn mark_online(&self, sample_rate: u32) {
+    fn mark_online(&self, sample_rate: u32, notice: Option<String>) {
         self.online.store(true, Ordering::Relaxed);
         self.restarting.store(false, Ordering::Relaxed);
         self.sample_rate.store(sample_rate, Ordering::Relaxed);
         if let Ok(mut last) = self.last_error.lock() {
-            *last = None;
+            *last = notice;
         }
     }
 
@@ -361,6 +381,90 @@ impl AudioRuntimeStatus {
     }
 }
 
+fn open_master_output(
+    audio: &AudioRuntimeStatus,
+    telemetry: Arc<DeckTelemetry>,
+    is_restart: bool,
+) -> Option<AudioEngine> {
+    audio.mark_restarting();
+    let requested = audio
+        .requested_device
+        .lock()
+        .ok()
+        .and_then(|device| device.clone());
+    let planned_fallback = audio
+        .fallback_from
+        .lock()
+        .ok()
+        .and_then(|device| device.clone());
+    let embed_raw = audio.embedded_cue_channel.load(Ordering::Relaxed);
+    let embed = (embed_raw != master_route::NO_EMBEDDED_CUE).then_some(embed_raw);
+    let mut config = EngineConfig::default();
+    config.output_device = requested.clone();
+    config.embedded_cue_first_channel = embed.filter(|_| requested.is_some());
+    config.embed_cue_live = Some(Arc::clone(&audio.embed_cue_live));
+    config.active_sample_rate =
+        device_rate::active_sample_rate(device_rate::AudioEndpoint::Output, requested.as_deref());
+    let opened = match AudioEngine::new(config, Arc::clone(&telemetry)) {
+        Ok(engine) => Ok((engine, planned_fallback.filter(|_| requested.is_none()))),
+        Err(error) if requested.is_some() => {
+            tracing::warn!("preferred speaker output failed ({error}); opening the macOS default");
+            let mut fallback = EngineConfig::default();
+            fallback.embed_cue_live = Some(Arc::clone(&audio.embed_cue_live));
+            fallback.active_sample_rate =
+                device_rate::active_sample_rate(device_rate::AudioEndpoint::Output, None);
+            match AudioEngine::new(fallback, telemetry) {
+                Ok(engine) => Ok((engine, requested)),
+                Err(fallback_error) => Err(format!(
+                    "{error}; macOS default output also failed: {fallback_error}"
+                )),
+            }
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    match opened {
+        Ok((engine, fallback_from)) => {
+            if is_restart {
+                audio.count_restart();
+            }
+            let sample_rate = engine.sample_rate();
+            let embedded = engine.embedded_cue_first_channel();
+            audio.embedded_active.store(
+                embedded.is_some() && fallback_from.is_none(),
+                Ordering::Relaxed,
+            );
+            if let Ok(mut name) = audio.master_device.lock() {
+                *name = Some(engine.device_name().to_string());
+            }
+            if let Ok(mut slot) = audio.fallback_from.lock() {
+                *slot = fallback_from.clone();
+            }
+            let route = embedded
+                .and_then(|first| {
+                    let left = first.checked_add(1)?;
+                    let right = left.checked_add(1)?;
+                    Some(format!("master 1/2, headphones {left}/{right}"))
+                })
+                .unwrap_or_else(|| "master 1/2".to_string());
+            tracing::info!(
+                "audio engine started @ {sample_rate} Hz on {} ({route})",
+                engine.device_name()
+            );
+            let notice = fallback_from.map(|name| {
+                format!("{name} is not available. Speakers are using the macOS default output.")
+            });
+            audio.mark_online(sample_rate, notice);
+            Some(engine)
+        }
+        Err(message) => {
+            tracing::error!("audio engine failed to start (continuing headless): {message}");
+            audio.embedded_active.store(false, Ordering::Relaxed);
+            audio.mark_error(message);
+            None
+        }
+    }
+}
+
 /// Spawn the dedicated audio thread that owns the [`AudioEngine`].
 fn spawn_engine() -> EngineHandle {
     let jog_output: flx4_runtime::JogOutput = Arc::new(std::array::from_fn(|_| {
@@ -379,47 +483,19 @@ fn spawn_engine() -> EngineHandle {
     let spawn_result = thread::Builder::new()
         .name("compas-audio".to_string())
         .spawn(move || {
+            master_route::install_boot(&audio_for_thread);
             let mut initial_report = Some(sr_tx);
-            let mut start_engine = |is_restart: bool| {
-                audio_for_thread.mark_restarting();
-                let mut engine_config = EngineConfig::default();
-                engine_config.active_sample_rate =
-                    device_rate::active_sample_rate(device_rate::AudioEndpoint::Output, None);
-                match AudioEngine::new(engine_config, telemetry_for_thread.clone()) {
-                    Ok(engine) => {
-                        if is_restart {
-                            audio_for_thread.count_restart();
-                        }
-                        let sr = engine.sample_rate();
-                        tracing::info!("audio engine started @ {sr} Hz");
-                        if let Ok(mut name) = audio_for_thread.master_device.lock() {
-                            *name = Some(engine.device_name().to_string());
-                        }
-                        audio_for_thread.mark_online(sr);
-                        if let Some(tx) = initial_report.take() {
-                            let _ = tx.send(sr);
-                        }
-                        Some(engine)
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        tracing::error!(
-                            "audio engine failed to start (continuing headless): {msg}"
-                        );
-                        audio_for_thread.mark_error(msg);
-                        if let Some(tx) = initial_report.take() {
-                            let _ = tx.send(0);
-                        }
-                        None
-                    }
-                }
-            };
-
-            let mut engine = start_engine(false);
+            let mut started_once = false;
+            let mut applied = u64::MAX;
+            let mut engine: Option<AudioEngine> = None;
             let mut jog_applied = [flx4_runtime::INACTIVE; 2];
-            let mut next_retry = Instant::now() + Duration::from_secs(2);
+            let mut next_retry = Instant::now();
 
             loop {
+                let generation = audio_for_thread.route_generation.load(Ordering::Acquire);
+                if generation != applied {
+                    engine = None;
+                }
                 if let Some(active) = engine.as_ref() {
                     if active.stream_failed() {
                         let msg = active
@@ -432,10 +508,28 @@ fn spawn_engine() -> EngineHandle {
                     }
                 }
 
-                if engine.is_none() && Instant::now() >= next_retry {
-                    engine = start_engine(true);
-                    jog_applied = [flx4_runtime::INACTIVE; 2]; // reapply latest desired state to the new stream
+                let route_changed = generation != applied;
+                if engine.is_none() && (route_changed || Instant::now() >= next_retry) {
+                    engine = open_master_output(
+                        &audio_for_thread,
+                        telemetry_for_thread.clone(),
+                        started_once,
+                    );
+                    started_once = true;
+                    applied = generation;
+                    audio_for_thread
+                        .applied_route_generation
+                        .store(generation, Ordering::Release);
+                    jog_applied = [flx4_runtime::INACTIVE; 2];
                     next_retry = Instant::now() + Duration::from_secs(2);
+                    if let Some(tx) = initial_report.take() {
+                        let _ = tx.send(
+                            engine
+                                .as_ref()
+                                .map(|active| active.sample_rate())
+                                .unwrap_or(0),
+                        );
+                    }
                 }
 
                 if let Some(active) = engine.as_mut() {
@@ -457,8 +551,26 @@ fn spawn_engine() -> EngineHandle {
                 };
 
                 if engine.is_none() {
-                    engine = start_engine(true);
+                    engine = open_master_output(
+                        &audio_for_thread,
+                        telemetry_for_thread.clone(),
+                        started_once,
+                    );
+                    started_once = true;
+                    let generation = audio_for_thread.route_generation.load(Ordering::Acquire);
+                    applied = generation;
+                    audio_for_thread
+                        .applied_route_generation
+                        .store(generation, Ordering::Release);
                     next_retry = Instant::now() + Duration::from_secs(2);
+                    if let Some(tx) = initial_report.take() {
+                        let _ = tx.send(
+                            engine
+                                .as_ref()
+                                .map(|active| active.sample_rate())
+                                .unwrap_or(0),
+                        );
+                    }
                 }
 
                 let Some(engine) = engine.as_mut() else {
@@ -811,10 +923,22 @@ struct EngineStatus {
     audio_restarting: bool,
     audio_restarts: u64,
     audio_error: Option<String>,
+    master_device: Option<String>,
+    master_requested: Option<String>,
+    master_fallback: bool,
+    master_embedded_headphones: bool,
     cue_device_latency_secs: f64,
     cue_prime_latency_secs: f64,
+    cue_underruns: u64,
+    cue_discarded_frames: u64,
+    cue_queued_frames: u64,
+    cue_primed: bool,
     booth_device_latency_secs: f64,
     booth_prime_latency_secs: f64,
+    booth_underruns: u64,
+    booth_discarded_frames: u64,
+    booth_queued_frames: u64,
+    booth_primed: bool,
     decks: Vec<DeckStatus>,
 }
 
@@ -872,16 +996,29 @@ fn engine_status_snapshot(
             frame: state.telemetry.playhead_frames(deck),
         })
         .collect();
+    let master = master_route::session(&state.audio);
     EngineStatus {
         sample_rate,
         audio_online: state.audio.online.load(Ordering::Relaxed),
         audio_restarting: state.audio.restarting.load(Ordering::Relaxed),
         audio_restarts: state.audio.restarts.load(Ordering::Relaxed),
         audio_error: state.audio.last_error(),
+        master_device: master.connected_device,
+        master_requested: master.requested_device,
+        master_fallback: master.fallback,
+        master_embedded_headphones: master.embedded_headphones,
         cue_device_latency_secs: cue.latency.device_latency_secs(),
         cue_prime_latency_secs: cue.latency.prime_latency_secs(),
+        cue_underruns: cue.latency.underruns(),
+        cue_discarded_frames: cue.latency.discarded_frames(),
+        cue_queued_frames: cue.latency.queued_frames(),
+        cue_primed: cue.latency.primed(),
         booth_device_latency_secs: booth.latency.device_latency_secs(),
         booth_prime_latency_secs: booth.latency.prime_latency_secs(),
+        booth_underruns: booth.latency.underruns(),
+        booth_discarded_frames: booth.latency.discarded_frames(),
+        booth_queued_frames: booth.latency.queued_frames(),
+        booth_primed: booth.latency.primed(),
         decks,
     }
 }
@@ -995,32 +1132,45 @@ fn load_track(
     state: State<'_, EngineHandle>,
     deck: usize,
     path: String,
-) {
-    jog.reset();
+) -> Result<(), String> {
+    let ticket = app.state::<deck_loads::DeckLoads>().begin(deck, || {
+        jog.reset();
+        let _ = app.emit(
+            "deck:loading",
+            DeckLoadingEvent {
+                deck,
+                path: path.clone(),
+            },
+        );
+    })?;
     let tx = state.tx.clone();
-    // Tell the UI immediately so it can show a loading state during decode + analysis.
-    let _ = app.emit(
-        "deck:loading",
-        DeckLoadingEvent {
-            deck,
-            path: path.clone(),
-        },
-    );
     thread::spawn(move || {
         let (buffer, metadata) = match compas_sources::decode_full(&path) {
             Ok(v) => v,
             Err(e) => {
-                let _ = app.emit(
-                    "deck:error",
-                    DeckErrorEvent {
-                        deck,
-                        message: format!("decode failed: {e}"),
-                    },
-                );
+                // A retired worker must not replace a newer load's status with its error.
+                let _ = app
+                    .state::<deck_loads::DeckLoads>()
+                    .commit(deck, ticket, || {
+                        let _ = app.emit(
+                            "deck:error",
+                            DeckErrorEvent {
+                                deck,
+                                message: format!("decode failed: {e}"),
+                            },
+                        );
+                        Ok(())
+                    });
                 return;
             }
         };
-
+        if !app
+            .state::<deck_loads::DeckLoads>()
+            .current(deck, ticket)
+            .unwrap_or(false)
+        {
+            return;
+        }
         let peaks = compute_peaks(&buffer.samples, WAVEFORM_BIN_FRAMES);
         let silence = silence_spans(&buffer.samples, buffer.source_rate);
         let buffer = buffer.with_silence(silence.clone());
@@ -1031,46 +1181,67 @@ fn load_track(
         );
         let (grid, key) = analyze_track(&buffer);
         let replay_gain = compas_dsp::analysis::replaygain_linear(&buffer.samples);
-
-        let _ = app.emit(
-            "deck:loaded",
-            DeckLoadedEvent {
-                deck,
-                path: metadata.provider_id.clone(),
-                title: metadata.title.clone(),
-                artist: metadata.artist.clone(),
-                duration_ms: buffer.duration_ms(),
-                source_rate: buffer.source_rate,
-                frames: buffer.frames(),
-                bpm: grid.bpm,
-                bpm_confidence: grid.confidence,
-                first_beat_sec: grid.first_beat_sec,
-                beat_interval_sec: grid.beat_interval_sec,
-                key_camelot: key.camelot,
-                key_name: key.name,
-                peaks,
-                band_peaks,
-                replay_gain,
-                silence,
-            },
-        );
-
-        // Beatgrid → source frames for the engine's sync PLL.
         let sr = buffer.source_rate as f64;
         let beat_offset = grid.first_beat_sec as f64 * sr;
         let beat_interval = grid.beat_interval_sec as f64 * sr;
-        let _ = tx.send(EngineMsg::Load {
+        let loaded = DeckLoadedEvent {
             deck,
-            buffer: Arc::new(buffer),
-            beat_offset,
-            beat_interval,
-        });
-        // Apply loudness normalization right after the load resets the deck's gain to neutral.
-        let _ = tx.send(EngineMsg::SetDeckReplayGain {
-            deck,
-            gain: replay_gain,
-        });
+            path: metadata.provider_id.clone(),
+            title: metadata.title.clone(),
+            artist: metadata.artist.clone(),
+            duration_ms: buffer.duration_ms(),
+            source_rate: buffer.source_rate,
+            frames: buffer.frames(),
+            bpm: grid.bpm,
+            bpm_confidence: grid.confidence,
+            first_beat_sec: grid.first_beat_sec,
+            beat_interval_sec: grid.beat_interval_sec,
+            key_camelot: key.camelot,
+            key_name: key.name,
+            peaks,
+            band_peaks,
+            replay_gain,
+            silence,
+        };
+
+        let result = app
+            .state::<deck_loads::DeckLoads>()
+            .commit(deck, ticket, || {
+                tx.send(EngineMsg::Load {
+                    deck,
+                    buffer: Arc::new(buffer),
+                    beat_offset,
+                    beat_interval,
+                })
+                .map_err(|e| e.to_string())?;
+                tx.send(EngineMsg::SetDeckReplayGain {
+                    deck,
+                    gain: replay_gain,
+                })
+                .map_err(|e| e.to_string())?;
+                // Keep the authoritative pitch memory consistent with LoadDeck's zero-pitch reset.
+                let snapshot = app.state::<native_effects::NativeEffects>().update(
+                    deck,
+                    native_effects::EffectUpdate::Pitch { semitones: 0.0 },
+                    |message| tx.send(message).map_err(|e| e.to_string()),
+                )?;
+                app.state::<native_controls::PerformanceState>()
+                    .install_track(deck, beat_offset, beat_interval, sr, f64::from(grid.bpm));
+                let _ = app.emit("effects:update", snapshot);
+                // Commands are enqueued before publication; this is not an audio-callback ack.
+                let _ = app.emit("deck:loaded", loaded);
+                Ok(())
+            });
+        if let Err(message) = result {
+            let _ = app
+                .state::<deck_loads::DeckLoads>()
+                .commit(deck, ticket, || {
+                    let _ = app.emit("deck:error", DeckErrorEvent { deck, message });
+                    Ok(())
+                });
+        }
     });
+    Ok(())
 }
 
 /// Downmix to mono (capped to [`ANALYSIS_MAX_SECS`]) and estimate beatgrid + key.
@@ -2062,11 +2233,26 @@ fn deck_seek(state: State<'_, EngineHandle>, deck: usize, frame: f64) -> Result<
 #[tauri::command]
 fn deck_unload(
     jog: State<'_, flx4_runtime::JogRuntime>,
+    app: AppHandle,
     state: State<'_, EngineHandle>,
+    performance: State<'_, native_controls::PerformanceState>,
     deck: usize,
 ) -> Result<(), String> {
-    jog.reset();
-    state.send(EngineMsg::Unload { deck })
+    let loads = app.state::<deck_loads::DeckLoads>();
+    let ticket = loads.begin(deck, || {})?;
+    loads.commit(deck, ticket, || {
+        jog.reset();
+        state.send(EngineMsg::Unload { deck })?;
+        let snapshot = app.state::<native_effects::NativeEffects>().update(
+            deck,
+            native_effects::EffectUpdate::Pitch { semitones: 0.0 },
+            |message| state.send(message),
+        )?;
+        performance.clear_deck(deck);
+        let _ = app.emit("effects:update", snapshot);
+        Ok(())
+    })?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2079,15 +2265,85 @@ fn set_deck_tempo(state: State<'_, EngineHandle>, deck: usize, ratio: f64) -> Re
 #[tauri::command]
 fn set_beatgrid(
     state: State<'_, EngineHandle>,
+    performance: State<'_, native_controls::PerformanceState>,
     deck: usize,
     offset_frames: f64,
     interval_frames: f64,
 ) -> Result<(), String> {
+    performance.set_grid(deck, offset_frames, interval_frames);
     state.send(EngineMsg::Beatgrid {
         deck,
         offset: offset_frames,
         interval: interval_frames,
     })
+}
+
+#[tauri::command]
+fn performance_set_hot_cue(
+    performance: State<'_, native_controls::PerformanceState>,
+    deck: usize,
+    slot: usize,
+    frame: Option<f64>,
+) {
+    performance.set_hot_cue(deck, slot, frame);
+}
+
+#[tauri::command]
+fn performance_set_hot_cues(
+    performance: State<'_, native_controls::PerformanceState>,
+    deck: usize,
+    frames: Vec<Option<f64>>,
+) {
+    performance.set_hot_cues(deck, &frames);
+}
+
+#[tauri::command]
+fn performance_set_loop(
+    performance: State<'_, native_controls::PerformanceState>,
+    deck: usize,
+    in_frame: f64,
+    out_frame: f64,
+    active: bool,
+    armed: bool,
+    beats: Option<f64>,
+) {
+    performance.set_loop(deck, in_frame, out_frame, active, armed, beats);
+}
+
+#[tauri::command]
+fn performance_set_quantize(
+    performance: State<'_, native_controls::PerformanceState>,
+    deck: usize,
+    enabled: bool,
+) {
+    performance.set_quantize(deck, enabled);
+}
+
+#[tauri::command]
+fn performance_set_jump_scale(
+    performance: State<'_, native_controls::PerformanceState>,
+    deck: usize,
+    scale: f64,
+) {
+    performance.set_jump_scale(deck, scale);
+}
+
+#[tauri::command]
+fn performance_set_synced(
+    performance: State<'_, native_controls::PerformanceState>,
+    deck: usize,
+    synced: bool,
+) {
+    performance.set_synced(deck, synced);
+}
+
+#[tauri::command]
+fn performance_set_sync_partner(
+    performance: State<'_, native_controls::PerformanceState>,
+    deck: usize,
+    partner: Option<usize>,
+) {
+    performance.set_partner(deck, partner);
 }
 
 /// Route a deck to a crossfader side for 4-deck mixing: 0 = A, 1 = thru, 2 = B.
@@ -2123,11 +2379,19 @@ fn set_deck_keylock(
 /// Key shift: transpose a deck by ± semitones without changing its tempo (WSOLA pitch shift).
 #[tauri::command]
 fn set_deck_pitch_shift(
+    app: AppHandle,
     state: State<'_, EngineHandle>,
+    effects: State<'_, native_effects::NativeEffects>,
     deck: usize,
     semitones: f64,
 ) -> Result<(), String> {
-    state.send(EngineMsg::DeckPitchShift { deck, semitones })
+    let snapshot = effects.update(
+        deck,
+        native_effects::EffectUpdate::Pitch { semitones },
+        |message| state.send(message),
+    )?;
+    let _ = app.emit("effects:update", snapshot);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2264,6 +2528,28 @@ fn set_deck_filter(
         cutoff,
         resonance,
     })
+}
+
+/// Atomically update one semantic effect and enqueue its engine parameters.
+/// Frontend uses this in place of the legacy raw-parameter setters.
+#[tauri::command]
+fn set_deck_effect(
+    app: AppHandle,
+    state: State<'_, EngineHandle>,
+    effects: State<'_, native_effects::NativeEffects>,
+    deck: usize,
+    update: native_effects::EffectUpdate,
+) -> Result<native_effects::EffectsSnapshot, String> {
+    let snapshot = effects.update(deck, update, |message| state.send(message))?;
+    let _ = app.emit("effects:update", snapshot.clone());
+    Ok(snapshot)
+}
+
+#[tauri::command]
+fn effects_snapshot(
+    effects: State<'_, native_effects::NativeEffects>,
+) -> Result<native_effects::EffectsSnapshot, String> {
+    effects.snapshot()
 }
 
 /// Configure the per-deck echo/delay insert. The UI computes `time_sec` (often
@@ -3058,15 +3344,21 @@ struct LoadedSample {
     name: String,
 }
 
-/// Decode an audio file into a sampler pad. Decoding is synchronous (samples are short); the
-/// whole-file PCM is installed on the audio thread via [`EngineMsg::LoadSample`].
+/// Decode on a blocking worker so sample loading never stalls the webview command thread.
 #[tauri::command]
-fn load_sample(
+async fn load_sample(
     state: State<'_, EngineHandle>,
     slot: usize,
     path: String,
 ) -> Result<LoadedSample, String> {
-    let (buffer, metadata) = compas_sources::decode_full(&path).map_err(|e| e.to_string())?;
+    sampler_loading::validate_slot(slot)?;
+    let permit = sampler_loading::acquire()?;
+    let decode_path = path.clone();
+    let (buffer, metadata) = tauri::async_runtime::spawn_blocking(move || {
+        sampler_loading::decode(std::path::Path::new(&decode_path), permit)
+    })
+    .await
+    .map_err(|e| format!("Sample loader failed: {e}"))??;
     // Prefer the embedded title; fall back to the file stem.
     let name = if metadata.title.trim().is_empty() {
         std::path::Path::new(&path)
@@ -3477,6 +3769,9 @@ pub fn run() {
         })
         .manage(CueState::new())
         .manage(native_controls::DeckEqState::default())
+        .manage(native_effects::NativeEffects::default())
+        .manage(deck_loads::DeckLoads::default())
+        .manage(native_controls::PerformanceState::new())
         .manage(BoothState {
             stop: Mutex::new(None),
             latency: Arc::new(compas_audio::MonitorLatency::default()),
@@ -3537,6 +3832,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             track_visuals::track_visuals,
+            track_visuals::track_file_facts,
             build_info,
             engine_status,
             export_diagnostics,
@@ -3592,6 +3888,13 @@ pub fn run() {
             set_deck_keylock,
             set_deck_pitch_shift,
             set_beatgrid,
+            performance_set_hot_cue,
+            performance_set_hot_cues,
+            performance_set_loop,
+            performance_set_quantize,
+            performance_set_jump_scale,
+            performance_set_synced,
+            performance_set_sync_partner,
             set_deck_sync,
             set_deck_xfader_assign,
             set_deck_gain,
@@ -3599,6 +3902,8 @@ pub fn run() {
             set_deck_eq,
             set_deck_eq_band,
             set_deck_filter,
+            set_deck_effect,
+            effects_snapshot,
             set_deck_echo,
             set_deck_reverb,
             set_deck_flanger,
@@ -3619,6 +3924,8 @@ pub fn run() {
             start_recording,
             stop_recording,
             list_output_devices,
+            master_route::master_session,
+            master_route::set_master_output,
             headphone::cue_session,
             headphone::list_output_device_details,
             headphone::configure_cue_output,

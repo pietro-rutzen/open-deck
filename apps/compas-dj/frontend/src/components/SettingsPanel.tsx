@@ -2,7 +2,8 @@ import type { AuxApi } from "../hooks/useAux";
 import type { BoothApi } from "../hooks/useBooth";
 import type { CueApi } from "../hooks/useCue";
 import type { InternalClockApi } from "../hooks/useInternalClock";
-import { exportDiagnostics, type KeyNotation } from "../lib/ipc";
+import { useMasterOutput } from "../hooks/useMasterOutput";
+import { exportDiagnostics, type KeyNotation, type OutputDeviceInfo } from "../lib/ipc";
 import { Aux, Booth, InternalClock } from "./Mixer";
 import { Icon } from "./icons";
 
@@ -39,6 +40,16 @@ export function SettingsPanel({
   onOpenControllers: () => void;
   onClose: () => void;
 }) {
+  const speakers = useMasterOutput();
+  const speakerStatus = speakers.switching
+    ? "Switching…"
+    : speakers.fallback
+      ? `Using ${speakers.connectedName ?? "macOS default"}`
+      : speakers.connectedName
+        ? speakers.embeddedHeadphones
+          ? `On: ${speakers.connectedName} · 1/2`
+          : `On: ${speakers.connectedName}`
+        : "Offline";
   return (
     <div className="panel-overlay" onClick={onClose}>
       <div className="panel settings-panel" onClick={(e) => e.stopPropagation()}>
@@ -52,6 +63,7 @@ export function SettingsPanel({
             <button
               className="chip settings-rescan"
               onClick={() => {
+                speakers.rescan();
                 aux.rescan();
                 cue.rescan();
                 booth.rescan();
@@ -61,6 +73,24 @@ export function SettingsPanel({
             </button>
           </div>
           <div className="settings-device-list">
+            <div className="settings-device-row">
+              <label className="settings-device-title" htmlFor="master-output-device"><Icon name="speaker" size={16} /><span>Speakers</span></label>
+              <select
+                id="master-output-device"
+                value={speakers.device ?? ""}
+                disabled={speakers.switching}
+                onChange={(event) => void speakers.setDevice(event.target.value || null)}
+              >
+                <option value="">Same as the Mac</option>
+                {speakers.device && !speakers.devices.some((device) => device.name === speakers.device) && (
+                  <option value={speakers.device}>{speakers.device} (unavailable)</option>
+                )}
+                {speakers.devices.map((device) => (
+                  <option key={device.name} value={device.name}>{speakerOptionLabel(device)}</option>
+                ))}
+              </select>
+              <span className="settings-device-status">{speakerStatus}</span>
+            </div>
             <div className="settings-device-row">
               <label className="settings-device-title" htmlFor="cue-output-device"><Icon name="headphones" size={16} /><span>Headphones</span></label>
               <select id="cue-output-device" value={cue.device ?? ""} disabled={cue.enabled}
@@ -91,7 +121,8 @@ export function SettingsPanel({
                 {cue.enabled ? "Stop headphones" : "Start headphones"}
               </button>
             </div>
-            <p className="ctrl-hint">Channel numbers refer to the selected audio device. Master playback stays on the system output. Select a separate headphone pair or a separate device.</p>
+            <p className="ctrl-hint">Speakers follow the Mac’s current output until you pick another device. Choose DDJ-FLX4 to send the master mix to the controller’s outputs 1/2, with headphones on 3/4. MacBook speakers and other outputs are listed separately. Choose speakers before the set: switching restarts playback and clears the loaded decks.</p>
+            {speakers.error && <p role="alert" className="ctrl-hint">{speakers.error}</p>}
             {cue.error && <p role="alert" className="ctrl-hint">{cue.error}</p>}
             <DevicePicker
               icon="sliders"
@@ -178,7 +209,7 @@ function DevicePicker({
   status,
   onChange,
 }: {
-  icon: "headphones" | "mic" | "sliders";
+  icon: "headphones" | "mic" | "sliders" | "speaker";
   label: string;
   value: string | null;
   devices: string[];
@@ -206,4 +237,11 @@ function DevicePicker({
       <span className="settings-device-status">{status}</span>
     </label>
   );
+}
+
+function speakerOptionLabel(device: OutputDeviceInfo): string {
+  const controller = device.name.toLowerCase().includes("ddj-flx4");
+  if (controller && device.channels >= 4) return `${device.name} · speakers 1/2, headphones 3/4`;
+  if (device.channels >= 2) return `${device.name} · ${device.channels} channels`;
+  return device.name;
 }

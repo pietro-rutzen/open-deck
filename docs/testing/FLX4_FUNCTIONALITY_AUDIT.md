@@ -13,7 +13,7 @@ Address inventory below covers every control entry in that mapping, including sh
 
 Not implemented: Pad FX 1/2, keyboard mode and stems, Smart CFX/Smart Fader. SHIFT+PLAY censor, SHIFT+LOOP IN/OUT boundary adjust via jog, SHIFT beat-jump size ×16, tempo-range cycling (SHIFT+SYNC), deck SHIFT buttons, the cue-point LED, track-loaded LEDs and beat-loop shift-layer LEDs are implemented below; every one of them still needs a physical FLX4 test (NOT RUN). Beat FX drives OpenDeck's per-deck echo/flanger/reverb/crusher inserts, not rekordbox's Beat FX DSP or master-channel FX position. Sampler pads share OpenDeck's 8 sampler slots across both decks and do not load or eject tracks. Hot cues follow OpenDeck set/seek semantics rather than rekordbox hold-to-preview. The second cue/play indicator address `90/91 47` stays dark because the same bytes are listed for both indicators. Unsupported controls must not be called working.
 
-Remaining architecture debt: loop, hot cue, beat jump, sync, key shift, sampler and Beat FX actions still execute through frontend state, although positions are now captured natively at button press. Engine command acknowledgements are still absent.
+Hot cue, beat loop, loop in/out, beat jump, quantize, sync, and sampler trigger/stop are applied on the controller thread at the press. Key shift and Beat FX still execute through frontend state. Engine command acknowledgements are still absent. Physical timing against a reference player is NOT RUN.
 
 ## Changed behavior (T019)
 

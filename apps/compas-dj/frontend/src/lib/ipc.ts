@@ -158,6 +158,10 @@ export interface EngineStatus {
   audio_restarting: boolean;
   audio_restarts: number;
   audio_error: string | null;
+  master_device: string | null;
+  master_requested: string | null;
+  master_fallback: boolean;
+  master_embedded_headphones: boolean;
   cue_device_latency_secs: number;
   cue_prime_latency_secs: number;
   booth_device_latency_secs: number;
@@ -251,6 +255,34 @@ export interface ProbedTrack {
 
 /** Cheap header probe for adding a file to the library (no full decode). */
 export const probeTrack = (path: string) => invoke<ProbedTrack>("probe_track", { path });
+
+/** Header facts for the selected-track inspector. No waveform decode. */
+export interface TrackFileFacts {
+  size_bytes: number;
+  created_ms: number | null;
+  modified_ms: number | null;
+  sample_rate_hz: number | null;
+  channels: number | null;
+  bits_per_sample: number | null;
+  bitrate_kbps: number | null;
+  bitrate_is_average: boolean;
+  album: string | null;
+  album_artist: string | null;
+  genre: string | null;
+  recorded_date: string | null;
+  track_number: string | null;
+  track_total: string | null;
+  disc_number: string | null;
+  disc_total: string | null;
+  composer: string | null;
+  lyricist: string | null;
+  comment: string | null;
+  label: string | null;
+  remixer: string | null;
+  original_artist: string | null;
+}
+export const trackFileFacts = (path: string) =>
+  invoke<TrackFileFacts>("track_file_facts", { path });
 
 // ---- Library + per-track state (SQLite) -------------------------------------------
 
@@ -533,6 +565,19 @@ export interface ControllerUpdate {
   frame?: number;
   /** Audible position captured natively when the message arrived (deck actions only). */
   heard_frame?: number;
+  /** Present when the controller thread already applied this action to the engine. */
+  performance?: {
+    loop_in?: number;
+    loop_out?: number;
+    loop_active?: boolean;
+    loop_armed?: boolean;
+    loop_beats?: number;
+    clear_loop_beats?: boolean;
+    hot_cue_frame?: number;
+    jump_scale?: number;
+    quantize?: boolean;
+    synced?: boolean;
+  };
 }
 export const onControllerUpdate = (cb: (u: ControllerUpdate) => void): Promise<UnlistenFn> =>
   listen<ControllerUpdate>("controller:update", (e) => cb(e.payload));
@@ -666,6 +711,27 @@ export const setSyncLeader = (deck: number, explicit: boolean) =>
   invoke("set_sync_leader", { deck, explicit });
 /** Auto-pick the best leader and follow it. */
 export const syncToLeader = (deck: number) => invoke("sync_to_leader", { deck });
+/** Keep controller-thread cue, loop, grid, and sync memory aligned with on-screen edits. */
+export const performanceSetHotCue = (deck: number, slot: number, frame: number | null) =>
+  invoke("performance_set_hot_cue", { deck, slot, frame });
+export const performanceSetHotCues = (deck: number, frames: (number | null)[]) =>
+  invoke("performance_set_hot_cues", { deck, frames });
+export const performanceSetLoop = (
+  deck: number,
+  inFrame: number,
+  outFrame: number,
+  active: boolean,
+  armed: boolean,
+  beats: number | null,
+) => invoke("performance_set_loop", { deck, inFrame, outFrame, active, armed, beats });
+export const performanceSetQuantize = (deck: number, enabled: boolean) =>
+  invoke("performance_set_quantize", { deck, enabled });
+export const performanceSetJumpScale = (deck: number, scale: number) =>
+  invoke("performance_set_jump_scale", { deck, scale });
+export const performanceSetSynced = (deck: number, synced: boolean) =>
+  invoke("performance_set_synced", { deck, synced });
+export const performanceSetSyncPartner = (deck: number, partner: number | null) =>
+  invoke("performance_set_sync_partner", { deck, partner });
 // ---- Loudness normalization (ReplayGain) ------------------------------------------
 /** Override a deck's loudness-normalization factor (1.0 = off). Auto-applied on load. */
 export const setDeckReplayGain = (deck: number, gain: number) =>
@@ -773,6 +839,20 @@ export const configureCueOutput = (device: string | null, firstChannel: number) 
 export const onCueSession = (cb: (session: CueSession) => void): Promise<UnlistenFn> =>
   listen<CueSession>("cue:session", (event) => cb(event.payload));
 
+export interface MasterSession {
+  requested_device: string | null;
+  connected_device: string | null;
+  embedded_headphones: boolean;
+  fallback: boolean;
+  online: boolean;
+  error: string | null;
+}
+export const masterSession = () => invoke<MasterSession>("master_session");
+export const setMasterOutput = (device: string | null) =>
+  invoke<MasterSession>("set_master_output", { device });
+export const onAudioOutputReset = (cb: () => void): Promise<UnlistenFn> =>
+  listen("audio:output-reset", () => cb());
+
 /** List output devices the headphone cue can target (first is usually the system default). */
 export const listOutputDevices = () => invoke<string[]>("list_output_devices");
 /** Start the validated configured cue route (or an explicit device); returns the device name. */
@@ -845,3 +925,26 @@ export const onEngineLoad = (cb: (e: EngineLoad) => void): Promise<UnlistenFn> =
 export const prioritizeAnalysis = (path: string) => invoke<void>("prioritize_analysis", { path });
 
 export const setDeckTrim = (deck: number, gain: number) => invoke<void>("set_deck_trim", { deck, gain });
+
+// Native Beat FX/key-shift authority. Events reflect engine commands; never resend them.
+export interface NativeDeckEffects {
+  echo: { active: boolean; beats: number; depth: number };
+  flanger: { active: boolean; beats: number; depth: number };
+  reverb: { active: boolean; size: number; mix: number };
+  crusher: { active: boolean; crush: number; down: number };
+  pitch_shift: number; beat_sec: number;
+}
+export interface EffectsSnapshot {
+  revision: number; effect: 'echo' | 'flanger' | 'reverb' | 'crusher'; deck: number; decks: NativeDeckEffects[];
+}
+export type EffectUpdate =
+  | ({ effect: 'echo' } & NativeDeckEffects['echo'])
+  | ({ effect: 'flanger' } & NativeDeckEffects['flanger'])
+  | ({ effect: 'reverb' } & NativeDeckEffects['reverb'])
+  | ({ effect: 'crusher' } & NativeDeckEffects['crusher'])
+  | { effect: 'pitch'; semitones: number }
+  | { effect: 'beat_sec'; seconds: number };
+export const setDeckEffect = (deck: number, update: EffectUpdate) => invoke<EffectsSnapshot>('set_deck_effect', { deck, update });
+export const effectsSnapshot = () => invoke<EffectsSnapshot>('effects_snapshot');
+export const onEffectsUpdate = (fn: (snapshot: EffectsSnapshot) => void): Promise<UnlistenFn> =>
+  listen<EffectsSnapshot>('effects:update', event => fn(event.payload));

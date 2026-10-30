@@ -369,20 +369,23 @@
 .panel-head { display: flex; justify-content: space-between; align-items: center; }
 .panel-head h3 { margin: 0; font-family: var(--font-display); font-size: 16px; }
 .settings-panel { width: min(520px, 92vw); }
+.settings-panel .chip { flex: none; }
 .settings-audio { display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid var(--border-hairline); padding-bottom: 10px; }
 .settings-section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .settings-section-head h4 { margin: 0; font-family: var(--font-display); font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.06em; }
 .settings-rescan { flex: none; padding: 4px 10px; font-size: 9px; }
-.settings-device-list { display: flex; flex-direction: column; gap: 6px; }
+.settings-device-list { display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content; column-gap: 8px; row-gap: 6px; align-items: center; }
+.settings-device-list > .ctrl-hint { grid-column: 1 / -1; margin: 2px 0 0; }
 .settings-io-list { display: flex; flex-direction: column; gap: 2px; }
 /* The relocated mixer I/O rows (.phones) sit flush inside Settings — drop their mixer divider. */
 .settings-io-list .phones { border-top: none; margin-top: 0; padding-top: 2px; }
-.settings-device-row { display: grid; grid-template-columns: max-content minmax(160px, 1fr) max-content; align-items: center; gap: 8px; color: var(--text-secondary); }
-.settings-device-title { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.settings-device-row { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; align-items: center; color: var(--text-secondary); }
+.settings-device-title { display: flex; align-items: center; gap: 7px; min-width: max-content; font-size: 12px; font-weight: 600; white-space: nowrap; }
 .settings-device-title span { white-space: nowrap; }
-.settings-device-row select { min-width: 0; width: 100%; background: var(--surface-control); color: var(--text-secondary); border: 1px solid var(--border-hairline-strong); border-radius: var(--r-pad); padding: 6px 8px; font-size: 11px; }
+.settings-device-row select { min-width: 0; width: 100%; -webkit-appearance: none; appearance: none; background-color: var(--surface-control); background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1.2 5 4.8 9 1.2' fill='none' stroke='%239497a3' stroke-width='1.2'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 8px center; background-size: 10px 6px; color: var(--text-secondary); border: 1px solid var(--border-hairline-strong); border-radius: 0; padding: 6px 24px 6px 8px; font-size: 11px; }
 .settings-device-row select:disabled { opacity: 0.7; }
 .settings-device-status { font-size: 10px; color: var(--text-tertiary); text-align: right; white-space: nowrap; }
+.settings-device-row > .chip { justify-self: end; padding: 6px 8px; }
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .settings-tile { min-height: 72px; border-radius: var(--r-tile); background: var(--surface-control); border: 1px solid var(--border-hairline-strong); color: var(--text-secondary); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; font-weight: 600; }
 .settings-tile:hover { color: #fff; border-color: var(--accent); }

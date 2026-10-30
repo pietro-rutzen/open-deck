@@ -3,6 +3,9 @@ type AudioStatus = {
   audio_restarting: boolean;
   audio_restarts: number;
   audio_error: string | null;
+  master_device: string | null;
+  master_fallback: boolean;
+  master_embedded_headphones: boolean;
   cue_device_latency_secs: number;
   cue_prime_latency_secs: number;
   booth_device_latency_secs: number;
@@ -12,7 +15,11 @@ type AudioStatus = {
 export function StatusBar({ sampleRate, audioStatus, beatFxLabel }: { sampleRate: number | null; audioStatus: AudioStatus | null; beatFxLabel?: string }) {
   const ok = sampleRate != null && sampleRate > 0 && (audioStatus?.audio_online ?? true);
   const restarting = audioStatus?.audio_restarting ?? false;
-  const label = restarting ? "Audio restarting" : ok ? "Engine OK" : "No audio device";
+  const fallback = audioStatus?.master_fallback ?? false;
+  const label = restarting ? "Audio restarting" : !ok ? "No audio device" : fallback ? "Speaker fallback" : "Engine OK";
+  const output = audioStatus?.master_embedded_headphones
+    ? `${audioStatus.master_device ?? "Speakers"} 1/2 · phones 3/4`
+    : audioStatus?.master_device ?? "Speakers";
   const ms = (v?: number) => `${(((v ?? 0) * 1000)).toFixed(1)} ms`;
   const latencyTitle = audioStatus
     ? `Cue ${ms(audioStatus.cue_device_latency_secs)} + ${ms(audioStatus.cue_prime_latency_secs)} buffer · Booth ${ms(audioStatus.booth_device_latency_secs)} + ${ms(audioStatus.booth_prime_latency_secs)} buffer`
@@ -21,13 +28,13 @@ export function StatusBar({ sampleRate, audioStatus, beatFxLabel }: { sampleRate
   return (
     <footer className="statusbar mono">
       <span className="st-engine" title={title}>
-        <span className={`st-dot ${restarting ? "st-dot--warn" : ok ? "st-dot--ok" : "st-dot--off"}`} />
+        <span className={`st-dot ${restarting || fallback ? "st-dot--warn" : ok ? "st-dot--ok" : "st-dot--off"}`} />
         {label}
       </span>
       <span className="st-sep">·</span>
       <span>{ok ? `${(sampleRate / 1000).toFixed(1)} kHz` : "— kHz"}</span>
       <span className="st-sep">·</span>
-      <span className="st-rt">Local audio</span>
+      <span className="st-rt" title={title}>{output}</span>
       {beatFxLabel && (
         <>
           <span className="st-sep">·</span>

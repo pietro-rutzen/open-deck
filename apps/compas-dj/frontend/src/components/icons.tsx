@@ -16,7 +16,8 @@ type IconName =
   | "sliders"
   | "perform"
   | "pads"
-  | "sun";
+  | "sun"
+  | "speaker";
 
 const PATHS: Record<IconName, ReactNode> = {
   play: <polygon points="6 3 20 12 6 21" />,
@@ -98,6 +99,13 @@ const PATHS: Record<IconName, ReactNode> = {
     <>
       <circle cx="12" cy="12" r="3" />
       <path d="M12 1v4M12 19v4M4.2 4.2l2.8 2.8M17 17l2.8 2.8M1 12h4M19 12h4M4.2 19.8 7 17M17 7l2.8-2.8" />
+    </>
+  ),
+  speaker: (
+    <>
+      <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+      <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+      <path d="M19 5a9 9 0 0 1 0 14" />
     </>
   ),
 };

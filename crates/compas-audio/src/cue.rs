@@ -22,6 +22,10 @@ const MAX_ADVANCE_PER_FRAME: usize = 48;
 pub struct MonitorLatency {
     device_latency_bits: AtomicU64,
     prime_latency_bits: AtomicU64,
+    underruns: AtomicU64,
+    discarded_frames: AtomicU64,
+    queued_frames: AtomicU64,
+    primed: AtomicBool,
 }
 impl MonitorLatency {
     pub fn device_latency_secs(&self) -> f64 {
@@ -29,6 +33,30 @@ impl MonitorLatency {
     }
     pub fn prime_latency_secs(&self) -> f64 {
         f64::from_bits(self.prime_latency_bits.load(Ordering::Relaxed))
+    }
+    /// Buffer depletion events after playback was primed, since this stream opened.
+    /// Startup waiting is excluded; this is not a physical-device xrun counter.
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+    /// Source frames skipped to bound backlog from independently clocked devices.
+    pub fn discarded_frames(&self) -> u64 {
+        self.discarded_frames.load(Ordering::Relaxed)
+    }
+    /// Most recent callback's queued source frames; excludes two interpolation frames.
+    pub fn queued_frames(&self) -> u64 {
+        self.queued_frames.load(Ordering::Relaxed)
+    }
+    pub fn primed(&self) -> bool {
+        self.primed.load(Ordering::Relaxed)
+    }
+    fn publish_reader(&self, reader: &MonitorReader) {
+        self.underruns.store(reader.underruns, Ordering::Relaxed);
+        self.discarded_frames
+            .store(reader.discarded_frames, Ordering::Relaxed);
+        self.queued_frames
+            .store((reader.consumer.slots() / 2) as u64, Ordering::Relaxed);
+        self.primed.store(reader.primed, Ordering::Relaxed);
     }
 }
 
@@ -289,6 +317,8 @@ struct MonitorReader {
     a: [f32; 2],
     b: [f32; 2],
     primed: bool,
+    underruns: u64,
+    discarded_frames: u64,
 }
 impl MonitorReader {
     fn new(consumer: Consumer<f32>, source: u32, target: u32) -> Self {
@@ -299,6 +329,8 @@ impl MonitorReader {
             a: [0.0; 2],
             b: [0.0; 2],
             primed: false,
+            underruns: 0,
+            discarded_frames: 0,
         }
     }
     fn pop_frame(&mut self) -> Option<[f32; 2]> {
@@ -319,6 +351,7 @@ impl MonitorReader {
                 break;
             }
             let _ = self.pop_frame();
+            self.discarded_frames = self.discarded_frames.saturating_add(1);
             discarded = true;
         }
         if discarded {
@@ -354,6 +387,7 @@ impl MonitorReader {
             }
             self.a = self.b;
             let Some(b) = self.pop_frame() else {
+                self.underruns = self.underruns.saturating_add(1);
                 self.primed = false;
                 self.phase = 0.0;
                 return output;
@@ -408,6 +442,10 @@ where
         );
     }
     let mut reader = MonitorReader::new(consumer, source_rate, config.sample_rate.0);
+    if let Some(latency) = latency.as_ref() {
+        latency.device_latency_bits.store(0, Ordering::Relaxed);
+        latency.publish_reader(&reader);
+    }
     let callback_failed = Arc::clone(&failed);
     let err_fn = move |error: cpal::StreamError| {
         if let Ok(mut last) = last_error.lock() {
@@ -433,6 +471,9 @@ where
                         callback_failed.store(true, Ordering::Release);
                     }
                 }
+                if let Some(latency) = latency.as_ref() {
+                    latency.publish_reader(&reader);
+                }
             },
             err_fn,
             None,
@@ -452,6 +493,88 @@ mod tests {
         }
         MonitorReader::new(consumer, source, target)
     }
+    #[test]
+    fn monitor_diagnostics_distinguish_startup_underrun_and_backlog() {
+        let (mut tx, rx) = RingBuffer::new(16_384);
+        let mut r = MonitorReader::new(rx, 48_000, 48_000);
+        let stats = MonitorLatency::default();
+        assert_eq!(r.next_frame(), [0.0; 2]);
+        stats.publish_reader(&r);
+        assert_eq!(stats.underruns(), 0, "startup is not an underrun");
+        assert!(!stats.primed());
+        for _ in 0..PRIME_SAMPLES / 2 {
+            tx.push(0.25).unwrap();
+            tx.push(-0.25).unwrap();
+        }
+        for _ in 0..PRIME_SAMPLES / 2 + 10 {
+            r.next_frame();
+        }
+        stats.publish_reader(&r);
+        assert_eq!(
+            stats.underruns(),
+            1,
+            "one depletion, not one event per silent frame"
+        );
+        assert_eq!(stats.queued_frames(), 0);
+        for _ in 0..6000 {
+            tx.push(0.25).unwrap();
+            tx.push(-0.25).unwrap();
+        }
+        r.begin_block();
+        stats.publish_reader(&r);
+        assert_eq!(
+            stats.discarded_frames(),
+            MAX_DISCARD_FRAMES_PER_BLOCK as u64
+        );
+        assert_eq!(
+            stats.queued_frames(),
+            6000 - MAX_DISCARD_FRAMES_PER_BLOCK as u64
+        );
+        assert_eq!(
+            stats.underruns(),
+            1,
+            "backlog discard is a different condition"
+        );
+        assert_eq!(r.next_frame(), [0.25, -0.25]);
+        stats.publish_reader(&r);
+        assert!(stats.primed());
+        let (_tx2, rx2) = RingBuffer::new(4096);
+        stats.publish_reader(&MonitorReader::new(rx2, 48_000, 48_000));
+        assert_eq!(stats.underruns(), 0, "new stream resets counters");
+        assert_eq!(stats.discarded_frames(), 0);
+        assert!(!stats.primed());
+    }
+
+    #[test]
+    fn sixty_seconds_simulated_nominal_clocks_preserve_stereo_without_drops() {
+        // Deterministic nominal scheduling only: not wall-clock or physical hardware testing.
+        for (source, target) in [(48_000u32, 48_000u32), (44_100, 48_000), (48_000, 44_100)] {
+            let (mut tx, rx) = RingBuffer::new(16_384);
+            let mut r = MonitorReader::new(rx, source, target);
+            for _ in 0..PRIME_SAMPLES / 2 {
+                tx.push(0.25).unwrap();
+                tx.push(-0.5).unwrap();
+            }
+            let mut generated = 0u64;
+            let blocks = u64::from(target) * 60 / 128;
+            for block in 0..blocks {
+                let due = (block + 1) * 128 * u64::from(source) / u64::from(target);
+                for _ in generated..due {
+                    tx.push(0.25).unwrap();
+                    tx.push(-0.5).unwrap();
+                }
+                generated = due;
+                r.begin_block();
+                for _ in 0..128 {
+                    assert_eq!(r.next_frame(), [0.25, -0.5]);
+                }
+            }
+            assert_eq!(r.underruns, 0, "{source}->{target}");
+            assert_eq!(r.discarded_frames, 0, "{source}->{target}");
+            assert!(r.consumer.slots() <= PRIME_SAMPLES + 4);
+        }
+    }
+
     #[test]
     fn routed_pair_is_isolated() {
         let mut frame = [9.0; 6];

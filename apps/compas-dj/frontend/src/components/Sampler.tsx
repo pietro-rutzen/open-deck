@@ -14,6 +14,7 @@ export function Sampler({ sampler, onClose }: { sampler: SamplerController; onCl
         <span className="mono sampler-hint">click empty → load · press → fire · ⟳ loop · ✕ clear</span>
         <button className="chip sampler-close" onClick={onClose} title="Close">✕</button>
       </div>
+      {sampler.error && <p role="alert">{sampler.error}</p>}
       <div className="spad-grid">
         {sampler.pads.map((pad, i) => (
           <div

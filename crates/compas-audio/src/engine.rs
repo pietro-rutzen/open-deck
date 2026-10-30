@@ -4,12 +4,12 @@ use std::sync::{Arc, Mutex};
 use compas_core::{CompasError, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
-use rtrb::{Consumer, Producer, RingBuffer};
+use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
 use crate::mixer::{AudioCommand, DeckTelemetry, Mixer, RetiredResource};
 
 /// Engine configuration.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Capacity of the control-command ring (commands per audio block are tiny).
     pub command_capacity: usize,
@@ -17,6 +17,12 @@ pub struct EngineConfig {
     pub reclaim_capacity: usize,
     /// Sample rate the output device is already running, when the host can report it.
     pub active_sample_rate: Option<u32>,
+    /// Open this output instead of the host default. `None` keeps the macOS default device.
+    pub output_device: Option<String>,
+    /// Stereo pair inside this same stream for the headphone bus. `Some(2)` is outputs 3/4.
+    pub embedded_cue_first_channel: Option<u16>,
+    /// Live gate for the embedded headphone pair. The callback only reads this atomic.
+    pub embed_cue_live: Option<Arc<AtomicBool>>,
 }
 
 impl Default for EngineConfig {
@@ -26,6 +32,9 @@ impl Default for EngineConfig {
             // Sized to absorb a burst of deck reloads each retiring their mix buffer, with headroom.
             reclaim_capacity: 16,
             active_sample_rate: None,
+            output_device: None,
+            embedded_cue_first_channel: None,
+            embed_cue_live: None,
         }
     }
 }
@@ -39,6 +48,8 @@ pub struct AudioEngine {
     reclaim: Consumer<RetiredResource>,
     telemetry: Arc<DeckTelemetry>,
     sample_rate: u32,
+    channels: u16,
+    embedded_cue_first_channel: Option<u16>,
     device_name: String,
     stream_failed: Arc<AtomicBool>,
     last_stream_error: Arc<Mutex<Option<String>>>,
@@ -49,9 +60,7 @@ impl AudioEngine {
     /// so other threads can read deck position/state without locking.
     pub fn new(config: EngineConfig, telemetry: Arc<DeckTelemetry>) -> Result<Self> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| CompasError::Device("no default output device".into()))?;
+        let device = select_output_device(&host, config.output_device.as_deref())?;
         let current = device
             .default_output_config()
             .map_err(|e| CompasError::Device(e.to_string()))?;
@@ -70,6 +79,14 @@ impl AudioEngine {
         let sample_rate = chosen.sample_rate().0;
         let sample_format = chosen.sample_format();
         let stream_config: cpal::StreamConfig = chosen.into();
+        let embedded_cue = config.embedded_cue_first_channel.filter(|first| {
+            first
+                .checked_add(1)
+                .is_some_and(|right| *first >= 2 && right < stream_config.channels)
+        });
+        let embed_cue_live = config
+            .embed_cue_live
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(embedded_cue.is_some())));
 
         let (cmd_tx, cmd_rx) = RingBuffer::<AudioCommand>::new(config.command_capacity);
         let (reclaim_tx, reclaim_rx) = RingBuffer::<RetiredResource>::new(config.reclaim_capacity);
@@ -82,6 +99,8 @@ impl AudioEngine {
                 &device,
                 &stream_config,
                 mixer,
+                embedded_cue,
+                embed_cue_live,
                 stream_failed.clone(),
                 last_stream_error.clone(),
             ),
@@ -89,6 +108,8 @@ impl AudioEngine {
                 &device,
                 &stream_config,
                 mixer,
+                embedded_cue,
+                embed_cue_live,
                 stream_failed.clone(),
                 last_stream_error.clone(),
             ),
@@ -96,6 +117,8 @@ impl AudioEngine {
                 &device,
                 &stream_config,
                 mixer,
+                embedded_cue,
+                embed_cue_live,
                 stream_failed.clone(),
                 last_stream_error.clone(),
             ),
@@ -114,6 +137,8 @@ impl AudioEngine {
             reclaim: reclaim_rx,
             telemetry,
             sample_rate,
+            channels: stream_config.channels,
+            embedded_cue_first_channel: embedded_cue,
             device_name: device.name().unwrap_or_else(|_| "Unknown output".into()),
             stream_failed,
             last_stream_error,
@@ -122,6 +147,15 @@ impl AudioEngine {
 
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// Headphone pair written by this stream, when the opened device has room for it.
+    pub fn embedded_cue_first_channel(&self) -> Option<u16> {
+        self.embedded_cue_first_channel
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -154,18 +188,82 @@ impl AudioEngine {
         }
     }
 
-    /// Send a control command to the audio thread. Errors if the ring is full (the UI
-    /// should coalesce rapid parameter changes).
-    pub fn send(&mut self, cmd: AudioCommand) -> Result<()> {
-        let r = match self.commands.push(cmd) {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                self.telemetry.inc_command_ring_full();
-                Err(CompasError::Other("audio command ring full".into()))
-            }
-        };
+    /// Preserve a full-ring command for ordered retry by its control-thread owner.
+    /// Ring-full telemetry counts attempts; the caller decides retry versus explicit rejection.
+    pub fn try_send_command(&mut self, cmd: AudioCommand) -> std::result::Result<(), AudioCommand> {
+        let result = push_command(&mut self.commands, &self.telemetry, cmd);
         self.drain_reclaimed();
-        r
+        result
+    }
+
+    /// Compatibility API: rejects/drops on the control thread if the ring is full.
+    pub fn send(&mut self, cmd: AudioCommand) -> Result<()> {
+        self.try_send_command(cmd)
+            .map_err(|_| CompasError::Other("audio command ring full".into()))
+    }
+}
+
+fn select_output_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::Device> {
+    let Some(want) = name else {
+        return host
+            .default_output_device()
+            .ok_or_else(|| CompasError::Device("no default output device".into()));
+    };
+    let mut matches = host
+        .output_devices()
+        .map_err(|error| CompasError::Device(error.to_string()))?
+        .filter(|device| device.name().is_ok_and(|device_name| device_name == want));
+    let device = matches
+        .next()
+        .ok_or_else(|| CompasError::Device(format!("output device '{want}' not found")))?;
+    if matches.next().is_some() {
+        return Err(CompasError::Device(format!(
+            "Multiple output devices are named '{want}'"
+        )));
+    }
+    Ok(device)
+}
+
+fn write_output_frame<T>(frame: &mut [T], master: (f32, f32), cue: Option<(usize, [f32; 2])>)
+where
+    T: FromSample<f32> + SizedSample,
+{
+    let (left, right) = master;
+    if frame.is_empty() {
+        return;
+    }
+    if frame.len() == 1 {
+        frame[0] = T::from_sample((left + right) * 0.5);
+        return;
+    }
+    frame[0] = T::from_sample(left);
+    frame[1] = T::from_sample(right);
+    for sample in frame.iter_mut().skip(2) {
+        *sample = T::from_sample(0.0);
+    }
+    let Some((first, signal)) = cue else {
+        return;
+    };
+    let Some(right_index) = first.checked_add(1) else {
+        return;
+    };
+    if first >= 2 && right_index < frame.len() {
+        frame[first] = T::from_sample(signal[0]);
+        frame[right_index] = T::from_sample(signal[1]);
+    }
+}
+
+fn push_command(
+    commands: &mut Producer<AudioCommand>,
+    telemetry: &DeckTelemetry,
+    command: AudioCommand,
+) -> std::result::Result<(), AudioCommand> {
+    match commands.push(command) {
+        Ok(()) => Ok(()),
+        Err(PushError::Full(command)) => {
+            telemetry.inc_command_ring_full();
+            Err(command)
+        }
     }
 }
 
@@ -174,6 +272,8 @@ fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     mut mixer: Mixer,
+    embedded_cue: Option<u16>,
+    embed_cue_live: Arc<AtomicBool>,
     stream_failed: Arc<AtomicBool>,
     last_stream_error: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream>
@@ -202,18 +302,15 @@ where
                     mixer.publish_latency(d.as_secs_f32());
                 }
                 mixer.drain_commands();
-                for frame in out.chunks_mut(channels) {
-                    let (l, r) = mixer.next_frame();
-                    match channels {
-                        1 => frame[0] = T::from_sample((l + r) * 0.5),
-                        _ => {
-                            frame[0] = T::from_sample(l);
-                            frame[1] = T::from_sample(r);
-                            for ch in frame.iter_mut().skip(2) {
-                                *ch = T::from_sample(0.0f32);
-                            }
-                        }
-                    }
+                if channels == 0 {
+                    return;
+                }
+                let cue_pair = embedded_cue.filter(|_| embed_cue_live.load(Ordering::Relaxed));
+                for frame in out.chunks_exact_mut(channels) {
+                    let buses = mixer.next_buses();
+                    let cue =
+                        cue_pair.map(|first| (usize::from(first), [buses.cue.0, buses.cue.1]));
+                    write_output_frame(frame, buses.master, cue);
                 }
                 // RT load = time spent in the callback ÷ this block's real-time budget.
                 let block_secs = (out.len() / channels) as f64 / sample_rate;
@@ -230,4 +327,66 @@ where
         )
         .map_err(|e| CompasError::Device(e.to_string()))?;
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn full_command_ring_returns_ownership_for_ordered_retry() {
+        let (mut tx, mut rx) = RingBuffer::new(1);
+        let telemetry = DeckTelemetry::new();
+        assert!(push_command(&mut tx, &telemetry, AudioCommand::SetMasterGain(0.5)).is_ok());
+        let buffer = Arc::new(compas_core::DeckBuffer::new(vec![0.0; 16], 48_000));
+        let weak = Arc::downgrade(&buffer);
+        let retained = push_command(
+            &mut tx,
+            &telemetry,
+            AudioCommand::LoadDeck {
+                deck: 0,
+                buffer,
+                beat_offset: 0.0,
+                beat_interval: 0.0,
+            },
+        )
+        .err()
+        .expect("full ring returns the owning command");
+        assert!(weak.upgrade().is_some());
+        assert_eq!(telemetry.command_ring_full(), 1);
+        assert!(matches!(
+            rx.pop().unwrap(),
+            AudioCommand::SetMasterGain(value) if value == 0.5
+        ));
+        assert!(push_command(&mut tx, &telemetry, retained).is_ok());
+        let loaded = rx.pop().unwrap();
+        assert!(matches!(loaded, AudioCommand::LoadDeck { deck: 0, .. }));
+        drop(loaded);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn master_pair_stays_on_outputs_1_and_2_and_cue_uses_3_and_4() {
+        let mut frame = [1.0_f32; 4];
+        write_output_frame(&mut frame, (0.25, -0.5), Some((2, [0.75, -0.25])));
+        assert_eq!(frame, [0.25, -0.5, 0.75, -0.25]);
+    }
+
+    #[test]
+    fn a_quiet_headphone_pair_does_not_replace_the_master() {
+        let mut frame = [1.0_f32; 4];
+        write_output_frame(&mut frame, (0.25, -0.5), None);
+        assert_eq!(frame, [0.25, -0.5, 0.0, 0.0]);
+        write_output_frame(&mut frame, (0.25, -0.5), Some((0, [0.9, 0.9])));
+        assert_eq!(frame, [0.25, -0.5, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn stereo_and_mono_outputs_keep_the_master_mix() {
+        let mut stereo = [0.0_f32; 2];
+        write_output_frame(&mut stereo, (0.4, -0.2), Some((2, [1.0, 1.0])));
+        assert_eq!(stereo, [0.4, -0.2]);
+        let mut mono = [0.0_f32; 1];
+        write_output_frame(&mut mono, (0.4, -0.2), None);
+        assert_eq!(mono, [0.1]);
+    }
 }

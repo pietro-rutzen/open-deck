@@ -1,6 +1,6 @@
 # OpenDeck project progress
 
-Updated: 2026-10-25 (Europe/Helsinki). This is the authoritative project resume index; task records contain detailed claims and evidence.
+Updated: 2026-10-30 (Europe/Helsinki). This is the authoritative project resume index; task records contain detailed claims and evidence.
 
 ## Current status
 
@@ -331,3 +331,33 @@ Owner root. [Task](tasks/T-019.md), [handoff](handoffs/T-019-20261026-01.md), [c
 - [x] Reopen final build for local-file practice.
 
 Owner root; reviewer deck_layout_review. [Task](tasks/T-020.md), [handoff](handoffs/T-020-20261028-01.md). No audio/controller logic changes; T019 physical qualification remains open.
+
+## T-021 — Controller-thread cue, loop, jump, and sync
+
+Hot cue, beat loop, manual loop, beat jump, quantize, and sync now enqueue engine commands on the controller thread, using the press-time playhead. Sampler trigger and stop do too, at the same velocity as an on-screen pad. The UI still owns mouse edits, key shift, and Beat FX. `compas-dj` lib tests cover the sampler press. Physical listening against a reference player is NOT RUN.
+
+
+## T022 — macOS desktop CI coverage
+
+- [x] Add explicit desktop app tests and a locked Tauri macOS bundle build to pull-request/main CI.
+- [x] Frontend and native bundle builds pass locally; independent workflow review and YAML validation pass.
+- [ ] Confirm hosted macOS run: local tests report 98 PASS, one Trash-permission failure; test remains enabled.
+
+Owner root; reviewer deck_layout_review. [Task](tasks/T-022.md), [handoff](handoffs/T-022-20261029-01.md). No application edits or release publishing.
+
+
+## T023 — FLX4 responsiveness and sampler loading
+
+- [x] Audit native loop/sampler paths; fix NoteOff release handling and tiny-loop adjustment panic.
+- [x] Off-UI bounded sampler loading, admission control before worker scheduling, and visible errors.
+- [x] 103 app tests pass (1 known Trash-permission test excluded locally), frontend/native build and independent review pass; native valid/invalid WAV loading verified.
+- [ ] Physical FLX4 latency, looping and sampler listening qualification.
+
+Owner root; controller specialist controller_audit; reviewer deck_layout_review. [Task](tasks/T-023.md), [handoff](handoffs/T-023-20261029-01.md).
+
+## T024 — Saturday speaker routing
+
+- [x] Choose speakers in the app. The default follows the Mac’s current output. DDJ-FLX4 master 1/2 with headphones 3/4 is an explicit choice.
+- [ ] Physical party rehearsal: FLX4 master plus headphones, and laptop-output playback. NOT RUN.
+
+Owner root. [Task](tasks/T-024.md), [handoff](handoffs/T-024-20261030-01.md). No latency or hardware certification. Beat FX and the listening pass remain open.

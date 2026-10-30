@@ -73,7 +73,8 @@ import { PaneDivider, useStoredSize } from './WorkspaceSplit';
 import { FolderNamePrompt, TrackMenu, type TrackMenuItem } from './TrackMenu';
 import { useLibrary } from '../hooks/useLibrary';
 import { Icon } from './icons';
-import { MiniWaveform, TrackCells, useTrackVisuals } from './LibraryVisuals';
+import { TrackCells } from './LibraryVisuals';
+import { TrackInspector } from './TrackInspector';
 
 const LIBRARY_ACCENT = 'var(--accent)';
 const VIEW_FOLDER_KEY = 'opendeck.library.folder.v1';
@@ -1018,8 +1019,6 @@ export const Library = memo(
       folderTracks.find((track) => track.path === selectedPath) ?? null;
     const selectedBrowse =
       browseRows.find((row) => row.key === browseKey) ?? null;
-    const visual = useTrackVisuals(selected?.path ?? null);
-    const selectedVisual = visual.status === 'ready' ? visual.data : undefined;
     useEffect(() => {
       if (!selectedPath) return;
       if (folderTracks.some((track) => track.path === selectedPath)) {
@@ -1717,189 +1716,35 @@ export const Library = memo(
           }
         >
           {selected ? (
-            <>
-              <div className="overline inspector-label">Track details</div>
-              <div className="inspector-artwork">
-                {selectedVisual?.artwork_data_url ? (
-                  <img
-                    src={selectedVisual.artwork_data_url}
-                    alt={`Cover art for ${selected.title}`}
-                  />
-                ) : (
-                  <div className="artwork-placeholder">
-                    <span aria-hidden="true">♫</span>
-                    <small>
-                      {visual.status === 'loading'
-                        ? 'Loading artwork…'
-                        : visual.status === 'unavailable'
-                          ? 'Artwork unavailable'
-                          : 'No embedded artwork'}
-                    </small>
-                  </div>
-                )}
-              </div>
-              <div className="inspector-heading">
-                <h3>
-                  {selectedVisual?.title ||
-                    selected.title ||
-                    baseName(selected.path)}
-                </h3>
-                <p>
-                  {selectedVisual?.artist ||
-                    selected.artist ||
-                    'Unknown artist'}
-                </p>
-                {selectedVisual?.album && (
-                  <p className="inspector-album">{selectedVisual.album}</p>
-                )}
-              </div>
-              <div className="inspector-wave">
-                {selectedVisual?.peaks.length ? (
-                  <MiniWaveform
-                    peaks={selectedVisual.peaks}
-                    bands={selectedVisual.band_peaks}
-                  />
-                ) : (
-                  <span className="mini-waveform-state">
-                    {visual.status === 'loading'
-                      ? 'Reading waveform…'
-                      : 'Waveform unavailable'}
-                  </span>
-                )}
-              </div>
-              <dl className="inspector-meta">
-                <div>
-                  <dt>Tempo</dt>
-                  <dd>
-                    {selected.bpm
-                      ? `${selected.bpm.toFixed(2)} BPM`
-                      : 'Not analyzed'}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Key</dt>
-                  <dd>
-                    {selected.key_camelot
-                      ? formatKey(
-                          selected.key_camelot,
-                          selected.key_name,
-                          keyNotation,
-                        )
-                      : 'Not analyzed'}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Duration</dt>
-                  <dd>{fmtMs(selected.duration_ms)}</dd>
-                </div>
-                {!listening && (
-                  <div>
-                    <dt>Plays</dt>
-                    <dd>{selected.play_count}</dd>
-                  </div>
-                )}
-                <div>
-                  <dt>Format</dt>
-                  <dd>
-                    {baseName(selected.path).includes('.')
-                      ? baseName(selected.path).split('.').pop()?.toUpperCase()
-                      : 'Unknown'}
-                  </dd>
-                </div>
-              </dl>
-              <div className="inspector-load" aria-label="Load selected track">
-                {DECKS.map((deck, i) => (
-                  <button
-                    key={deck.letter}
-                    style={{ color: deck.color, borderColor: deck.color }}
-                    onClick={() => load(i, selected.path)}
-                    title={`Load ${selected.title} onto Deck ${deck.letter}`}
-                  >
-                    Load {deck.letter}
-                  </button>
-                ))}
-              </div>
-              <div className="inspector-actions">
-                {nextDecks.map((deck) => {
-                  const loadedHere = loadedPaths[deck.index] === selected.path;
-                  const queued = readQueuedPaths(deck.index).includes(selected.path);
-                  return (
-                    <button
-                      key={deck.letter}
-                      className="chip"
-                      disabled={loadedHere || queued}
-                      title={
-                        loadedHere
-                          ? `Already loaded on deck ${deck.letter}`
-                          : queued
-                            ? `Already in deck ${deck.letter}'s Next queue`
-                            : `Add to deck ${deck.letter}'s Next queue, ahead of automatic suggestions`
-                      }
-                      onClick={() => queueTrack(deck.index, selected.path)}
-                    >
-                      {queued ? `Queued ${deck.letter}` : `Queue ${deck.letter}`}
-                    </button>
-                  );
-                })}
-              </div>
-              <div className="inspector-tags">
-                <div className="overline">Tags</div>
-                {selected.tags.map((tag) => (
-                  <button
-                    className="chip"
-                    key={tag}
-                    onClick={() => dropTag(selected.path, tag)}
-                    aria-label={`Remove tag ${tag}`}
-                  >
-                    {tag} ×
-                  </button>
-                ))}
-                {taggingPath === selected.path ? (
-                  <input
-                    autoFocus
-                    value={tagInput}
-                    placeholder="New tag"
-                    aria-label="New tag"
-                    onChange={(e) => setTagInput(e.target.value)}
-                    onBlur={() => commitTag(selected.path)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') commitTag(selected.path);
-                      else if (e.key === 'Escape') {
-                        setTaggingPath(null);
-                        setTagInput('');
-                      }
-                    }}
-                  />
-                ) : (
-                  <button
-                    className="chip"
-                    onClick={() => {
-                      setTaggingPath(selected.path);
-                      setTagInput('');
-                    }}
-                  >
-                    + Tag
-                  </button>
-                )}
-              </div>
-              <div className="inspector-file">
-                <div className="overline">File</div>
-                <p title={selected.path}>{selected.path}</p>
-              </div>
-              <details className="inspector-remove">
-                <summary>Library options</summary>
-                <button
-                  className="chip"
-                  onClick={() => {
-                    lib.remove(selected.path);
-                    setSelectedPath(null);
-                  }}
-                >
-                  Remove from library
-                </button>
-                <p>The original file stays on disk.</p>
-              </details>
-            </>
+            <TrackInspector
+              track={selected}
+              keyNotation={keyNotation}
+              showPlayCount={!listening}
+              decks={DECKS}
+              loadedPaths={loadedPaths}
+              nextDecks={nextDecks}
+              tagging={taggingPath === selected.path}
+              tagInput={tagInput}
+              onTagInput={setTagInput}
+              onBeginTag={() => {
+                setTaggingPath(selected.path);
+                setTagInput('');
+              }}
+              onCommitTag={() => commitTag(selected.path)}
+              onCancelTag={() => {
+                setTaggingPath(null);
+                setTagInput('');
+              }}
+              onDropTag={(tag) => dropTag(selected.path, tag)}
+              onLoad={(deck) => {
+                void load(deck, selected.path);
+              }}
+              onQueue={(deck) => queueTrack(deck, selected.path)}
+              onRemove={() => {
+                lib.remove(selected.path);
+                setSelectedPath(null);
+              }}
+            />
           ) : selectedBrowse?.kind === 'folder' ? (
             <div className="inspector-empty">
               <Icon name="folder" size={28} />
@@ -1912,7 +1757,7 @@ export const Library = memo(
               <span aria-hidden="true">♫</span>
               <h3>Your music, in detail</h3>
               <p>
-                Select a track to see artwork, waveform and file information.
+                Select a track to see its cover, file details and waveform.
               </p>
             </div>
           )}

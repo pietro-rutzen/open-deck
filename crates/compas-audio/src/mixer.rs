@@ -125,6 +125,11 @@ impl SyncMode {
 /// installs an `Arc<DeckBuffer>`; the Arc it replaces is pushed to the engine's reclaim
 /// ring so it is dropped on the control thread, never freed on the RT path.
 pub enum AudioCommand {
+    /// Controller receipt to ordered callback-barrier elapsed time. This proves only
+    /// queue traversal, not semantic command success, output/DAC, or physical USB latency.
+    LatencyProbe {
+        received: std::time::Instant,
+    },
     SetCrossfader(f32),
     /// Configure the crossfader response: `curve` (steepness, ≥0.25), `mode` (0 = constant-power,
     /// 1 = additive/cut), and `reverse` (swap A/B sides).
@@ -451,8 +456,12 @@ pub struct DeckTelemetry {
     rt_load_bits: AtomicU64,
     /// Count of blocks that overran their real-time budget (potential underruns).
     xruns: AtomicU64,
-    /// Control commands dropped because the SPSC command ring was full.
+    /// SPSC full attempts (including retries); this is pressure, not a count of lost actions.
     command_ring_full: AtomicU64,
+    controller_probe_count: AtomicU64,
+    controller_probe_last_us: AtomicU64,
+    controller_probe_max_us: AtomicU64,
+    controller_probe_histogram: [AtomicU64; 8],
     /// Master-record samples dropped because the record ring was full.
     record_ring_drops: AtomicU64,
     /// Headphone/cue samples dropped because the cue ring was full.
@@ -485,6 +494,10 @@ impl DeckTelemetry {
             rt_load_bits: AtomicU64::new(0),
             xruns: AtomicU64::new(0),
             command_ring_full: AtomicU64::new(0),
+            controller_probe_count: AtomicU64::new(0),
+            controller_probe_last_us: AtomicU64::new(0),
+            controller_probe_max_us: AtomicU64::new(0),
+            controller_probe_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
             record_ring_drops: AtomicU64::new(0),
             cue_ring_drops: AtomicU64::new(0),
             reclaim_ring_full: AtomicU64::new(0),
@@ -494,6 +507,33 @@ impl DeckTelemetry {
             at_cue: std::array::from_fn(|_| AtomicBool::new(false)),
             output_latency_bits: AtomicU64::new(0),
         }
+    }
+
+    pub fn controller_probe_count(&self) -> u64 {
+        self.controller_probe_count.load(Ordering::Relaxed)
+    }
+    pub fn controller_probe_last_us(&self) -> u64 {
+        self.controller_probe_last_us.load(Ordering::Relaxed)
+    }
+    pub fn controller_probe_max_us(&self) -> u64 {
+        self.controller_probe_max_us.load(Ordering::Relaxed)
+    }
+    /// Non-transactional diagnostic snapshot: <=1,2,4,8,16,32,64 ms, then >64 ms.
+    pub fn controller_probe_histogram(&self) -> [u64; 8] {
+        std::array::from_fn(|i| self.controller_probe_histogram[i].load(Ordering::Relaxed))
+    }
+    fn record_controller_probe(&self, micros: u64) {
+        const LIMITS: [u64; 7] = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000];
+        let bucket = LIMITS
+            .iter()
+            .position(|limit| micros <= *limit)
+            .unwrap_or(7);
+        self.controller_probe_last_us
+            .store(micros, Ordering::Relaxed);
+        self.controller_probe_max_us
+            .fetch_max(micros, Ordering::Relaxed);
+        self.controller_probe_histogram[bucket].fetch_add(1, Ordering::Relaxed);
+        self.controller_probe_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn tempo_only(&self, deck: usize) -> bool {
@@ -1676,6 +1716,10 @@ impl Mixer {
                 break;
             };
             match cmd {
+                AudioCommand::LatencyProbe { received } => {
+                    let micros = received.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                    self.telemetry.record_controller_probe(micros);
+                }
                 AudioCommand::SetCrossfader(p) => self.crossfader.set_position(p),
                 AudioCommand::SetCrossfaderConfig {
                     curve,
@@ -2287,6 +2331,13 @@ impl Mixer {
     }
 
     /// Compatibility master render; advances all buses exactly once.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "mixer tests and external callers still render through the master pair"
+        )
+    )]
     #[inline]
     pub fn next_frame(&mut self) -> (f32, f32) {
         self.next_buses().master
@@ -2347,6 +2398,44 @@ impl Mixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn callback_probe_is_ordered_and_measures_only_after_drain() {
+        let (mut tx, mut mixer) = mixer_with_commands();
+        tx.push(AudioCommand::SetDeckCue {
+            deck: 0,
+            active: true,
+        })
+        .unwrap();
+        tx.push(AudioCommand::LatencyProbe {
+            received: std::time::Instant::now() - std::time::Duration::from_millis(2),
+        })
+        .unwrap();
+        assert_eq!(mixer.telemetry.controller_probe_count(), 0);
+        mixer.drain_commands();
+        assert!(mixer.decks[0].cue);
+        assert_eq!(mixer.telemetry.controller_probe_count(), 1);
+        assert!(mixer.telemetry.controller_probe_last_us() >= 2_000);
+        assert_eq!(
+            mixer
+                .telemetry
+                .controller_probe_histogram()
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+    }
+    #[test]
+    fn controller_probe_histogram_has_fixed_boundaries_and_monotonic_max() {
+        let telemetry = DeckTelemetry::new();
+        for micros in [1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 64_001] {
+            telemetry.record_controller_probe(micros);
+        }
+        assert_eq!(telemetry.controller_probe_histogram(), [1; 8]);
+        telemetry.record_controller_probe(1);
+        assert_eq!(telemetry.controller_probe_count(), 9);
+        assert_eq!(telemetry.controller_probe_last_us(), 1);
+        assert_eq!(telemetry.controller_probe_max_us(), 64_001);
+    }
 
     #[test]
     fn crossfader_changes_master_but_never_headphone_preview() {

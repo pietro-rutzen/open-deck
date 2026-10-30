@@ -12,7 +12,7 @@ import { ControllerMap } from "./components/ControllerMap";
 import { Sampler } from "./components/Sampler";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ProfilePanel } from "./components/ProfilePanel";
-import { isNativeDeckControl, useDeck, type DeckController } from "./hooks/useDeck";
+import { isNativeDeckControl, isNativePerformanceControl, useDeck, type DeckController } from "./hooks/useDeck";
 import { BEAT_FX_LABELS, useBeatFx } from "./hooks/useBeatFx";
 import { useAutoMix } from "./hooks/useAutoMix";
 import { useCue } from "./hooks/useCue";
@@ -22,7 +22,7 @@ import { useInternalClock } from "./hooks/useInternalClock";
 import { useMidi } from "./hooks/useMidi";
 import { useMidiMap } from "./hooks/useMidiMap";
 import { useSampler } from "./hooks/useSampler";
-import { controllerLearn, controllerSession, onControllerSession, controllerFeedback, engineStatus, inTauri, onControllerBatch, onControllerUpdate, pickRecordingPath, pitchClassOf, setCrossfader, setCrossfaderConfig, setDeckFxMacro, setMasterGain, startRecording, stopRecording, type ControllerUpdate, type EngineStatus, type KeyNotation } from "./lib/ipc";
+import { controllerLearn, controllerSession, onControllerSession, controllerFeedback, engineStatus, inTauri, onAudioOutputReset, onControllerBatch, onControllerUpdate, performanceSetSyncPartner, pickRecordingPath, pitchClassOf, setCrossfader, setCrossfaderConfig, setDeckFxMacro, setMasterGain, startRecording, stopRecording, type ControllerUpdate, type EngineStatus, type KeyNotation } from "./lib/ipc";
 import { useWindowFrame } from "./lib/windowFrame";
 
 const DECK_COLORS = ["var(--deck-a)", "var(--deck-b)", "var(--deck-c)", "var(--deck-d)"];
@@ -48,7 +48,7 @@ export function App() {
   const decks = [deckA, deckB, deckC, deckD];
 
   const [sampleRate, setSampleRate] = useState<number | null>(null);
-  const [audioStatus, setAudioStatus] = useState<Pick<EngineStatus, "audio_online" | "audio_restarting" | "audio_restarts" | "audio_error" | "cue_device_latency_secs" | "cue_prime_latency_secs" | "booth_device_latency_secs" | "booth_prime_latency_secs"> | null>(null);
+  const [audioStatus, setAudioStatus] = useState<Pick<EngineStatus, "audio_online" | "audio_restarting" | "audio_restarts" | "audio_error" | "master_device" | "master_fallback" | "master_embedded_headphones" | "cue_device_latency_secs" | "cue_prime_latency_secs" | "booth_device_latency_secs" | "booth_prime_latency_secs"> | null>(null);
   const [xfade, setXfade] = useState(0.5);
   const [showKeys, setShowKeys] = useState(false);
   const [showMap, setShowMap] = useState(false);
@@ -86,6 +86,13 @@ export function App() {
   const [rightSel, setRightSel] = useState(1);
   const leftDeck = decks[leftSel];
   const rightDeck = decks[rightSel];
+  useEffect(() => {
+    if (!inTauri()) return;
+    for (let deck = 0; deck < decks.length; deck += 1) {
+      const partner = deck === leftSel ? rightSel : deck === rightSel ? leftSel : null;
+      performanceSetSyncPartner(deck, partner).catch(() => {});
+    }
+  }, [leftSel, rightSel, decks.length]);
 
   const applyCrossfade = useCallback((v: number) => {
     setXfade(v);
@@ -102,6 +109,19 @@ export function App() {
     setXfReverse(reverse);
     if (inTauri()) setCrossfaderConfig(curve, additive ? 1 : 0, reverse).catch(() => {});
   }, []);
+  useEffect(() => {
+    if (!inTauri()) return;
+    let alive = true;
+    const unlisten = onAudioOutputReset(() => {
+      if (!alive) return;
+      setCrossfader(xfade).catch(() => {});
+      setCrossfaderConfig(xfCurve, xfAdditive ? 1 : 0, xfReverse).catch(() => {});
+    });
+    return () => {
+      alive = false;
+      void unlisten.then((stop) => stop()).catch(() => {});
+    };
+  }, [xfade, xfCurve, xfAdditive, xfReverse]);
   const auto = useAutoMix([leftDeck, rightDeck], applyCrossfade);
 
   const applyFxMacro = useCallback((deck: number, v: number) => {
@@ -121,6 +141,9 @@ export function App() {
             audio_restarting: s.audio_restarting,
             audio_restarts: s.audio_restarts,
             audio_error: s.audio_error,
+            master_device: s.master_device,
+            master_fallback: s.master_fallback,
+            master_embedded_headphones: s.master_embedded_headphones,
             cue_device_latency_secs: s.cue_device_latency_secs,
             cue_prime_latency_secs: s.cue_prime_latency_secs,
             booth_device_latency_secs: s.booth_device_latency_secs,
@@ -135,6 +158,9 @@ export function App() {
             audio_restarting: false,
             audio_restarts: 0,
             audio_error: "engine status unavailable",
+            master_device: null,
+            master_fallback: false,
+            master_embedded_headphones: false,
             cue_device_latency_secs: 0,
             cue_prime_latency_secs: 0,
             booth_device_latency_secs: 0,
@@ -234,13 +260,19 @@ export function App() {
 
   // Native controller thread already applied these to the engine; UI state only reflects them.
   const reflectRef = useRef<(u: ControllerUpdate) => void>(() => {});
-  reflectRef.current = ({ control, value }: ControllerUpdate) => {
+  reflectRef.current = (update: ControllerUpdate) => {
+    const { control, value } = update;
     if (!Number.isFinite(value)) return;
     if (control === "mixer.crossfader") return setXfade(value);
     const deckMatch = control.match(/^deck\.(\d+)\.(.+)$/);
     const deckController = deckMatch ? decks[Number(deckMatch[1])] : undefined;
-    if (deckController && deckMatch && isNativeDeckControl(deckMatch[2])) {
+    if (!deckController || !deckMatch) return;
+    if (isNativeDeckControl(deckMatch[2])) {
       deckController.actions.reflectController(deckMatch[2], value);
+      return;
+    }
+    if (isNativePerformanceControl(deckMatch[2])) {
+      deckController.actions.reflectPerformance(deckMatch[2], update);
     }
   };
 

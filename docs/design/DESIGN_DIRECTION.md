@@ -80,3 +80,7 @@ Normal A/B controls must remain visible as the upper pane shrinks. Use container
 ## Responsive hierarchy (T020, 2026-10-28)
 
 Treat resize adaptability as a standing requirement for every UI change. Prioritize Play/Cue, tempo and headphone monitoring, with bounded container-relative sizing and compact spacing. Preserve the user's preferred large waveform height when space allows; temporarily cap its displayed height to reserve usable control space, and restore it automatically on expansion. Waveform drag, keyboard and accessibility values must reflect rendered geometry. Very small panes retain scrolling rather than overlapping controls. Verify short and tall panes; do not infer narrow-window or quad-mode coverage from a wide screenshot.
+
+## Track inspector density
+
+The library inspector uses a square segmented control: Summary, Info, and Artwork. Summary keeps a 64px cover beside the title so time, tempo, key and file details stay visible without scrolling past a full-size image. Artwork is the full-size view. Info lists embedded tags the file actually contains, plus library tags and the path. Missing credits are omitted. Sample rate comes from the file header. Bitrate is the PCM rate when bit depth is known; otherwise it is an average from size and duration, labeled average. The inspector does not edit embedded tags or replace artwork.

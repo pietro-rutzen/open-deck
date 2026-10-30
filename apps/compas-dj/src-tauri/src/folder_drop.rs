@@ -70,16 +70,13 @@ pub fn plan_remove_from_folder(source: &Path, music_dir: &Path) -> Result<Planne
     if parent_is_inside(source, &destination) {
         return Err("This track is already in removed from playlists".to_string());
     }
-    fs::create_dir_all(&destination).map_err(|error| {
-        format!(
-            "Could not create {}: {error}",
-            destination.display()
-        )
-    })?;
+    fs::create_dir_all(&destination)
+        .map_err(|error| format!("Could not create {}: {error}", destination.display()))?;
     let planned = plan_audio_moves(&destination, &[path_text(source)?])?;
-    planned.into_iter().next().ok_or_else(|| {
-        "This track is already in removed from playlists".to_string()
-    })
+    planned
+        .into_iter()
+        .next()
+        .ok_or_else(|| "This track is already in removed from playlists".to_string())
 }
 
 fn parent_is_inside(source: &Path, destination: &Path) -> bool {

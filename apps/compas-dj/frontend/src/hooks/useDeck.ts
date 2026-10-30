@@ -7,6 +7,10 @@ import {
   deckSeek,
   deckUnload,
   setDeckKeylock,
+  setDeckEffect,
+  effectsSnapshot,
+  onEffectsUpdate,
+  type EffectsSnapshot,
   setDeckPitchShift,
   inTauri,
   loadTrack,
@@ -15,16 +19,13 @@ import {
   onDeckLoading,
   onLibraryPathsMoved,
   onDeckPosition,
+  onAudioOutputReset,
   pickAudioFile,
   setBeatgrid,
   setDeckSync,
   setDeckSyncLive,
   setDeckSyncInternal,
   setDeckXfaderAssign,
-  setDeckEcho,
-  setDeckReverb,
-  setDeckFlanger,
-  setDeckCrusher,
   setDeckEq,
   setDeckEqBand,
   setDeckFilter,
@@ -40,6 +41,12 @@ import {
   setCueMode as setCueModeCmd,
   setDeckSyncMode as setDeckSyncModeCmd,
   setSyncLeader as setSyncLeaderCmd,
+  performanceSetHotCue,
+  performanceSetHotCues,
+  performanceSetJumpScale,
+  performanceSetLoop,
+  performanceSetQuantize,
+  performanceSetSynced,
   dbClearCue,
   dbClearLoop,
   dbRecordPlay,
@@ -49,6 +56,7 @@ import {
   dbSetLoop,
   dbTrackState,
   dbUpsertAnalysis,
+  type ControllerUpdate,
   type DeckLoaded,
   type FilterMode,
 } from "../lib/ipc";
@@ -71,6 +79,13 @@ export const NATIVE_DECK_CONTROLS = ["volume", "trim", "eq.low", "eq.mid", "eq.h
 export type NativeDeckControl = (typeof NATIVE_DECK_CONTROLS)[number];
 export const isNativeDeckControl = (control: string): control is NativeDeckControl =>
   (NATIVE_DECK_CONTROLS as readonly string[]).includes(control);
+
+const NATIVE_PERFORMANCE_CONTROL =
+  /^(?:hotcue|clear_hotcue|beatloop|beatjump)\.\d$|^(?:loop\.(?:in|out|toggle|half|double|reloop_stop|nudge_in|nudge_out)|jump\.(?:back|forward)|beatjump\.scale_(?:down|up)|quantize|sync)$/;
+
+/** Cue, loop, jump, quantize, and sync actions the controller thread applies itself. */
+export const isNativePerformanceControl = (control: string): boolean =>
+  NATIVE_PERFORMANCE_CONTROL.test(control);
 
 const TRIM_PERSIST_DELAY_MS = 250;
 
@@ -262,34 +277,35 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         ? meta!.beat_interval_sec
         : NO_GRID_BEAT_SEC;
 
-  // Translate the UI echo (beat-synced time + single "depth") to engine params.
-  const applyEcho = useCallback(
-    (e: EchoState) => {
-      const timeSec = fxBeatSec * e.beats;
-      const feedback = 0.15 + e.depth * 0.7; // 0.15..0.85
-      const mix = e.active ? e.depth * 0.5 : 0; // up to half-wet
-      setDeckEcho(deck, e.active, timeSec, feedback, mix).catch(() => {});
-    },
-    [deck, fxBeatSec],
-  );
-  // Beat-synced flanger: the LFO period is `beats` long; depth drives sweep + resonance.
-  const applyFlanger = useCallback(
-    (f: FlangerState) => {
-      const period = fxBeatSec * f.beats;
-      const rateHz = period > 0 ? 1 / period : 0.3;
-      const feedback = 0.35 + f.depth * 0.5; // 0.35..0.85
-      const mix = f.active ? 0.5 : 0; // classic 50/50 flange
-      setDeckFlanger(deck, f.active, rateHz, f.depth, feedback, mix).catch(() => {});
-    },
-    [deck, fxBeatSec],
-  );
-  // Re-push active beat-synced FX when the effective tempo source changes (clock BPM edit, INT
-  // toggle, or a new grid on load) so the audible delay/LFO keeps tracking without a chip re-toggle.
   useEffect(() => {
-    if (!dsp) return;
-    if (echoRef.current.active) applyEcho(echoRef.current);
-    if (flangerRef.current.active) applyFlanger(flangerRef.current);
-  }, [dsp, applyEcho, applyFlanger]);
+    if (!inTauri()) return;
+    let disposed = false;
+    let revision = -1;
+    const reflect = (snapshot: EffectsSnapshot) => {
+      if (disposed || snapshot.revision <= revision) return;
+      const next = snapshot.decks[deck];
+      if (!next) return;
+      revision = snapshot.revision;
+      echoRef.current = next.echo; setEchoState(next.echo);
+      flangerRef.current = next.flanger; setFlangerState(next.flanger);
+      reverbRef.current = next.reverb; setReverbState(next.reverb);
+      crusherRef.current = next.crusher; setCrusherState(next.crusher);
+      pitchShiftRef.current = next.pitch_shift; setPitchShiftState(next.pitch_shift);
+    };
+    const subscription = onEffectsUpdate(reflect);
+    subscription.then(() => effectsSnapshot()).then(reflect).catch(() => {});
+    return () => { disposed = true; subscription.then(unlisten => unlisten()); };
+  }, [deck]);
+  const applyEcho = useCallback((e: EchoState) => {
+    setDeckEffect(deck, { effect: 'echo', ...e }).catch(error => setError(String(error)));
+  }, [deck]);
+  const applyFlanger = useCallback((f: FlangerState) => {
+    setDeckEffect(deck, { effect: 'flanger', ...f }).catch(error => setError(String(error)));
+  }, [deck]);
+  useEffect(() => {
+    if (!inTauri()) return;
+    setDeckEffect(deck, { effect: 'beat_sec', seconds: fxBeatSec }).catch(error => setError(String(error)));
+  }, [deck, fxBeatSec]);
   // Path of the loaded track + a once-per-load guard for recording a play.
   const pathRef = useRef<string | null>(null);
   const playedRef = useRef(false);
@@ -315,6 +331,23 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
     let active = true;
     const track = (p: Promise<UnlistenFn>) => p.then((u) => (active ? unlistens.push(u) : u()));
 
+    track(
+      onAudioOutputReset(() => {
+        const flatEq = { hi: 0, mid: 0, low: 0 };
+        eqRef.current = flatEq;
+        setEqState(flatEq);
+        setFilterState(0);
+        tempoRef.current = 1;
+        setTempo(1);
+        if (!pathRef.current) return;
+        pathRef.current = null;
+        gainLoadRef.current += 1;
+        setMeta(null);
+        setPlaying(false);
+        setLoading(false);
+        setError("Speakers changed. Load this deck again.");
+      }),
+    );
     track(
       onDeckLoading((e) => {
         if (e.deck !== deck) return;
@@ -383,16 +416,19 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
                 const arr: (number | null)[] = Array(8).fill(null);
                 for (const c of st.cues) if (c.slot >= 0 && c.slot < 8) arr[c.slot] = c.frame;
                 setHotCues(arr);
+                performanceSetHotCues(deck, arr).catch(() => {});
               }
               // Restore the saved loop region, but leave it disarmed (don't jump the play-head).
               const lp = st.loops.find((l) => l.slot === 0);
               if (lp) {
-                setLoopState({
+                const restored = {
                   active: false,
                   beats: lp.beats,
                   inFrame: lp.in_frame,
                   outFrame: lp.out_frame,
-                });
+                };
+                setLoopState(restored);
+                performanceSetLoop(deck, restored.inFrame, restored.outFrame, false, false, restored.beats).catch(() => {});
               }
             })
             .catch(() => {
@@ -461,18 +497,19 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
     // Per-track persistence is keyed by file path and only for local (DSP) decks.
     const path = meta?.path ?? null;
     const canPersist = dsp && !!path;
+    const publishLoop = (next: LoopState) => {
+      performanceSetLoop(deck, next.inFrame, next.outFrame, next.active, !!next.armed, next.beats).catch(swallow);
+    };
     // Beat-synced echo/flanger pushes are defined at component scope (they track the internal
     // clock via `fxBeatSec` and re-push on tempo change); alias them here for the setters below.
     const pushEcho = applyEcho;
     const pushFlanger = applyFlanger;
     const pushReverb = (r: ReverbState) => {
-      setDeckReverb(deck, r.active, r.size, r.active ? r.mix : 0).catch(swallow);
+      setDeckEffect(deck, { effect: "reverb", ...r }).catch(swallow);
     };
     // Bitcrusher: crush 0..1 → 16..2 bits; down 0..1 → 1..32× sample-and-hold. Full wet.
     const pushCrusher = (c: CrusherState) => {
-      const bits = Math.round(16 - c.crush * 14);
-      const downsample = 1 + Math.round(c.down * 31);
-      setDeckCrusher(deck, c.active, bits, downsample, c.active ? 1 : 0).catch(swallow);
+      setDeckEffect(deck, { effect: "crusher", ...c }).catch(swallow);
     };
     // Current beatgrid in source frames (interval + first-beat offset incl. manual nudge), or
     // null when the track has no grid. Read live so a grid nudge takes effect immediately.
@@ -565,6 +602,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
           setSyncInternalState(false);
         }
         setDeckSync(deck, master).catch(swallow);
+        performanceSetSynced(deck, master !== null).catch(swallow);
       },
       // Tempo-match the live mic/aux beat clock (mutually exclusive with deck and internal sync).
       toggleSyncLive: () => {
@@ -714,6 +752,58 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
           }
         }
       },
+      reflectPerformance: (control: string, update: ControllerUpdate) => {
+        const mirror = update.performance;
+        const cue = control.match(/^(hotcue|clear_hotcue)\.(\d)$/);
+        if (cue) {
+          const slot = Number(cue[2]);
+          if (cue[1] === "clear_hotcue") {
+            setHotCues((current) => {
+              const next = [...current];
+              next[slot] = null;
+              return next;
+            });
+            if (canPersist) dbClearCue(path as string, slot).catch(swallow);
+            return;
+          }
+          const frame = mirror?.hot_cue_frame;
+          if (frame == null || !Number.isFinite(frame)) return;
+          setHotCues((current) => {
+            const next = [...current];
+            next[slot] = frame;
+            return next;
+          });
+          if (canPersist) dbSetCue(path as string, slot, frame).catch(swallow);
+          return;
+        }
+        if (mirror?.quantize != null) setQuantize(mirror.quantize);
+        if (mirror?.jump_scale != null && Number.isFinite(mirror.jump_scale)) {
+          beatJumpScaleRef.current = mirror.jump_scale;
+          setBeatJumpScale(mirror.jump_scale);
+        }
+        if (mirror?.synced != null) {
+          setSyncedState(mirror.synced);
+          if (mirror.synced) {
+            setSyncLiveState(false);
+            setSyncInternalState(false);
+            setSyncModeState(0);
+          }
+        }
+        if (mirror?.loop_in == null || mirror.loop_out == null) return;
+        const next: LoopState = {
+          inFrame: mirror.loop_in,
+          outFrame: mirror.loop_out,
+          active: mirror.loop_active ?? false,
+          armed: mirror.loop_armed ?? false,
+          beats: mirror.clear_loop_beats ? null : (mirror.loop_beats ?? null),
+        };
+        loopRef.current = next;
+        setLoopState(next);
+        if (!canPersist || !next.active) return;
+        if (control.startsWith("beatloop.") || control === "loop.out") {
+          dbSetLoop(path as string, 0, next.inFrame, next.outFrame, next.beats).catch(swallow);
+        }
+      },
       setHotCue: (i: number, atFrame = frameRef.current) => {
         setHotCues((cur) => {
           const next = [...cur];
@@ -721,6 +811,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
           if (next[i] == null) {
             next[i] = atFrame;
             if (canPersist) dbSetCue(path as string, i, atFrame).catch(swallow);
+            performanceSetHotCue(deck, i, atFrame).catch(swallow);
           } else {
             const target = quantizeRef.current ? snapBeat(next[i] as number) : (next[i] as number);
             deckSeek(deck, target).catch(swallow);
@@ -735,6 +826,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
           return next;
         });
         if (canPersist) dbClearCue(path as string, i).catch(swallow);
+        performanceSetHotCue(deck, i, null).catch(swallow);
       },
       beatLoop: (beats: number, atFrame = frameRef.current) => {
         if (!meta || (meta.beat_interval_sec ?? 0) <= 0) return;
@@ -747,29 +839,44 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         const cur = loopRef.current;
         if (cur.active && cur.beats === beats) {
           setLoopActiveCmd(deck, false).catch(swallow);
-          setLoopState({ ...cur, active: false });
+          const next = { ...cur, active: false };
+          setLoopState(next);
+          publishLoop(next);
         } else {
           setLoopCmd(deck, inFrame, outFrame, true).catch(swallow);
-          setLoopState({ active: true, beats, inFrame, outFrame });
+          const next = { active: true, beats, inFrame, outFrame };
+          setLoopState(next);
+          publishLoop(next);
           if (canPersist) dbSetLoop(path as string, 0, inFrame, outFrame, beats).catch(swallow);
         }
       },
       // Arm the loop: store the in-point and light IN until OUT lands (no engine loop yet).
-      loopIn: (atFrame = frameRef.current) => setLoopState((l) => ({ ...l, inFrame: atFrame, beats: null, armed: true })),
+      loopIn: (atFrame = frameRef.current) => {
+        const next = { ...loopRef.current, inFrame: atFrame, beats: null, armed: true };
+        loopRef.current = next;
+        setLoopState(next);
+        publishLoop(next);
+      },
       loopOut: (atFrame = frameRef.current) => {
         const out = atFrame;
         const l = loopRef.current;
         if (out > l.inFrame) {
           setLoopCmd(deck, l.inFrame, out, true).catch(swallow);
-          setLoopState({ active: true, beats: null, inFrame: l.inFrame, outFrame: out, armed: false });
+          const next = { active: true, beats: null, inFrame: l.inFrame, outFrame: out, armed: false };
+          loopRef.current = next;
+          setLoopState(next);
+          publishLoop(next);
           if (canPersist) dbSetLoop(path as string, 0, l.inFrame, out, null).catch(swallow);
         }
       },
       toggleLoop: () => {
         const l = loopRef.current;
         if (l.outFrame <= l.inFrame) return;
-        setLoopCmd(deck, l.inFrame, l.outFrame, !l.active).catch(swallow);
-        setLoopState({ ...l, active: !l.active, armed: false });
+        const next = { ...l, active: !l.active, armed: false };
+        setLoopCmd(deck, l.inFrame, l.outFrame, next.active).catch(swallow);
+        loopRef.current = next;
+        setLoopState(next);
+        publishLoop(next);
       },
       // Pioneer SHIFT+RELOOP: return to the stored loop, engage it and stop on its in-point.
       reloopAndStop: () => {
@@ -778,24 +885,33 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         deckPause(deck).catch(swallow);
         setLoopCmd(deck, l.inFrame, l.outFrame, true).catch(swallow);
         deckSeek(deck, l.inFrame).catch(swallow);
-        setLoopState({ ...l, active: true, armed: false });
+        const next = { ...l, active: true, armed: false };
+        loopRef.current = next;
+        setLoopState(next);
+        publishLoop(next);
       },
       clearLoop: () => {
         setLoopActiveCmd(deck, false).catch(swallow);
-        setLoopState((l) => ({ ...l, active: false, armed: false }));
+        setLoopState((l) => {
+          const next = { ...l, active: false, armed: false };
+          publishLoop(next);
+          return next;
+        });
         if (canPersist) dbClearLoop(path as string, 0).catch(swallow);
       },
       // Halve/double the active loop, anchored at the loop-in. Mirror the new length locally.
       scaleLoop: (factor: number) => {
         scaleLoopCmd(deck, factor).catch(swallow);
         setLoopState((l) => {
-          if (!l.active || l.outFrame <= l.inFrame) return l;
+          if (l.outFrame <= l.inFrame) return l;
           const len = Math.max(8, (l.outFrame - l.inFrame) * factor);
-          return {
+          const next = {
             ...l,
             outFrame: l.inFrame + len,
             beats: l.beats != null ? l.beats * factor : null,
           };
+          publishLoop(next);
+          return l.active ? next : l;
         });
       },
       // Shift the active loop by whole beats (or ~50 ms when there's no grid).
@@ -803,9 +919,12 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         const g = grid();
         const delta = g ? g.interval * deltaBeats : (meta?.source_rate ?? 44100) * 0.05 * Math.sign(deltaBeats);
         moveLoopCmd(deck, delta).catch(swallow);
-        setLoopState((l) =>
-          l.active ? { ...l, inFrame: Math.max(0, l.inFrame + delta), outFrame: l.outFrame + delta } : l,
-        );
+        setLoopState((l) => {
+          if (!l.active) return l;
+          const next = { ...l, inFrame: Math.max(0, l.inFrame + delta), outFrame: l.outFrame + delta };
+          publishLoop(next);
+          return next;
+        });
       },
       // Main CUE button (press/release) → engine cue state machine (CDJ preview / gated stutter).
       cueButton: (pressed: boolean) => cueButtonCmd(deck, pressed).catch(swallow),
@@ -824,7 +943,11 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         setIsLeaderState(next);
         setSyncLeaderCmd(deck, next).catch(swallow);
       },
-      toggleQuantize: () => setQuantize((q) => !q),
+      toggleQuantize: () => setQuantize((q) => {
+        const next = !q;
+        performanceSetQuantize(deck, next).catch(swallow);
+        return next;
+      }),
       // Jump the play-head by whole beats (negative = back). When quantize is on, the jump
       // starts from the nearest beat so repeated jumps stay grid-aligned.
       beatJump: (beats: number, fromFrame = frameRef.current) => {
@@ -839,6 +962,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         const next = Math.min(16, Math.max(1 / 16, beatJumpScaleRef.current * factor));
         beatJumpScaleRef.current = next;
         setBeatJumpScale(next);
+        performanceSetJumpScale(deck, next).catch(swallow);
       },
       setTempoRange: (percent: number) => {
         const allowed = [6, 8, 10, 16, 100];
@@ -868,6 +992,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         if (next.inFrame === current.inFrame && next.outFrame === current.outFrame) return;
         loopRef.current = next;
         setLoopState(next);
+        publishLoop(next);
         setLoopCmd(deck, next.inFrame, next.outFrame, next.active).catch(swallow);
       },
       // Momentary loop-roll with slip. Engaging loops the sub-beat region at the play-head;
@@ -885,63 +1010,75 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
       },
       toggleEcho: () => {
         const next = { ...echoRef.current, active: !echoRef.current.active };
+        echoRef.current = next;
         setEchoState(next);
         pushEcho(next);
       },
       setEchoBeats: (beats: number) => {
         const next = { ...echoRef.current, beats };
+        echoRef.current = next;
         setEchoState(next);
-        if (next.active) pushEcho(next);
+        pushEcho(next);
       },
       setEchoDepth: (depth: number) => {
         const next = { ...echoRef.current, depth };
+        echoRef.current = next;
         setEchoState(next);
-        if (next.active) pushEcho(next);
+        pushEcho(next);
       },
       toggleReverb: () => {
         const next = { ...reverbRef.current, active: !reverbRef.current.active };
+        reverbRef.current = next;
         setReverbState(next);
         pushReverb(next);
       },
       setReverbSize: (size: number) => {
         const next = { ...reverbRef.current, size };
+        reverbRef.current = next;
         setReverbState(next);
-        if (next.active) pushReverb(next);
+        pushReverb(next);
       },
       setReverbMix: (mix: number) => {
         const next = { ...reverbRef.current, mix };
+        reverbRef.current = next;
         setReverbState(next);
-        if (next.active) pushReverb(next);
+        pushReverb(next);
       },
       toggleFlanger: () => {
         const next = { ...flangerRef.current, active: !flangerRef.current.active };
+        flangerRef.current = next;
         setFlangerState(next);
         pushFlanger(next);
       },
       setFlangerBeats: (beats: number) => {
         const next = { ...flangerRef.current, beats };
+        flangerRef.current = next;
         setFlangerState(next);
-        if (next.active) pushFlanger(next);
+        pushFlanger(next);
       },
       setFlangerDepth: (depth: number) => {
         const next = { ...flangerRef.current, depth };
+        flangerRef.current = next;
         setFlangerState(next);
-        if (next.active) pushFlanger(next);
+        pushFlanger(next);
       },
       toggleCrusher: () => {
         const next = { ...crusherRef.current, active: !crusherRef.current.active };
+        crusherRef.current = next;
         setCrusherState(next);
         pushCrusher(next);
       },
       setCrusherCrush: (crush: number) => {
         const next = { ...crusherRef.current, crush };
+        crusherRef.current = next;
         setCrusherState(next);
-        if (next.active) pushCrusher(next);
+        pushCrusher(next);
       },
       setCrusherDown: (down: number) => {
         const next = { ...crusherRef.current, down };
+        crusherRef.current = next;
         setCrusherState(next);
-        if (next.active) pushCrusher(next);
+        pushCrusher(next);
       },
     };
   }, [deck, playing, tempo, meta, isLeader, syncLive, syncInternal, applyEcho, applyFlanger]);

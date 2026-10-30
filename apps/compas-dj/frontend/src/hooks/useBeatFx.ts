@@ -1,4 +1,5 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { effectsSnapshot, onEffectsUpdate, inTauri, type EffectsSnapshot } from "../lib/ipc";
 import type { DeckController } from "./useDeck";
 
 export const BEAT_FX_EFFECTS = ["echo", "flanger", "reverb", "crusher"] as const;
@@ -70,6 +71,20 @@ export function useBeatFx() {
     selectionRef.current = next;
     setSelection(next);
   };
+
+  useEffect(() => {
+    if (!inTauri()) return;
+    let disposed = false;
+    let revision = -1;
+    const reflect = (snapshot: EffectsSnapshot) => {
+      if (disposed || snapshot.revision <= revision) return;
+      revision = snapshot.revision;
+      select({ effect: snapshot.effect, deck: snapshot.deck });
+    };
+    const subscription = onEffectsUpdate(reflect);
+    subscription.then(() => effectsSnapshot()).then(reflect).catch(() => {});
+    return () => { disposed = true; subscription.then(unlisten => unlisten()); };
+  }, []);
 
   /** Returns true when `control` belongs to the Beat FX unit. */
   const handle = (control: string, value: number, decks: DeckController[]): boolean => {

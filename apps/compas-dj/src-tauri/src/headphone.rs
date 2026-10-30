@@ -89,11 +89,14 @@ fn publish(app: &AppHandle) {
         let _ = app.emit("cue:session", s);
     }
 }
-fn report(app: &AppHandle, error: &str) {
+pub(crate) fn report(app: &AppHandle, error: &str) {
     if let Ok(mut inner) = app.state::<CueState>().inner.lock() {
         inner.session.error = Some(error.to_owned());
     }
     publish(app);
+}
+pub(crate) fn cue_enabled(app: &AppHandle) -> Result<bool, String> {
+    snapshot(app).map(|session| session.enabled)
 }
 fn feedback(app: &AppHandle, deck: usize, active: bool) {
     app.state::<super::controllers::ControllerEngine>().send(
@@ -213,16 +216,51 @@ pub(crate) fn initialize(app: &AppHandle) {
     if let Ok(mut sender) = app.state::<CueState>().controller_tx.lock() {
         *sender = Some(tx);
     }
-    let app = app.clone();
+    let controller_app = app.clone();
     std::thread::spawn(move || {
         while let Ok((control, value)) = rx.recv() {
             let mut batch = vec![(control, value)];
             while let Ok(next) = rx.try_recv() {
                 batch.push(next);
             }
-            if let Err(error) = apply_controller_batch(&app, &rx, batch) {
-                report(&app, &error);
+            if let Err(error) = apply_controller_batch(&controller_app, &rx, batch) {
+                report(&controller_app, &error);
             }
+        }
+    });
+    arm_saved_headphones(app);
+}
+fn arm_saved_headphones(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        for _ in 0..40 {
+            if !app
+                .state::<EngineHandle>()
+                .audio
+                .online
+                .load(Ordering::Relaxed)
+            {
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+            let cue = app.state::<CueState>();
+            let Ok(_operation) = cue.operation.lock() else {
+                return;
+            };
+            if snapshot(&app)
+                .map(|session| session.enabled)
+                .unwrap_or(true)
+            {
+                return;
+            }
+            let Ok(route) = selected_route(&app) else {
+                return;
+            };
+            match start_locked(&app, &route) {
+                Ok(_) => publish(&app),
+                Err(error) => report(&app, &error),
+            }
+            return;
         }
     });
 }
@@ -272,6 +310,10 @@ fn stop_locked(app: &AppHandle, leds: bool) -> Result<(), String> {
         inner.session.connected_name = None;
         (inner.stop.take(), inner.worker.take(), old_cued)
     };
+    app.state::<EngineHandle>()
+        .audio
+        .embed_cue_live
+        .store(false, Ordering::Relaxed);
     if let Some(stop) = stop {
         let _ = stop.send(());
     }
@@ -292,8 +334,87 @@ fn stop_locked(app: &AppHandle, leds: bool) -> Result<(), String> {
     }
     Ok(())
 }
+fn release_monitor_worker(app: &AppHandle) -> Result<(), String> {
+    let (stop, worker) = {
+        let cue = app.state::<CueState>();
+        let mut inner = cue.inner.lock().map_err(|error| error.to_string())?;
+        inner.generation = inner.generation.wrapping_add(1);
+        (inner.stop.take(), inner.worker.take())
+    };
+    if let Some(stop) = stop {
+        let _ = stop.send(());
+    }
+    if let Some(worker) = worker {
+        if worker.thread().id() != std::thread::current().id() {
+            let _ = worker.join();
+        }
+    }
+    app.state::<EngineHandle>().send(EngineMsg::StopCueOutput)
+}
+fn stream_embeds(app: &AppHandle, route: &Route) -> bool {
+    let audio = &app.state::<EngineHandle>().audio;
+    if !audio.online.load(Ordering::Relaxed) || !audio.embedded_active.load(Ordering::Relaxed) {
+        return false;
+    }
+    if audio.embedded_cue_channel.load(Ordering::Relaxed) != route.first_channel {
+        return false;
+    }
+    audio
+        .master_device
+        .lock()
+        .ok()
+        .and_then(|name| name.clone())
+        .as_deref()
+        == Some(route.device.as_str())
+}
+fn enable_embedded(app: &AppHandle, route: &Route) -> Result<String, String> {
+    validate_safe_route(app, route)?;
+    release_monitor_worker(app)?;
+    app.state::<EngineHandle>()
+        .audio
+        .embed_cue_live
+        .store(true, Ordering::Relaxed);
+    {
+        let cue = app.state::<CueState>();
+        let mut inner = cue.inner.lock().map_err(|error| error.to_string())?;
+        inner.session.device = Some(route.device.clone());
+        inner.session.first_channel = route.first_channel;
+        inner.session.enabled = true;
+        inner.session.connected_name = Some(route.device.clone());
+        inner.session.error = None;
+    }
+    if let Err(error) = save_route(app, route) {
+        report(
+            app,
+            &format!("Headphones active; could not remember routing: {error}"),
+        );
+    }
+    Ok(route.device.clone())
+}
+pub(crate) fn rearm_after_master_change(
+    app: &AppHandle,
+    headphones_were_enabled: bool,
+) -> Result<(), String> {
+    let cue = app.state::<CueState>();
+    let _operation = cue.operation.lock().map_err(|error| error.to_string())?;
+    if !headphones_were_enabled {
+        app.state::<EngineHandle>()
+            .audio
+            .embed_cue_live
+            .store(false, Ordering::Relaxed);
+        publish(app);
+        return Ok(());
+    }
+    let route = selected_route(app)?;
+    start_locked(app, &route)?;
+    publish(app);
+    Ok(())
+}
 fn start_locked(app: &AppHandle, route: &Route) -> Result<String, String> {
     validate_safe_route(app, route)?;
+    if stream_embeds(app, route) {
+        return enable_embedded(app, route);
+    }
     let engine = app.state::<EngineHandle>();
     if !engine.audio.online.load(Ordering::Relaxed) {
         return Err("Master audio engine is offline; headphones could not start".into());
@@ -316,6 +437,7 @@ fn start_locked(app: &AppHandle, route: &Route) -> Result<String, String> {
     let device = route.device.clone();
     let first = route.first_channel;
     let latency = cue.latency.clone();
+    let source_route = engine.audio.route_generation.load(Ordering::Relaxed);
     let spawn = std::thread::Builder::new()
         .name("opendeck-headphones".into())
         .spawn(move || {
@@ -336,6 +458,9 @@ fn start_locked(app: &AppHandle, route: &Route) -> Result<String, String> {
                             Ok(()) | Err(RecvTimeoutError::Disconnected) => break None,
                             Err(RecvTimeoutError::Timeout) => {
                                 let engine = worker_app.state::<EngineHandle>();
+                                if engine.audio.route_generation.load(Ordering::Relaxed) != source_route {
+                                    break None;
+                                }
                                 if !engine.audio.online.load(Ordering::Relaxed)
                                     || engine.audio.sample_rate.load(Ordering::Relaxed) != source_rate
                                     || engine.audio.restarts.load(Ordering::Relaxed) != source_generation

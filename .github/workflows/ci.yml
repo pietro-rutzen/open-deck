@@ -74,6 +74,37 @@ jobs:
         working-directory: apps/compas-dj/frontend
         run: npm run build
 
+  macos-app:
+    name: macOS desktop app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/compas-dj/frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-app
+      - name: Install frontend dependencies
+        working-directory: apps/compas-dj/frontend
+        run: npm ci
+      # The native crate embeds the frontend assets and is not a default workspace member.
+      - name: Build frontend assets
+        working-directory: apps/compas-dj/frontend
+        run: npm run build
+      - name: Test desktop application
+        run: cargo test --locked -p compas-dj --lib
+      # Exercise the real Tauri bundle path without publishing or release credentials.
+      - name: Build macOS app bundle
+        working-directory: apps/compas-dj
+        run: frontend/node_modules/.bin/tauri build --debug --bundles app -- --locked
+
   versions:
     name: Version consistency
     runs-on: ubuntu-latest

@@ -1,8 +1,10 @@
 //! Controller-originated mixer and transport commands resolved on the controller thread and sent
 //! straight to the engine queue, so performance controls never round-trip through React/IPC.
 use crate::EngineMsg;
-use compas_audio::{DeckTelemetry, FilterMode, NUM_DECKS};
+use compas_audio::{DeckTelemetry, FilterMode, NUM_DECKS, NUM_SAMPLER_PADS};
+use serde::Serialize;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 const EQ_BANDS: usize = 3;
 const EQ_LOW: usize = 0;
@@ -54,7 +56,26 @@ pub(crate) fn clamp_eq_db(value: f32) -> Option<f32> {
 /// without re-sending it to the engine.
 pub(crate) struct NativeAction {
     pub message: Option<EngineMsg>,
+    /// Further engine commands applied in order after `message` (sync sends mode, tempo, then follow).
+    pub messages: Vec<EngineMsg>,
     pub mirror: bool,
+    /// Replaces the control value the UI reflects, when the musical result is not the raw MIDI value.
+    pub mirror_value: Option<f64>,
+    /// Loop, cue, quantize, sync, and beat-jump state the UI displays. The engine command already ran.
+    pub performance: Option<PerformanceMirror>,
+    /// Extra controls to mirror, such as the tempo fader after sync.
+    pub extra_mirrors: Vec<(String, f64)>,
+}
+
+fn single(message: Option<EngineMsg>, mirror: bool) -> NativeAction {
+    NativeAction {
+        message,
+        messages: Vec::new(),
+        mirror,
+        mirror_value: None,
+        performance: None,
+        extra_mirrors: Vec::new(),
+    }
 }
 
 pub(crate) struct FilterSettings {
@@ -86,6 +107,33 @@ pub(crate) fn filter_settings(position: f64) -> FilterSettings {
     }
 }
 
+/// Same fixed velocity as an on-screen pad click. The control bus only reports press or release.
+const SAMPLE_VELOCITY: u8 = 110;
+
+/// Sampler trigger and stop. The sample is already in the engine, so the press only has to start it.
+fn sampler_action(control: &str, value: f64) -> Option<NativeAction> {
+    let (slot, action) = control.strip_prefix("sampler.")?.split_once('.')?;
+    if action != "trigger" && action != "stop" {
+        return None;
+    }
+    let slot = slot.parse::<usize>().ok()?;
+    if slot >= NUM_SAMPLER_PADS {
+        return None;
+    }
+    if !value.is_finite() || value < 0.5 {
+        return Some(single(None, false));
+    }
+    let message = if action == "trigger" {
+        EngineMsg::TriggerSample {
+            slot,
+            velocity: SAMPLE_VELOCITY,
+        }
+    } else {
+        EngineMsg::StopSample { slot }
+    };
+    Some(single(Some(message), false))
+}
+
 fn deck_control(control: &str) -> Option<(usize, &str)> {
     let rest = control.strip_prefix("deck.")?;
     let (index, name) = rest.split_once('.')?;
@@ -100,27 +148,19 @@ pub(crate) fn resolve(
     value: f64,
     telemetry: &DeckTelemetry,
     eq: &DeckEqState,
+    performance: &PerformanceState,
+    captured: Option<CapturedPosition>,
 ) -> Option<NativeAction> {
+    if let Some(action) = sampler_action(control, value) {
+        return Some(action);
+    }
     let (deck, name) = deck_control(control)?;
     if !value.is_finite() {
-        return Some(NativeAction {
-            message: None,
-            mirror: false,
-        });
+        return Some(single(None, false));
     }
     let pressed = value >= 0.5;
-    let mirrored = |message: EngineMsg| {
-        Some(NativeAction {
-            message: Some(message),
-            mirror: true,
-        })
-    };
-    let unmirrored = |message: Option<EngineMsg>| {
-        Some(NativeAction {
-            message,
-            mirror: false,
-        })
-    };
+    let mirrored = |message: EngineMsg| Some(single(Some(message), true));
+    let unmirrored = |message: Option<EngineMsg>| Some(single(message, false));
     let eq_band = |band: usize| {
         let db = value.clamp(-EQ_LIMIT_DB, EQ_LIMIT_DB) as f32;
         eq.with_band(deck, band, db)?;
@@ -165,7 +205,7 @@ pub(crate) fn resolve(
             active: pressed,
         })),
         "start" => unmirrored(pressed.then_some(EngineMsg::DeckSeek { deck, frame: 0.0 })),
-        _ => None,
+        _ => performance_action(control, deck, name, value, telemetry, performance, captured),
     }
 }
 
@@ -193,12 +233,654 @@ pub(crate) fn capture_position(
         .then_some(CapturedPosition { frame, heard_frame })
 }
 
+const HOT_CUES: usize = 8;
+const BEAT_LOOP_BEATS: [f64; HOT_CUES] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+const BEAT_JUMP_BEATS: [f64; HOT_CUES] = [-1.0, 1.0, -2.0, 2.0, -4.0, 4.0, -8.0, 8.0];
+const JUMP_SCALE_MIN: f64 = 1.0 / 16.0;
+const JUMP_SCALE_MAX: f64 = 16.0;
+const LOOP_MIN_FRAMES: f64 = 8.0;
+
+/// Display state for a controller action the engine has already applied.
+#[derive(Serialize, Clone, Default)]
+pub(crate) struct PerformanceMirror {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_in: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_out: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_armed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_beats: Option<f64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub clear_loop_beats: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_cue_frame: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jump_scale: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantize: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synced: Option<bool>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Clone)]
+struct DeckSnapshot {
+    hot_cues: [Option<f64>; HOT_CUES],
+    quantize: bool,
+    grid_offset: f64,
+    grid_interval: f64,
+    jump_scale: f64,
+    loop_in: f64,
+    loop_out: f64,
+    loop_active: bool,
+    loop_armed: bool,
+    loop_beats: Option<f64>,
+    source_rate: f64,
+    bpm: f64,
+    synced: bool,
+    partner: Option<usize>,
+}
+
+impl Default for DeckSnapshot {
+    fn default() -> Self {
+        Self {
+            hot_cues: [None; HOT_CUES],
+            quantize: false,
+            grid_offset: 0.0,
+            grid_interval: 0.0,
+            jump_scale: 1.0,
+            loop_in: 0.0,
+            loop_out: 0.0,
+            loop_active: false,
+            loop_armed: false,
+            loop_beats: None,
+            source_rate: 0.0,
+            bpm: 0.0,
+            synced: false,
+            partner: None,
+        }
+    }
+}
+
+/// Hot-cue, loop, grid, and sync memory read on the controller thread.
+/// The audio callback never locks this.
+pub(crate) struct PerformanceState {
+    decks: [Mutex<DeckSnapshot>; NUM_DECKS],
+}
+
+impl Default for PerformanceState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PerformanceState {
+    pub(crate) fn new() -> Self {
+        Self {
+            decks: std::array::from_fn(|_| Mutex::new(DeckSnapshot::default())),
+        }
+    }
+
+    fn with_deck<T>(&self, deck: usize, update: impl FnOnce(&mut DeckSnapshot) -> T) -> Option<T> {
+        let deck = self.decks.get(deck)?;
+        let mut snapshot = deck.lock().unwrap_or_else(|poison| poison.into_inner());
+        Some(update(&mut snapshot))
+    }
+
+    pub(crate) fn set_hot_cue(&self, deck: usize, slot: usize, frame: Option<f64>) {
+        if slot >= HOT_CUES {
+            return;
+        }
+        let frame = frame.filter(|frame| frame.is_finite());
+        self.with_deck(deck, |snapshot| snapshot.hot_cues[slot] = frame);
+    }
+
+    pub(crate) fn set_hot_cues(&self, deck: usize, frames: &[Option<f64>]) {
+        self.with_deck(deck, |snapshot| {
+            for (slot, frame) in frames.iter().enumerate().take(HOT_CUES) {
+                snapshot.hot_cues[slot] = frame.filter(|frame| frame.is_finite());
+            }
+        });
+    }
+
+    pub(crate) fn set_loop(
+        &self,
+        deck: usize,
+        in_frame: f64,
+        out_frame: f64,
+        active: bool,
+        armed: bool,
+        beats: Option<f64>,
+    ) {
+        if !in_frame.is_finite() || !out_frame.is_finite() {
+            return;
+        }
+        let beats = beats.filter(|beats| beats.is_finite());
+        self.with_deck(deck, |snapshot| {
+            snapshot.loop_in = in_frame;
+            snapshot.loop_out = out_frame;
+            snapshot.loop_active = active;
+            snapshot.loop_armed = armed;
+            snapshot.loop_beats = beats;
+        });
+    }
+
+    pub(crate) fn set_quantize(&self, deck: usize, enabled: bool) {
+        self.with_deck(deck, |snapshot| snapshot.quantize = enabled);
+    }
+
+    pub(crate) fn set_jump_scale(&self, deck: usize, scale: f64) {
+        if !scale.is_finite() || scale <= 0.0 {
+            return;
+        }
+        self.with_deck(deck, |snapshot| {
+            snapshot.jump_scale = scale.clamp(JUMP_SCALE_MIN, JUMP_SCALE_MAX);
+        });
+    }
+
+    pub(crate) fn set_synced(&self, deck: usize, synced: bool) {
+        self.with_deck(deck, |snapshot| snapshot.synced = synced);
+    }
+
+    pub(crate) fn set_partner(&self, deck: usize, partner: Option<usize>) {
+        let partner = partner.filter(|partner| *partner < NUM_DECKS && *partner != deck);
+        self.with_deck(deck, |snapshot| snapshot.partner = partner);
+    }
+
+    pub(crate) fn set_grid(&self, deck: usize, offset: f64, interval: f64) {
+        if !offset.is_finite() || !interval.is_finite() {
+            return;
+        }
+        self.with_deck(deck, |snapshot| {
+            snapshot.grid_offset = offset;
+            snapshot.grid_interval = interval.max(0.0);
+        });
+    }
+
+    /// Drop the previous track's cues, loop, and grid as the new buffer is installed.
+    pub(crate) fn install_track(
+        &self,
+        deck: usize,
+        offset: f64,
+        interval: f64,
+        source_rate: f64,
+        bpm: f64,
+    ) {
+        self.with_deck(deck, |snapshot| {
+            snapshot.hot_cues = [None; HOT_CUES];
+            snapshot.loop_in = 0.0;
+            snapshot.loop_out = 0.0;
+            snapshot.loop_active = false;
+            snapshot.loop_armed = false;
+            snapshot.loop_beats = None;
+            snapshot.synced = false;
+            snapshot.grid_offset = if offset.is_finite() { offset } else { 0.0 };
+            snapshot.grid_interval = if interval.is_finite() {
+                interval.max(0.0)
+            } else {
+                0.0
+            };
+            snapshot.source_rate = if source_rate.is_finite() {
+                source_rate.max(0.0)
+            } else {
+                0.0
+            };
+            snapshot.bpm = if bpm.is_finite() { bpm.max(0.0) } else { 0.0 };
+        });
+    }
+
+    pub(crate) fn clear_deck(&self, deck: usize) {
+        self.install_track(deck, 0.0, 0.0, 0.0, 0.0);
+    }
+}
+
+fn snap_beat(frame: f64, offset: f64, interval: f64) -> f64 {
+    offset + ((frame - offset) / interval).round() * interval
+}
+
+fn beat_loop_bounds(heard: f64, beats: f64, offset: f64, interval: f64) -> (f64, f64) {
+    let in_frame = (offset + ((heard - offset) / interval).round() * interval).max(0.0);
+    (in_frame, in_frame + beats * interval)
+}
+
+fn loop_mirror(snapshot: &DeckSnapshot) -> PerformanceMirror {
+    PerformanceMirror {
+        loop_in: Some(snapshot.loop_in),
+        loop_out: Some(snapshot.loop_out),
+        loop_active: Some(snapshot.loop_active),
+        loop_armed: Some(snapshot.loop_armed),
+        loop_beats: snapshot.loop_beats,
+        clear_loop_beats: snapshot.loop_beats.is_none(),
+        ..PerformanceMirror::default()
+    }
+}
+
+fn mirrored_loop(snapshot: &DeckSnapshot, message: Option<EngineMsg>) -> NativeAction {
+    let mut action = single(message, true);
+    action.performance = Some(loop_mirror(snapshot));
+    action
+}
+
+fn performance_action(
+    control: &str,
+    deck: usize,
+    name: &str,
+    value: f64,
+    telemetry: &DeckTelemetry,
+    performance: &PerformanceState,
+    captured: Option<CapturedPosition>,
+) -> Option<NativeAction> {
+    let loaded = telemetry.is_loaded(deck);
+    let tempos = std::array::from_fn(|index| telemetry.tempo_ratio(index));
+    let position = captured.or_else(|| capture_position(control, telemetry));
+    apply_performance(deck, name, value, loaded, position, &tempos, performance)
+}
+
+fn apply_performance(
+    deck: usize,
+    name: &str,
+    value: f64,
+    loaded: bool,
+    position: Option<CapturedPosition>,
+    tempos: &[f64; NUM_DECKS],
+    performance: &PerformanceState,
+) -> Option<NativeAction> {
+    let pressed = value >= 0.5;
+    if name == "quantize" && pressed {
+        return performance.with_deck(deck, |snapshot| {
+            snapshot.quantize = !snapshot.quantize;
+            let enabled = snapshot.quantize;
+            let mut action = single(None, true);
+            action.mirror_value = Some(if enabled { 1.0 } else { 0.0 });
+            action.performance = Some(PerformanceMirror {
+                quantize: Some(enabled),
+                ..PerformanceMirror::default()
+            });
+            action
+        });
+    }
+    if pressed && (name == "beatjump.scale_down" || name == "beatjump.scale_up") {
+        let factor = if name == "beatjump.scale_down" {
+            JUMP_SCALE_MIN
+        } else {
+            JUMP_SCALE_MAX
+        };
+        return performance.with_deck(deck, |snapshot| {
+            snapshot.jump_scale =
+                (snapshot.jump_scale * factor).clamp(JUMP_SCALE_MIN, JUMP_SCALE_MAX);
+            let scale = snapshot.jump_scale;
+            let mut action = single(None, true);
+            action.mirror_value = Some(scale);
+            action.performance = Some(PerformanceMirror {
+                jump_scale: Some(scale),
+                ..PerformanceMirror::default()
+            });
+            action
+        });
+    }
+    if name == "sync" && pressed {
+        return sync_action(deck, tempos, performance);
+    }
+    if !loaded {
+        return None;
+    }
+    if name == "loop.nudge_in" || name == "loop.nudge_out" {
+        return nudge_loop(deck, value, name == "loop.nudge_in", performance);
+    }
+    if !pressed {
+        return None;
+    }
+    if let Some(slot) = pad_slot(name, "hotcue") {
+        return hot_cue_action(deck, slot, position, performance);
+    }
+    if let Some(slot) = pad_slot(name, "clear_hotcue") {
+        performance.set_hot_cue(deck, slot, None);
+        return Some(single(None, true));
+    }
+    if let Some(slot) = pad_slot(name, "beatloop") {
+        let heard = position?.heard_frame;
+        return beat_loop_action(deck, BEAT_LOOP_BEATS[slot], heard, performance);
+    }
+    if let Some(slot) = pad_slot(name, "beatjump") {
+        let frame = position?.frame;
+        return beat_jump_action(deck, BEAT_JUMP_BEATS[slot], frame, performance);
+    }
+    let heard = position.as_ref().map(|position| position.heard_frame);
+    let frame = position.as_ref().map(|position| position.frame);
+    match name {
+        "loop.in" => arm_loop(deck, heard?, performance),
+        "loop.out" => finish_loop(deck, heard?, performance),
+        "loop.toggle" => toggle_loop(deck, performance),
+        "loop.half" => scale_loop_action(deck, 0.5, performance),
+        "loop.double" => scale_loop_action(deck, 2.0, performance),
+        "loop.reloop_stop" => reloop_stop(deck, performance),
+        "jump.back" => beat_jump_action(deck, -4.0, frame?, performance),
+        "jump.forward" => beat_jump_action(deck, 4.0, frame?, performance),
+        _ => None,
+    }
+}
+
+fn pad_slot(name: &str, action: &str) -> Option<usize> {
+    let slot = name.strip_prefix(action)?.strip_prefix('.')?;
+    let index = slot.parse::<usize>().ok()?;
+    (index < HOT_CUES).then_some(index)
+}
+
+fn hot_cue_action(
+    deck: usize,
+    slot: usize,
+    position: Option<CapturedPosition>,
+    performance: &PerformanceState,
+) -> Option<NativeAction> {
+    let heard = position?.heard_frame.max(0.0);
+    performance.with_deck(deck, |snapshot| {
+        if let Some(stored) = snapshot.hot_cues[slot] {
+            let target = if snapshot.quantize {
+                snapped(stored, snapshot).max(0.0)
+            } else {
+                stored
+            };
+            single(
+                Some(EngineMsg::DeckSeek {
+                    deck,
+                    frame: target,
+                }),
+                false,
+            )
+        } else {
+            snapshot.hot_cues[slot] = Some(heard);
+            let mut action = single(None, true);
+            action.performance = Some(PerformanceMirror {
+                hot_cue_frame: Some(heard),
+                ..PerformanceMirror::default()
+            });
+            action
+        }
+    })
+}
+
+fn snapped(frame: f64, snapshot: &DeckSnapshot) -> f64 {
+    if snapshot.grid_interval > 0.0 {
+        snap_beat(frame, snapshot.grid_offset, snapshot.grid_interval)
+    } else {
+        frame
+    }
+}
+
+fn beat_jump_action(
+    deck: usize,
+    beats: f64,
+    from_frame: f64,
+    performance: &PerformanceState,
+) -> Option<NativeAction> {
+    performance.with_deck(deck, |snapshot| {
+        if snapshot.grid_interval <= 0.0 {
+            return None;
+        }
+        let base = if snapshot.quantize {
+            snap_beat(from_frame, snapshot.grid_offset, snapshot.grid_interval)
+        } else {
+            from_frame
+        };
+        let target = (base + beats * snapshot.jump_scale * snapshot.grid_interval).max(0.0);
+        Some(single(
+            Some(EngineMsg::DeckSeek {
+                deck,
+                frame: target,
+            }),
+            false,
+        ))
+    })?
+}
+
+fn beat_loop_action(
+    deck: usize,
+    beats: f64,
+    heard: f64,
+    performance: &PerformanceState,
+) -> Option<NativeAction> {
+    performance.with_deck(deck, |snapshot| {
+        if snapshot.grid_interval <= 0.0 {
+            return None;
+        }
+        let same_length = snapshot.loop_active
+            && snapshot
+                .loop_beats
+                .is_some_and(|stored| (stored - beats).abs() < 1e-9);
+        if same_length {
+            snapshot.loop_active = false;
+            return Some(mirrored_loop(
+                snapshot,
+                Some(EngineMsg::LoopActive {
+                    deck,
+                    active: false,
+                }),
+            ));
+        }
+        let (in_frame, out_frame) =
+            beat_loop_bounds(heard, beats, snapshot.grid_offset, snapshot.grid_interval);
+        snapshot.loop_in = in_frame;
+        snapshot.loop_out = out_frame;
+        snapshot.loop_active = true;
+        snapshot.loop_armed = false;
+        snapshot.loop_beats = Some(beats);
+        Some(mirrored_loop(
+            snapshot,
+            Some(EngineMsg::Loop {
+                deck,
+                in_frame,
+                out_frame,
+                active: true,
+            }),
+        ))
+    })?
+}
+
+fn arm_loop(deck: usize, heard: f64, performance: &PerformanceState) -> Option<NativeAction> {
+    performance.with_deck(deck, |snapshot| {
+        snapshot.loop_in = heard.max(0.0);
+        snapshot.loop_beats = None;
+        snapshot.loop_armed = true;
+        mirrored_loop(snapshot, None)
+    })
+}
+
+fn finish_loop(deck: usize, heard: f64, performance: &PerformanceState) -> Option<NativeAction> {
+    performance.with_deck(deck, |snapshot| {
+        let out_frame = heard.max(0.0);
+        if out_frame <= snapshot.loop_in {
+            return single(None, false);
+        }
+        snapshot.loop_out = out_frame;
+        snapshot.loop_active = true;
+        snapshot.loop_armed = false;
+        snapshot.loop_beats = None;
+        mirrored_loop(
+            snapshot,
+            Some(EngineMsg::Loop {
+                deck,
+                in_frame: snapshot.loop_in,
+                out_frame,
+                active: true,
+            }),
+        )
+    })
+}
+
+fn toggle_loop(deck: usize, performance: &PerformanceState) -> Option<NativeAction> {
+    performance.with_deck(deck, |snapshot| {
+        if snapshot.loop_out <= snapshot.loop_in {
+            return single(None, false);
+        }
+        snapshot.loop_active = !snapshot.loop_active;
+        snapshot.loop_armed = false;
+        mirrored_loop(
+            snapshot,
+            Some(EngineMsg::Loop {
+                deck,
+                in_frame: snapshot.loop_in,
+                out_frame: snapshot.loop_out,
+                active: snapshot.loop_active,
+            }),
+        )
+    })
+}
+
+fn scale_loop_action(
+    deck: usize,
+    factor: f64,
+    performance: &PerformanceState,
+) -> Option<NativeAction> {
+    performance.with_deck(deck, |snapshot| {
+        let mut action = single(Some(EngineMsg::ScaleLoop { deck, factor }), false);
+        if snapshot.loop_out > snapshot.loop_in {
+            let length = ((snapshot.loop_out - snapshot.loop_in) * factor).max(LOOP_MIN_FRAMES);
+            snapshot.loop_out = snapshot.loop_in + length;
+            snapshot.loop_beats = snapshot.loop_beats.map(|beats| beats * factor);
+            snapshot.loop_armed = false;
+            action.mirror = true;
+            action.performance = Some(loop_mirror(snapshot));
+        }
+        action
+    })
+}
+
+fn reloop_stop(deck: usize, performance: &PerformanceState) -> Option<NativeAction> {
+    performance.with_deck(deck, |snapshot| {
+        if snapshot.loop_out <= snapshot.loop_in {
+            return single(None, false);
+        }
+        snapshot.loop_active = true;
+        snapshot.loop_armed = false;
+        let mut action = mirrored_loop(snapshot, None);
+        action.messages = vec![
+            EngineMsg::DeckPlaying {
+                deck,
+                playing: false,
+            },
+            EngineMsg::Loop {
+                deck,
+                in_frame: snapshot.loop_in,
+                out_frame: snapshot.loop_out,
+                active: true,
+            },
+            EngineMsg::DeckSeek {
+                deck,
+                frame: snapshot.loop_in,
+            },
+        ];
+        action
+    })
+}
+
+fn nudge_loop(
+    deck: usize,
+    counts: f64,
+    nudge_in: bool,
+    performance: &PerformanceState,
+) -> Option<NativeAction> {
+    if counts == 0.0 || !counts.is_finite() {
+        return None;
+    }
+    let ready = performance.with_deck(deck, |snapshot| {
+        snapshot.source_rate > 0.0 && snapshot.loop_out > snapshot.loop_in
+    })?;
+    if !ready {
+        return None;
+    }
+    performance.with_deck(deck, |snapshot| {
+        let delta = counts * snapshot.source_rate * 0.01;
+        // Legacy/restored/manual loops can be shorter than the adjustment minimum.
+        // Restore the invariant before clamp: an out point below eight frames would
+        // otherwise make its upper bound negative and panic the controller worker.
+        snapshot.loop_out = snapshot.loop_out.max(snapshot.loop_in + LOOP_MIN_FRAMES);
+        if nudge_in {
+            snapshot.loop_in =
+                (snapshot.loop_in + delta).clamp(0.0, snapshot.loop_out - LOOP_MIN_FRAMES);
+        } else {
+            snapshot.loop_out = (snapshot.loop_out + delta).max(snapshot.loop_in + LOOP_MIN_FRAMES);
+        }
+        snapshot.loop_beats = None;
+        mirrored_loop(
+            snapshot,
+            Some(EngineMsg::Loop {
+                deck,
+                in_frame: snapshot.loop_in,
+                out_frame: snapshot.loop_out,
+                active: snapshot.loop_active,
+            }),
+        )
+    })
+}
+
+fn sync_action(
+    deck: usize,
+    tempos: &[f64; NUM_DECKS],
+    performance: &PerformanceState,
+) -> Option<NativeAction> {
+    let (synced, partner, own_bpm) = performance.with_deck(deck, |snapshot| {
+        (snapshot.synced, snapshot.partner, snapshot.bpm)
+    })?;
+    if synced {
+        performance.set_synced(deck, false);
+        let mut action = single(Some(EngineMsg::DeckSync { deck, master: None }), true);
+        action.performance = Some(PerformanceMirror {
+            synced: Some(false),
+            ..PerformanceMirror::default()
+        });
+        return Some(action);
+    }
+    let partner = partner?;
+    if own_bpm <= 0.0 || partner >= NUM_DECKS {
+        return None;
+    }
+    let partner_bpm = performance.with_deck(partner, |snapshot| snapshot.bpm)?;
+    let partner_tempo = tempos[partner];
+    if partner_bpm <= 0.0 || !partner_tempo.is_finite() || partner_tempo <= 0.0 {
+        return None;
+    }
+    let ratio = partner_bpm * partner_tempo / own_bpm;
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return None;
+    }
+    performance.set_synced(deck, true);
+    let mut action = single(None, true);
+    action.messages = vec![
+        EngineMsg::SetDeckSyncMode { deck, mode: 0 },
+        EngineMsg::DeckTempo { deck, ratio },
+        EngineMsg::DeckSync {
+            deck,
+            master: Some(partner),
+        },
+    ];
+    action.performance = Some(PerformanceMirror {
+        synced: Some(true),
+        ..PerformanceMirror::default()
+    });
+    action.extra_mirrors = vec![(format!("deck.{deck}.tempo"), (ratio - 1.0) * 100.0)];
+    Some(action)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn resolved(control: &str, value: f64, eq: &DeckEqState) -> NativeAction {
-        resolve(control, value, &DeckTelemetry::new(), eq).expect("native control")
+        resolve(
+            control,
+            value,
+            &DeckTelemetry::new(),
+            eq,
+            &PerformanceState::new(),
+            None,
+        )
+        .expect("native control")
     }
 
     #[test]
@@ -214,7 +896,15 @@ mod tests {
             "deck.x.volume",
         ] {
             assert!(
-                resolve(control, 1.0, &telemetry, &eq).is_none(),
+                resolve(
+                    control,
+                    1.0,
+                    &telemetry,
+                    &eq,
+                    &PerformanceState::new(),
+                    None,
+                )
+                .is_none(),
                 "{control}"
             );
         }
@@ -301,8 +991,226 @@ mod tests {
     }
 
     #[test]
+    fn sampler_pads_trigger_and_stop_without_the_ui() {
+        let eq = DeckEqState::default();
+        let performance = PerformanceState::new();
+        let telemetry = DeckTelemetry::new();
+        let trigger = resolve(
+            "sampler.3.trigger",
+            1.0,
+            &telemetry,
+            &eq,
+            &performance,
+            None,
+        )
+        .expect("trigger");
+        assert!(matches!(
+            trigger.message,
+            Some(EngineMsg::TriggerSample {
+                slot: 3,
+                velocity: 110
+            })
+        ));
+        assert!(!trigger.mirror);
+        let release = resolve(
+            "sampler.3.trigger",
+            0.0,
+            &telemetry,
+            &eq,
+            &performance,
+            None,
+        )
+        .expect("release");
+        assert!(release.message.is_none());
+        let stop =
+            resolve("sampler.1.stop", 1.0, &telemetry, &eq, &performance, None).expect("stop");
+        assert!(matches!(
+            stop.message,
+            Some(EngineMsg::StopSample { slot: 1 })
+        ));
+        assert!(resolve("sampler.gain", 0.5, &telemetry, &eq, &performance, None).is_none());
+        assert!(resolve(
+            "sampler.8.trigger",
+            1.0,
+            &telemetry,
+            &eq,
+            &performance,
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
     fn position_capture_requires_a_loaded_deck() {
         assert!(capture_position("deck.0.hotcue.0", &DeckTelemetry::new()).is_none());
         assert!(capture_position("mixer.crossfader", &DeckTelemetry::new()).is_none());
+    }
+
+    fn at(frame: f64, heard: f64) -> CapturedPosition {
+        CapturedPosition {
+            frame,
+            heard_frame: heard,
+        }
+    }
+
+    fn perform(
+        name: &str,
+        position: Option<CapturedPosition>,
+        performance: &PerformanceState,
+    ) -> Option<NativeAction> {
+        apply_performance(0, name, 1.0, true, position, &[1.0; NUM_DECKS], performance)
+    }
+
+    #[test]
+    fn hot_cue_stores_the_heard_frame_and_later_seeks_there() {
+        let performance = PerformanceState::new();
+        let set = perform("hotcue.0", Some(at(20_000.0, 10_000.0)), &performance).expect("set");
+        assert!(set.message.is_none());
+        assert_eq!(
+            set.performance.and_then(|mirror| mirror.hot_cue_frame),
+            Some(10_000.0)
+        );
+        let jump = perform("hotcue.0", Some(at(50_000.0, 40_000.0)), &performance).expect("jump");
+        assert!(matches!(
+            jump.message,
+            Some(EngineMsg::DeckSeek { deck: 0, frame }) if frame == 10_000.0
+        ));
+        assert!(!jump.mirror);
+    }
+
+    #[test]
+    fn quantize_seeks_a_stored_hot_cue_to_the_nearest_beat() {
+        let performance = PerformanceState::new();
+        performance.set_grid(0, 0.0, 22_050.0);
+        performance.set_quantize(0, true);
+        performance.set_hot_cue(0, 0, Some(10_000.0));
+        let jump = perform("hotcue.0", Some(at(80_000.0, 70_000.0)), &performance).expect("jump");
+        assert!(matches!(
+            jump.message,
+            Some(EngineMsg::DeckSeek { deck: 0, frame }) if frame == 0.0
+        ));
+    }
+
+    #[test]
+    fn beat_jump_uses_the_press_frame_and_the_current_scale() {
+        let performance = PerformanceState::new();
+        performance.set_grid(0, 0.0, 22_050.0);
+        performance.set_jump_scale(0, 2.0);
+        let jump = perform("beatjump.5", Some(at(30_000.0, 20_000.0)), &performance).expect("jump");
+        // Pad 5 is +4 beats, doubled by the scale, from the read frame rather than the heard frame.
+        assert!(matches!(
+            jump.message,
+            Some(EngineMsg::DeckSeek { deck: 0, frame }) if (frame - 206_400.0).abs() < 1e-6
+        ));
+        performance.set_quantize(0, true);
+        let quantized =
+            perform("jump.forward", Some(at(30_000.0, 20_000.0)), &performance).expect("quantized");
+        // Nearest beat to 30_000 is 22_050, then +4 beats at scale 2.
+        assert!(matches!(
+            quantized.message,
+            Some(EngineMsg::DeckSeek { deck: 0, frame }) if (frame - 198_450.0).abs() < 1e-6
+        ));
+    }
+
+    #[test]
+    fn beat_loop_engages_from_the_heard_frame_and_toggles_off() {
+        let performance = PerformanceState::new();
+        performance.set_grid(0, 0.0, 22_050.0);
+        let on = perform("beatloop.4", Some(at(40_000.0, 30_000.0)), &performance).expect("on");
+        assert!(matches!(
+            on.message,
+            Some(EngineMsg::Loop { deck: 0, in_frame, out_frame, active: true })
+                if (in_frame - 22_050.0).abs() < 1e-6 && (out_frame - 110_250.0).abs() < 1e-6
+        ));
+        let off = perform("beatloop.4", Some(at(50_000.0, 40_000.0)), &performance).expect("off");
+        assert!(matches!(
+            off.message,
+            Some(EngineMsg::LoopActive {
+                deck: 0,
+                active: false
+            })
+        ));
+    }
+
+    #[test]
+    fn loop_out_uses_the_armed_in_point_and_ignores_a_backward_out() {
+        let performance = PerformanceState::new();
+        let armed = perform("loop.in", Some(at(2_000.0, 1_000.0)), &performance).expect("in");
+        assert!(armed.message.is_none());
+        assert!(armed
+            .performance
+            .as_ref()
+            .is_some_and(|mirror| mirror.loop_armed == Some(true)));
+        let ignored = perform("loop.out", Some(at(500.0, 400.0)), &performance).expect("early");
+        assert!(ignored.message.is_none());
+        let engaged = perform("loop.out", Some(at(6_000.0, 5_000.0)), &performance).expect("out");
+        assert!(matches!(
+            engaged.message,
+            Some(EngineMsg::Loop { deck: 0, in_frame, out_frame, active: true })
+                if in_frame == 1_000.0 && out_frame == 5_000.0
+        ));
+    }
+
+    #[test]
+    fn sync_matches_the_partner_tempo_immediately_and_disengages() {
+        let performance = PerformanceState::new();
+        performance.with_deck(0, |snapshot| snapshot.bpm = 100.0);
+        performance.with_deck(1, |snapshot| snapshot.bpm = 128.0);
+        performance.set_partner(0, Some(1));
+        let mut tempos = [1.0; NUM_DECKS];
+        tempos[1] = 1.05;
+        let on =
+            apply_performance(0, "sync", 1.0, true, None, &tempos, &performance).expect("sync");
+        assert!(on.messages.iter().any(|message| matches!(
+            message,
+            EngineMsg::DeckTempo { deck: 0, ratio } if (ratio - 1.344).abs() < 1e-9
+        )));
+        assert!(on.messages.iter().any(|message| matches!(
+            message,
+            EngineMsg::DeckSync {
+                deck: 0,
+                master: Some(1)
+            }
+        )));
+        assert_eq!(on.extra_mirrors.len(), 1);
+        assert_eq!(on.extra_mirrors[0].0, "deck.0.tempo");
+        assert!((on.extra_mirrors[0].1 - 34.4).abs() < 1e-9);
+        let off =
+            apply_performance(0, "sync", 1.0, true, None, &tempos, &performance).expect("off");
+        assert!(matches!(
+            off.message,
+            Some(EngineMsg::DeckSync {
+                deck: 0,
+                master: None
+            })
+        ));
+        assert!(apply_performance(
+            0,
+            "sync",
+            1.0,
+            true,
+            None,
+            &tempos,
+            &PerformanceState::new()
+        )
+        .is_none());
+    }
+    #[test]
+    fn nudging_tiny_loop_near_start_preserves_valid_bounds() {
+        for nudge_in in [true, false] {
+            for counts in [-1.0, 1.0] {
+                let performance = PerformanceState::new();
+                performance.with_deck(0, |snapshot| {
+                    snapshot.source_rate = 48_000.0;
+                    snapshot.loop_in = 0.0;
+                    snapshot.loop_out = 4.0;
+                    snapshot.loop_active = true;
+                });
+                let action = nudge_loop(0, counts, nudge_in, &performance).expect("nudge");
+                assert!(matches!(action.message,
+                    Some(EngineMsg::Loop { deck: 0, in_frame, out_frame, active: true })
+                        if in_frame >= 0.0 && out_frame - in_frame >= LOOP_MIN_FRAMES));
+            }
+        }
     }
 }

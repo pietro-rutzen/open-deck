@@ -129,7 +129,11 @@ export function useCue(): CueApi {
     desired.current.channel = channel;
     void enqueue("route", async () => { await configureCueOutput(device, channel); });
   }, [enqueue]);
-  const setDevice = useCallback((device: string | null) => configure(device, 0), [configure]);
+  const setDevice = useCallback((device: string | null) => {
+    const channels = details.find((entry) => entry.name === device)?.channels ?? 0;
+    const headphonePair = device?.toLowerCase().includes("ddj-flx4") && channels >= 4 ? 2 : 0;
+    configure(device, headphonePair);
+  }, [configure, details]);
   const setChannel = useCallback((channel: number) => {
     if (Number.isInteger(channel) && channel >= 0) configure(desired.current.device, channel);
   }, [configure]);

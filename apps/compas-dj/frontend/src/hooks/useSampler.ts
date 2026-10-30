@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   clearSample,
   inTauri,
   loadSample,
+  onAudioOutputReset,
   pickAudioFile,
   samplerPadCount,
   setSampleLoop,
@@ -31,6 +32,8 @@ const emptyPad = (): Pad => ({ name: null, loop: false, loading: false });
 export function useSampler() {
   const [pads, setPads] = useState<Pad[]>(() => Array.from({ length: DEFAULT_PADS }, emptyPad));
   const [gain, setGainState] = useState(0.9);
+  const [error, setError] = useState<string | null>(null);
+  const loading = useRef(false);
 
   useEffect(() => {
     if (!inTauri()) return;
@@ -39,18 +42,42 @@ export function useSampler() {
       .catch(() => {});
   }, []);
 
+  useEffect(() => {
+    if (!inTauri()) return;
+    let active = true;
+    const unlisten = onAudioOutputReset(() => {
+      if (!active) return;
+      setPads((current) => {
+        if (current.some((pad) => pad.name)) {
+          setError("Speakers changed. Load sampler pads again.");
+        }
+        return current.map(() => emptyPad());
+      });
+    });
+    return () => {
+      active = false;
+      void unlisten.then((stop) => stop()).catch(() => {});
+    };
+  }, []);
+
   const patch = (slot: number, p: Partial<Pad>) =>
     setPads((cur) => cur.map((pad, i) => (i === slot ? { ...pad, ...p } : pad)));
 
   const load = useCallback(async (slot: number) => {
-    const path = await pickAudioFile();
-    if (!path) return;
-    patch(slot, { loading: true });
+    if (loading.current) return;
+    loading.current = true;
+    setError(null);
     try {
+      const path = await pickAudioFile();
+      if (!path) return;
+      patch(slot, { loading: true });
       const r = await loadSample(slot, path);
-      patch(slot, { name: r.name, loading: false });
-    } catch {
+      patch(slot, { name: r.name });
+    } catch (cause) {
+      setError(`Could not load sample: ${String(cause)}`);
+    } finally {
       patch(slot, { loading: false });
+      loading.current = false;
     }
   }, []);
 
@@ -83,7 +110,7 @@ export function useSampler() {
     setSamplerGain(g).catch(() => {});
   }, []);
 
-  return { pads, gain, load, clear, trigger, stop, toggleLoop, setGain };
+  return { pads, gain, error, load, clear, trigger, stop, toggleLoop, setGain };
 }
 
 export type SamplerController = ReturnType<typeof useSampler>;

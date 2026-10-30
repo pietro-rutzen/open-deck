@@ -200,6 +200,9 @@ pub struct ControllerUpdateEvent {
     /// Audible position when the controller message arrived (read position minus output latency).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heard_frame: Option<f64>,
+    /// Loop, cue, quantize, sync, or beat-jump display state. Present only after the engine applied it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performance: Option<crate::native_controls::PerformanceMirror>,
 }
 
 impl ControllerUpdateEvent {
@@ -209,6 +212,7 @@ impl ControllerUpdateEvent {
             value,
             frame: None,
             heard_frame: None,
+            performance: None,
         }
     }
 }
@@ -227,7 +231,7 @@ fn upsert_latest(pending: &mut Vec<ControllerUpdateEvent>, update: ControllerUpd
         .iter_mut()
         .find(|queued| queued.control == update.control)
     {
-        Some(queued) => queued.value = update.value,
+        Some(queued) => *queued = update,
         None => pending.push(update),
     }
 }
@@ -339,15 +343,62 @@ impl Router {
         if super::headphone::controller_update(&self.app, &update.control, update.value) {
             return;
         }
-        let eq = self.app.state::<crate::native_controls::DeckEqState>();
-        if let Some(action) =
-            crate::native_controls::resolve(&update.control, update.value, &self.telemetry, &eq)
-        {
-            if let Some(message) = action.message {
-                let _ = self.app.state::<crate::EngineHandle>().send(message);
+        // Beat FX and key shift are native-owned. Never fall back through React on errors.
+        let engine = self.app.state::<crate::EngineHandle>();
+        match self
+            .app
+            .state::<crate::native_effects::NativeEffects>()
+            .handle(&update.control, update.value, |message| {
+                engine.send(message)
+            }) {
+            Ok(Some(snapshot)) => {
+                let _ = self.app.emit("effects:update", snapshot);
+                return;
             }
+            Err(error) => {
+                tracing::warn!("Native effects control failed: {error}");
+                return;
+            }
+            Ok(None) => {}
+        }
+        let eq = self.app.state::<crate::native_controls::DeckEqState>();
+        let performance = self.app.state::<crate::native_controls::PerformanceState>();
+        let captured = update
+            .frame
+            .zip(update.heard_frame)
+            .map(
+                |(frame, heard_frame)| crate::native_controls::CapturedPosition {
+                    frame,
+                    heard_frame,
+                },
+            );
+        if let Some(action) = crate::native_controls::resolve(
+            &update.control,
+            update.value,
+            &self.telemetry,
+            &eq,
+            &performance,
+            captured,
+        ) {
+            let engine = self.app.state::<crate::EngineHandle>();
+            if let Some(message) = action.message {
+                let _ = engine.send(message);
+            }
+            for message in action.messages {
+                let _ = engine.send(message);
+            }
+            if let Some(value) = action.mirror_value {
+                update.value = value;
+            }
+            update.performance = action.performance;
             if action.mirror {
                 upsert_latest(&mut self.batch.mirror, update);
+            }
+            for (control, value) in action.extra_mirrors {
+                upsert_latest(
+                    &mut self.batch.mirror,
+                    ControllerUpdateEvent::new(control, value),
+                );
             }
             return;
         }
@@ -577,13 +628,14 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                     continue;
                 };
                 hold.fired = true;
-                router.emit_now(ControllerUpdateEvent {
-                    heard_frame: hold.heard_frame,
-                    ..ControllerUpdateEvent::new(
-                        format!("deck.{deck}.beatloop.{FOUR_BEAT_LOOP_PAD}"),
-                        1.0,
-                    )
-                });
+                let heard = hold.heard_frame;
+                let mut update = ControllerUpdateEvent::new(
+                    format!("deck.{deck}.beatloop.{FOUR_BEAT_LOOP_PAD}"),
+                    1.0,
+                );
+                update.frame = heard;
+                update.heard_frame = heard;
+                router.route(&registry, update);
             }
         }
         if flx4_profile {
@@ -592,16 +644,22 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 .take_loop_nudges();
             for (deck, (nudge_in, nudge_out)) in nudges.into_iter().enumerate() {
                 if nudge_in != 0 {
-                    router.emit_now(ControllerUpdateEvent::new(
-                        format!("deck.{deck}.loop.nudge_in"),
-                        f64::from(nudge_in),
-                    ));
+                    router.route(
+                        &registry,
+                        ControllerUpdateEvent::new(
+                            format!("deck.{deck}.loop.nudge_in"),
+                            f64::from(nudge_in),
+                        ),
+                    );
                 }
                 if nudge_out != 0 {
-                    router.emit_now(ControllerUpdateEvent::new(
-                        format!("deck.{deck}.loop.nudge_out"),
-                        f64::from(nudge_out),
-                    ));
+                    router.route(
+                        &registry,
+                        ControllerUpdateEvent::new(
+                            format!("deck.{deck}.loop.nudge_out"),
+                            f64::from(nudge_out),
+                        ),
+                    );
                 }
             }
         }
@@ -697,6 +755,12 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 fb_last.clear();
             }
             ControllerMsg::Midi(status, d1, raw_d2) => {
+                // Special FLX4 handlers must see the same release semantics as mappings.
+                let (status, raw_d2) = if flx4_profile {
+                    normalize_note_release(status, raw_d2)
+                } else {
+                    (status, raw_d2)
+                };
                 let consumed = 'resolve: {
                     if flx4_profile {
                         if matches!(status, 0x90 | 0x91) && d1 == FLX4_SHIFT_NOTE {
@@ -873,6 +937,15 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 }
             }
         }
+    }
+}
+
+/// NoteOff release velocity is not a press. Normalize before all special handlers.
+fn normalize_note_release(status: u8, value: u8) -> (u8, u8) {
+    if status & 0xf0 == 0x80 {
+        (status | 0x10, 0)
+    } else {
+        (status, value)
     }
 }
 
@@ -1480,5 +1553,21 @@ mod tests {
         assert_eq!(scale_tempo_percent(8.0, 100.0), 100.0);
         assert!(tempo_deck("deck.0.tempo").is_some());
         assert!(tempo_deck("deck.0.tempo_range").is_none());
+    }
+    #[test]
+    fn flx4_special_noteoff_clears_holds_and_loop_adjustment() {
+        for channel in [0, 1] {
+            for release_velocity in [0, 64, 127] {
+                // All special handlers receive exactly the same canonical release as
+                // a zero-velocity NoteOn, independent of NoteOff release velocity.
+                assert_eq!(
+                    normalize_note_release(0x80 | channel, release_velocity),
+                    normalize_note_release(0x90 | channel, 0)
+                );
+            }
+        }
+        assert_eq!(normalize_note_release(0x90, 127), (0x90, 127));
+        assert_eq!(normalize_note_release(0x91, 0), (0x91, 0));
+        assert_eq!(normalize_note_release(0xb0, 64), (0xb0, 64));
     }
 }
