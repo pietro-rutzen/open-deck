@@ -2,7 +2,7 @@ import { hotCueMarkers } from "../lib/hotCueMarkers";
 import { type CSSProperties, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { useElementSize } from "../hooks/useElementSize";
 import type { DeckState } from "../hooks/useDeck";
-import { bandAmplitudes, filledWavePath, WAVE_COLORS, waveformScale } from "../lib/waveformDisplay";
+import { rgbPaths, RGB_WAVE_KEY, waveColumn, waveformScale, type WavePoint } from "../lib/waveformDisplay";
 import { inTauri, onControllerUpdate } from "../lib/ipc";
 
 const NOW_FRAC = 0.38; // NOW playhead sits 38% from the left; track scrolls under it
@@ -153,7 +153,6 @@ export function WaveformZone({ lanes }: { lanes: Lane[] }) {
 const WaveGraphic = memo(function WaveGraphic({
   peaks,
   bands,
-  color,
   origin,
   binSec,
   view,
@@ -165,7 +164,6 @@ const WaveGraphic = memo(function WaveGraphic({
 }: {
   peaks: number[];
   bands: [number, number, number][];
-  color: string;
   origin: number;
   binSec: number;
   view: number;
@@ -175,12 +173,11 @@ const WaveGraphic = memo(function WaveGraphic({
   beatOffset: number;
   stretch: number;
 }) {
-  const displayScale = useMemo(() => waveformScale(peaks, bands), [peaks, bands]);
-  const useBands = bands.length === peaks.length && peaks.length > 0;
+  const displayScale = useMemo(() => waveformScale(peaks), [peaks]);
   const centerY = height / 2;
   const pixelsPerSecond = width / Math.max(view, 0.001);
   const span = view * WAVE_SPAN;
-  const samples = useMemo(() => {
+  const paths = useMemo(() => {
     if (binSec <= 0 || peaks.length === 0 || width <= 0 || stretch <= 0) return [];
     const sourceOrigin = origin * stretch;
     const sourceEnd = (origin + span) * stretch;
@@ -189,22 +186,14 @@ const WaveGraphic = memo(function WaveGraphic({
     if (last < first) return [];
     const columns = Math.max(1, Math.ceil(width * WAVE_SPAN * 1.15));
     const step = Math.max(1, Math.ceil((last - first + 1) / columns));
-    const points: { x: number; amps: number[] }[] = [];
+    const points: WavePoint[] = [];
     for (let index = first; index <= last; index += step) {
       const end = Math.min(last, index + step - 1);
-      let loudest = index;
-      for (let probe = index + 1; probe <= end; probe += 1) {
-        if (peaks[probe] > peaks[loudest]) loudest = probe;
-      }
-      const peak = peaks[loudest] ?? 0;
-      const band = useBands ? bands[loudest] : undefined;
-      points.push({
-        x: (loudest * binSec / stretch - origin) * pixelsPerSecond,
-        amps: bandAmplitudes(peak, band, displayScale).map((amp) => amp * centerY * 0.94),
-      });
+      const column = waveColumn(peaks, bands, index, end + 1, displayScale, centerY * 0.94);
+      points.push({ ...column, x: (column.loudest * binSec / stretch - origin) * pixelsPerSecond });
     }
-    return points;
-  }, [bands, binSec, centerY, displayScale, origin, peaks, pixelsPerSecond, span, stretch, useBands, width]);
+    return rgbPaths(points, centerY);
+  }, [bands, binSec, centerY, displayScale, origin, peaks, pixelsPerSecond, span, stretch, width]);
   const beats = useMemo(() => {
     if (beatInterval <= 0.05 || width <= 0 || stretch <= 0) return [];
     const end = origin + span;
@@ -227,12 +216,8 @@ const WaveGraphic = memo(function WaveGraphic({
   const showBeatNumber = beatInterval / view * width > 45;
   return (
     <g>
-      {samples.length > 0 && (useBands ? [0, 1, 2] : [0]).map((layer) => (
-        <path key={layer} d={filledWavePath(samples.map((sample) => ({ x: sample.x, amp: sample.amps[layer] ?? 0 })), centerY)} fill={useBands ? WAVE_COLORS[layer] : color} />
-      ))}
-      {samples.length > 0 && !useBands && (
-        <path d={filledWavePath(samples.map((sample) => ({ x: sample.x, amp: (sample.amps[0] ?? 0) * 0.42 })), centerY)} fill="#ffffff" opacity={0.78} />
-      )}
+      <title>{RGB_WAVE_KEY}</title>
+      {paths.map(path => <path key={path.fill} {...path} />)}
       <g className="wf-beat-grid" aria-label="Beat grid, grouped in four beats">
         {beats.map((beat) => (
           <g key={`${beat.bar}-${beat.beat}-${beat.x.toFixed(1)}`}>
@@ -388,7 +373,7 @@ const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; vi
       {peaks.length > 0 && (
         <div ref={scrollRef} className="wf-scroll">
           <svg className="wf-svg" viewBox={`0 0 ${Math.max(1, VW * WAVE_SPAN)} ${VH}`} preserveAspectRatio="none">
-            <WaveGraphic peaks={peaks} bands={bands} color={color} origin={origin} binSec={binSec} view={view} width={VW} height={VH} beatInterval={beatInterval} beatOffset={beatOffset} stretch={stretch} />
+            <WaveGraphic peaks={peaks} bands={bands} origin={origin} binSec={binSec} view={view} width={VW} height={VH} beatInterval={beatInterval} beatOffset={beatOffset} stretch={stretch} />
             {state.loop.active && state.loop.outFrame > state.loop.inFrame && (
               <rect
                 x={(state.loop.inFrame / sr / stretch - origin) * (VW / Math.max(view, 0.001))}

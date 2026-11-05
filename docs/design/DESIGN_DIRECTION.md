@@ -84,3 +84,7 @@ Treat resize adaptability as a standing requirement for every UI change. Priorit
 ## Track inspector density
 
 The library inspector uses a square segmented control: Summary, Info, and Artwork. Summary keeps a 64px cover beside the title so time, tempo, key and file details stay visible without scrolling past a full-size image. Artwork is the full-size view. Info lists embedded tags the file actually contains, plus library tags and the path. Missing credits are omitted. Sample rate comes from the file header. Bitrate is the PCM rate when bit depth is known; otherwise it is an average from size and duration, labeled average. The inspector does not edit embedded tags or replace artwork.
+
+## Frequency colors (T033)
+
+Use red for bass, green for mids and blue for treble across track rows, the inspector, full-track overviews and scrolling decks. Blend the measured bands for each visible time interval. Shape carries amplitude. Use neutral gray for amplitude-only data. Deck identity belongs on controls and labels. Cue flags retain their assigned colors.

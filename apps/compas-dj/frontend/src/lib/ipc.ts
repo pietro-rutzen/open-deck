@@ -34,16 +34,6 @@ export interface DeckLoaded {
   silence?: [number, number][];
 }
 
-/** Frequency colors are independent of deck identity: blue lows, amber mids, pale highs. */
-export const bandColor = ([low, mid, high]: [number, number, number]): string => {
-  const weights = [low, mid, high].map((v) => Number.isFinite(v) ? Math.max(0, v) : 0);
-  const sum = weights.reduce((a, b) => a + b, 0);
-  if (sum <= 1e-8) return "rgb(92, 110, 130)";
-  const palette = [[67, 151, 239], [244, 173, 66], [242, 244, 248]];
-  const dominant = weights[0] >= weights[1] && weights[0] >= weights[2] ? 0 : weights[1] >= weights[2] ? 1 : 2;
-  return `rgb(${palette[dominant].join(", ")})`;
-};
-
 /** How a musical key is displayed: Camelot wheel codes (8A/7B) or standard names (C#m/D). */
 export type KeyNotation = "camelot" | "musical";
 

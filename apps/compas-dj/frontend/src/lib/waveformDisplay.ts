@@ -1,62 +1,59 @@
-// Display-only envelopes: preserve signal timing and silence; never alter playback audio.
-export const WAVE_COLORS = ["#087fff", "#ffad00", "#ffffff"] as const;
-const finite = (v: number) => Number.isFinite(v) ? Math.max(0, v) : 0;
-export function waveformScale(peaks: number[], bands: [number, number, number][] = []) {
-  let peak = 0, band = 0;
-  for (const p of peaks) peak = Math.max(peak, finite(p));
-  for (const b of bands) for (const v of b) band = Math.max(band, finite(v));
-  return { peakGain: peak > .00001 ? Math.min(6, 1 / peak) : 1, bandGain: band > .00001 ? Math.min(12, 1 / band) : 1 };
-}
-export function waveformHeight(value: number, gain: number) {
-  return Math.pow(Math.min(1, finite(value) * gain), .72);
-}
-export function frequencyLayers(peak: number, bands: [number, number, number], scale: ReturnType<typeof waveformScale>) {
-  const envelope = waveformHeight(peak, scale.peakGain);
-  return bands.map((energy, index) => ({ color: WAVE_COLORS[index], height: Math.min(envelope, waveformHeight(energy, scale.bandGain)) }))
-    .sort((a, b) => b.height - a.height);
+// Display-only. Height encodes amplitude and hue encodes the measured spectral mix.
+type Bands = readonly [number, number, number];
+const finite = (value: number) => Number.isFinite(value) ? Math.max(0, value) : 0;
+export const RGB_WAVE_KEY = 'Waveform colors: bass red, mids green, treble blue. Mixed frequencies blend.';
+const NEUTRAL = '#8996a4';
+
+export function waveformScale(peaks: number[]) {
+  let max = 0;
+  for (const p of peaks) max = Math.max(max, finite(p));
+  return max > 0.00001 ? Math.min(6, 1 / max) : 1;
 }
 
-export function bandAmplitudes(peak: number, bands: readonly [number, number, number] | undefined, scale: ReturnType<typeof waveformScale>): number[] {
-  const envelope = waveformHeight(peak, scale.peakGain);
-  if (!bands) return [envelope];
-  return [0, 1, 2].map((index) => Math.min(envelope, waveformHeight(bands[index], scale.bandGain)));
+// Quantized channels keep the SVG path count bounded at every zoom level.
+export function frequencyColor(low: number, mid: number, high: number) {
+  const r = finite(low), g = finite(mid), b = finite(high);
+  const max = Math.max(r, g, b);
+  if (max === 0) return NEUTRAL;
+  const level = (value: number) => Math.round(5 * value / max) / 5;
+  const red = level(r), green = level(g), blue = level(b);
+  return `rgb(${Math.round(40 + 215 * red)},${Math.round(47 + 157 * green + 45 * blue)},${Math.round(53 + 32 * green + 170 * blue)})`;
 }
 
-const roundWave = (value: number) => (Math.round(value * 10) / 10).toFixed(1);
+export interface WavePoint { x: number; amp: number; color: string }
 
-const clampCurve = (value: number, first: number, second: number, center: number, upper: boolean) => {
-  const towardPeak = upper ? Math.min(first, second) : Math.max(first, second);
-  const room = Math.abs(first - second) * 0.2;
-  const bound = upper ? towardPeak - room : towardPeak + room;
-  return upper ? Math.max(bound, Math.min(center, value)) : Math.min(bound, Math.max(center, value));
-};
-
-const curveThrough = (points: readonly { x: number; y: number }[], center: number, upper: boolean) => {
-  const commands: string[] = [];
-  for (let index = 0; index < points.length - 1; index += 1) {
-    const before = points[Math.max(0, index - 1)];
-    const from = points[index];
-    const to = points[index + 1];
-    const after = points[Math.min(points.length - 1, index + 2)];
-    const controlFromX = from.x + (to.x - before.x) / 6;
-    const controlToX = to.x - (after.x - from.x) / 6;
-    const controlFromY = clampCurve(from.y + (to.y - before.y) / 6, from.y, to.y, center, upper);
-    const controlToY = clampCurve(to.y - (after.y - from.y) / 6, from.y, to.y, center, upper);
-    commands.push(` C ${roundWave(controlFromX)} ${roundWave(controlFromY)} ${roundWave(controlToX)} ${roundWave(controlToY)} ${roundWave(to.x)} ${roundWave(to.y)}`);
+// Pool power across the whole output column, so a kick cannot erase a quieter hi-hat
+// from its color. The peak from that same interval supplies the silhouette.
+export function waveColumn(peaks: number[], bands: Bands[], start: number, end: number,
+  gain: number, radius: number) {
+  let loudest = start, peak = 0, low = 0, mid = 0, high = 0;
+  const measured = bands.length === peaks.length;
+  for (let i = start; i < end; i++) {
+    const p = finite(peaks[i]);
+    if (p > peak) { peak = p; loudest = i; }
+    if (measured) {
+      low += finite(bands[i][0]) ** 2;
+      mid += finite(bands[i][1]) ** 2;
+      high += finite(bands[i][2]) ** 2;
+    }
   }
-  return commands.join("");
-};
+  return { loudest, amp: Math.pow(Math.min(1, peak * gain), 0.72) * radius,
+    color: frequencyColor(Math.sqrt(low), Math.sqrt(mid), Math.sqrt(high)) };
+}
 
-/** One filled silhouette through the peaks, mirrored around `centerY`. */
-export function filledWavePath(points: readonly { x: number; amp: number }[], centerY: number): string {
-  const usable = points.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.amp) && point.amp >= 0);
-  if (usable.length === 0) return "";
-  const first = usable[0];
-  if (usable.length === 1) {
-    return `M ${roundWave(first.x)} ${roundWave(centerY - first.amp)} L ${roundWave(first.x)} ${roundWave(centerY + first.amp)} Z`;
+// Adjacent columns share their interpolated edge. Batch all polygons of one hue
+// into one SVG path to avoid creating an element per audio bin.
+export function rgbPaths(points: WavePoint[], center: number) {
+  const paths = new Map<string, string[]>();
+  const coord = (v: number) => v.toFixed(1);
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i], before = points[i - 1] ?? p, after = points[i + 1] ?? p;
+    if (p.amp + before.amp + after.amp === 0) continue;
+    const l = coord((p.x + before.x) / 2), r = coord((p.x + after.x) / 2), x = coord(p.x);
+    const a = (p.amp + before.amp) / 2, b = (p.amp + after.amp) / 2;
+    const path = `M${l} ${coord(center-a)}L${x} ${coord(center-p.amp)} ${r} ${coord(center-b)} ${r} ${coord(center+b)} ${x} ${coord(center+p.amp)} ${l} ${coord(center+a)}Z`;
+    const group = paths.get(p.color);
+    if (group) group.push(path); else paths.set(p.color, [path]);
   }
-  const upper = usable.map((point) => ({ x: point.x, y: centerY - point.amp }));
-  const lower = [...usable].reverse().map((point) => ({ x: point.x, y: centerY + point.amp }));
-  const right = lower[0];
-  return `M ${roundWave(upper[0].x)} ${roundWave(upper[0].y)}${curveThrough(upper, centerY, true)} L ${roundWave(right.x)} ${roundWave(right.y)}${curveThrough(lower, centerY, false)} Z`;
+  return Array.from(paths, ([fill, segments]) => ({ fill, d: segments.join('') }));
 }

@@ -928,24 +928,32 @@ pub fn band_peaks(samples: &[f32], sample_rate: u32, bin_frames: usize) -> Vec<[
     }
     let sr = sample_rate as f32;
     // Three bands: low (<250 Hz), mid (250 Hz–2.5 kHz, an HPF→LPF cascade), high (>2.5 kHz).
-    let mut low = crate::Biquad::new(crate::BiquadCoeffs::low_pass(250.0, sr, 0.707));
-    let mut mid_hp = crate::Biquad::new(crate::BiquadCoeffs::high_pass(250.0, sr, 0.707));
-    let mut mid_lp = crate::Biquad::new(crate::BiquadCoeffs::low_pass(2500.0, sr, 0.707));
-    let mut high = crate::Biquad::new(crate::BiquadCoeffs::high_pass(2500.0, sr, 0.707));
+    let mut filters = std::array::from_fn::<_, 2, _>(|_| {
+        (
+            crate::Biquad::new(crate::BiquadCoeffs::low_pass(250.0, sr, 0.707)),
+            crate::Biquad::new(crate::BiquadCoeffs::high_pass(250.0, sr, 0.707)),
+            crate::Biquad::new(crate::BiquadCoeffs::low_pass(2500.0, sr, 0.707)),
+            crate::Biquad::new(crate::BiquadCoeffs::high_pass(2500.0, sr, 0.707)),
+        )
+    });
 
     let nbins = frames.div_ceil(bin_frames);
     let mut sums = vec![[0.0f64; 3]; nbins];
     let mut counts = vec![0u32; nbins];
 
-    for i in 0..frames {
-        let mono = 0.5 * (samples[i * 2] + samples[i * 2 + 1]);
-        let l = low.process(mono);
-        let m = mid_lp.process(mid_hp.process(mono));
-        let h = high.process(mono);
+    for (i, stereo) in samples.chunks_exact(2).enumerate() {
         let bin = i / bin_frames;
-        sums[bin][0] += (l as f64) * (l as f64);
-        sums[bin][1] += (m as f64) * (m as f64);
-        sums[bin][2] += (h as f64) * (h as f64);
+        for (&sample, (low, mid_hp, mid_lp, high)) in stereo.iter().zip(&mut filters) {
+            // Sum channel power so wide or polarity-inverted material retains its color.
+            let bands = [
+                low.process(sample),
+                mid_lp.process(mid_hp.process(sample)),
+                high.process(sample),
+            ];
+            for (sum, value) in sums[bin].iter_mut().zip(bands) {
+                *sum += 0.5 * f64::from(value).powi(2);
+            }
+        }
         counts[bin] += 1;
     }
 
@@ -1000,6 +1008,11 @@ mod tests {
             avg(&bins_high, 2) > avg(&bins_high, 0),
             "high tone should be high-band heavy"
         );
+        let mut wide = sine(8000.0);
+        for stereo in wide.chunks_exact_mut(2) {
+            stereo[1] = -stereo[1];
+        }
+        assert_eq!(band_peaks(&wide, sr, 4096), bins_high);
         assert!(band_peaks(&[], sr, 4096).is_empty());
     }
 

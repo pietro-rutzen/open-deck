@@ -17,9 +17,10 @@ import {
 } from '../lib/ipc';
 import { audibleFramesRemaining } from '../lib/silence';
 import {
-  bandAmplitudes,
-  filledWavePath,
-  WAVE_COLORS,
+  waveColumn,
+  RGB_WAVE_KEY,
+  rgbPaths,
+  type WavePoint,
   waveformScale,
 } from '../lib/waveformDisplay';
 import { useElementSize } from '../hooks/useElementSize';
@@ -1182,46 +1183,22 @@ export function Deck({
 const OverviewWave = memo(function OverviewWave({
   peaks,
   bands,
-  color,
 }: {
   peaks: number[];
   bands: [number, number, number][];
-  color: string;
 }) {
   const [svgRef, size] = useElementSize<SVGSVGElement>(600, 96);
   const W = size.width;
   const H = size.height;
   const cy = H / 2;
   const N = peaks.length;
-  const useBands = bands.length === N && N > 0;
-  const displayScale = useMemo(
-    () => waveformScale(peaks, bands),
-    [peaks, bands],
-  );
-  // Cap at ~one bar per output column so long tracks stay cheap to draw.
-  const cols = Math.min(N, W);
-  const step = Math.max(1, Math.ceil(N / cols));
-  const samples: { x: number; amps: number[] }[] = [];
+  const gain = useMemo(() => waveformScale(peaks), [peaks]);
+  const step = Math.max(1, Math.ceil(N / Math.max(1, W)));
+  const samples: WavePoint[] = [];
   for (let i = 0; i < N; i += step) {
-    let pk = 0;
-    let bi = i;
-    const end = Math.min(N, i + step);
-    for (let j = i; j < end; j++) {
-      if (peaks[j] > pk) {
-        pk = peaks[j];
-        bi = j;
-      }
-    }
-    samples.push({
-      x: (bi / N) * W,
-      amps: bandAmplitudes(
-        pk,
-        useBands ? bands[bi] : undefined,
-        displayScale,
-      ).map((amp) => amp * cy * 0.94),
-    });
+    const column = waveColumn(peaks, bands, i, Math.min(N, i + step), gain, cy * 0.94);
+    samples.push({ ...column, x: column.loudest / N * W });
   }
-  const layers = useBands ? [0, 1, 2] : [0];
   return (
     <svg
       ref={svgRef}
@@ -1229,34 +1206,8 @@ const OverviewWave = memo(function OverviewWave({
       viewBox={`0 0 ${W} ${H}`}
       preserveAspectRatio="none"
     >
-      {layers.map((layer) => (
-        <path
-          key={layer}
-          d={filledWavePath(
-            samples.map((sample) => ({
-              x: sample.x,
-              amp: sample.amps[layer] ?? 0,
-            })),
-            cy,
-          )}
-          fill={useBands ? WAVE_COLORS[layer] : color}
-          shapeRendering="geometricPrecision"
-        />
-      ))}
-      {!useBands && (
-        <path
-          d={filledWavePath(
-            samples.map((sample) => ({
-              x: sample.x,
-              amp: (sample.amps[0] ?? 0) * 0.42,
-            })),
-            cy,
-          )}
-          fill="#ffffff"
-          opacity={0.78}
-          shapeRendering="geometricPrecision"
-        />
-      )}
+      <title>{RGB_WAVE_KEY}</title>
+      {rgbPaths(samples, cy).map(path => <path key={path.fill} {...path} />)}
     </svg>
   );
 });
@@ -1315,7 +1266,7 @@ function OverviewBar({
         dragging.current = false;
       }}
     >
-      <OverviewWave peaks={peaks} bands={meta.band_peaks ?? []} color={color} />
+      <OverviewWave peaks={peaks} bands={meta.band_peaks ?? []} />
       <OverviewPlayhead state={state} color={color} />
       {loop.active && loopRight > loopLeft && (
         <div

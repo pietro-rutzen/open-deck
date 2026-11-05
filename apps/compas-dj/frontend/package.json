@@ -10,7 +10,7 @@
     "icons": "node scripts/gen-icons.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "node scripts/test-library-controller.mjs && node scripts/test-hot-cue-markers.mjs"
+    "test": "node scripts/test-library-controller.mjs && node scripts/test-hot-cue-markers.mjs && node scripts/test-waveform-rgb.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

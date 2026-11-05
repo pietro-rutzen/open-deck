@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { bandAmplitudes, filledWavePath, WAVE_COLORS, waveformScale } from "../lib/waveformDisplay";
+import { rgbPaths, RGB_WAVE_KEY, waveColumn, waveformScale } from "../lib/waveformDisplay";
 import { inTauri } from "../lib/ipc";
 
 export interface TrackVisuals {
@@ -98,23 +98,19 @@ export function useTrackVisuals(path: string | null, enabled = true, includeArtw
 }
 
 export function MiniWaveform({ peaks, bands = [], label = "Track frequency and amplitude overview" }: { peaks: number[]; bands?: [number, number, number][]; label?: string }) {
-  const scale = useMemo(() => waveformScale(peaks, bands), [peaks, bands]);
-  const count = Math.min(peaks.length, 256);
-  if (!count) return <span className="mini-waveform-state">No waveform</span>;
-  const useBands = bands.length === peaks.length;
-  const samples = Array.from({ length: count }, (_, index) => {
-    const at = Math.min(peaks.length - 1, Math.floor(index * peaks.length / count));
-    return {
-      x: ((index + 0.5) * 256) / count,
-      amps: bandAmplitudes(peaks[at] ?? 0, useBands ? bands[at] : undefined, scale).map((amp) => amp * 19),
-    };
-  });
-  const layers = useBands ? [0, 1, 2] : [0];
+  const paths = useMemo(() => {
+    const gain = waveformScale(peaks);
+    const count = Math.min(peaks.length, 256);
+    const points = Array.from({ length: count }, (_, i) => ({
+      ...waveColumn(peaks, bands, Math.floor(i * peaks.length / count), Math.floor((i + 1) * peaks.length / count), gain, 19),
+      x: ((i + 0.5) * 256) / count,
+    }));
+    return rgbPaths(points, 20);
+  }, [peaks, bands]);
+  if (!peaks.length) return <span className="mini-waveform-state">No waveform</span>;
   return <svg className="mini-waveform" viewBox="0 0 256 40" preserveAspectRatio="none" role="img" aria-label={label}>
-    {layers.map((layer) => (
-      <path key={layer} d={filledWavePath(samples.map((sample) => ({ x: sample.x, amp: sample.amps[layer] ?? 0 })), 20)} fill={useBands ? WAVE_COLORS[layer] : WAVE_COLORS[0]} shapeRendering="geometricPrecision" />
-    ))}
-    {!useBands && <path d={filledWavePath(samples.map((sample) => ({ x: sample.x, amp: (sample.amps[0] ?? 0) * 0.42 })), 20)} fill="#ffffff" opacity={0.78} shapeRendering="geometricPrecision" />}
+    <title>{RGB_WAVE_KEY}</title>
+    {paths.map(path => <path key={path.fill} {...path} />)}
   </svg>;
 }
 
