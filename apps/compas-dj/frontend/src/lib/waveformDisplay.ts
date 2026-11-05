@@ -1,7 +1,7 @@
 // Display-only. Height encodes amplitude and hue encodes the measured spectral mix.
 type Bands = readonly [number, number, number];
 const finite = (value: number) => Number.isFinite(value) ? Math.max(0, value) : 0;
-export const RGB_WAVE_KEY = 'Waveform colors: bass red, mids green, treble sky blue. Mixed frequencies blend. In the narrow center core, band thickness shows bass (blue), mids (amber) and treble (ivory).';
+export const RGB_WAVE_KEY = 'Waveform colors: bass red, mids green, treble sky blue. Mixed frequencies blend. In the centered core, band thickness shows bass (blue), mids (amber) and treble (ivory).';
 const NEUTRAL = '#8996a4';
 
 export function waveformScale(peaks: number[]) {
@@ -92,8 +92,8 @@ export function rgbPaths(points: WavePoint[], center: number) {
 export function wavePaths(points: WavePoint[], center: number, gain: number) {
   const paths = rgbPaths(points, center);
   if (!gain || !paths.length || points.length < 2) return paths;
-  // Each side of the core may occupy up to 39% of the local peak radius.
-  const coreFraction = 0.39;
+  // Each side of the core may occupy up to 58.5% of the local peak radius.
+  const coreFraction = 0.585;
   const layers = Array.from({ length: 3 }, () => ({ upper: [] as string[], lower: [] as string[] }));
   const visible = [false, false, false];
   for (const point of points) {

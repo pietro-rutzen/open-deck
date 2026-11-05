@@ -24,7 +24,7 @@ Current source baseline: aefba51 plus T025–T031 reliability changes in this de
 | 4 | Reproducible release candidate | Green hosted CI, toolchain/platform matrix, audit callback risks and dependency/license provenance |
 | 5 | Distribution | Signed/notarized build, clean-Mac installation, tested recovery instructions, checksums matching tested revision |
 
-Do not add features ahead of outstanding reliability failures. Full historical milestones below retain their strict acceptance criteria; implemented features alone do not close multi-part gates. Latest completed coding task: [T038](#t038--frequency-core-size); T027 audio-test review and lint gates remain open. Recent handoffs: [T025](handoffs/T-025-20261103-01.md), [T026](handoffs/T-026-20261104-01.md).
+Do not add features ahead of outstanding reliability failures. Full historical milestones below retain their strict acceptance criteria; implemented features alone do not close multi-part gates. Latest completed coding task: [T039](#t039--preview-and-playing-waveform-core); T027 audio-test review and lint gates remain open. Recent handoffs: [T025](handoffs/T-025-20261103-01.md), [T026](handoffs/T-026-20261104-01.md).
 
 ## Milestones and acceptance gates
 
@@ -481,3 +481,8 @@ Limit scope: PCM accumulator only; codec internals, analysis arrays, total RSS a
 
 - [x] Increased the centered frequency bands by 30% relative to T037. Root integrated and rgb_review checked the 39% cap, symmetry and bass-dropout fixture. Frontend typecheck, tests and desktop bundle build passed on base 06642b9.
 - [ ] Install the rebuilt bundle via scripts/opendeck-install.sh. Applications replacement was denied before restart.
+
+## T039 — Preview and playing waveform core
+
+- [x] Increased the shared frequency core by 50% relative to T038, to a 58.5% cap. Root integrated. rgb_review verified both preview and detail fixtures.
+- [x] Frontend typecheck and tests passed. Built, installed and verified the Applications bundle and ran the relaunch workflow.

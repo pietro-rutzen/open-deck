@@ -37,22 +37,24 @@ assert.ok(channels(1, .2, 0)[0] > 200, 'bass without treble stays warm');
 
 // With equal peaks and a bass dropout, only the outer band should retreat.
 const bands = [[.6, .2, .1], [0, .2, .1]];
-const points = bands.map((_, x) => ({ x, ...waveColumn([1, 1], bands, x, x + 1, 1, 20) }));
-const base = rgbPaths(points, 20);
-const hybrid = wavePaths(points, 20, structureGain(bands));
-assert.deepEqual(hybrid.slice(0, base.length), base);
-const [bass, mids, highs] = hybrid.slice(base.length);
-const coordinates = layer => layer.d.match(/-?\d+\.\d+/g).map(Number);
-for (const layer of [bass, mids, highs]) {
-  const [x0, top0, x1, top1, x2, bottom1, x3, bottom0] = coordinates(layer);
-  assert.deepEqual([x0, x1, x2, x3], [0, 1, 1, 0]);
-  assert.equal(top0 + bottom0, 40);
-  assert.equal(top1 + bottom1, 40);
-  assert.ok(top0 >= 12.2 && top1 >= 12.2);
-  if (layer === bass) {
-    assert.equal(bottom0, 27.3); // 20 + (20 × 0.94 × 0.39), rounded for SVG.
-    assert.ok(bottom0 > bottom1);
+for (const view of ['preview', 'detail']) {
+  const points = bands.map((_, x) => ({ x, ...waveColumn([1, 1], bands, x, x + 1, 1, 20, view) }));
+  const base = rgbPaths(points, 20);
+  const hybrid = wavePaths(points, 20, structureGain(bands));
+  assert.deepEqual(hybrid.slice(0, base.length), base);
+  const [bass, mids, highs] = hybrid.slice(base.length);
+  const coordinates = layer => layer.d.match(/-?\d+\.\d+/g).map(Number);
+  for (const layer of [bass, mids, highs]) {
+    const [x0, top0, x1, top1, x2, bottom1, x3, bottom0] = coordinates(layer);
+    assert.deepEqual([x0, x1, x2, x3], [0, 1, 1, 0]);
+    assert.equal(top0 + bottom0, 40);
+    assert.equal(top1 + bottom1, 40);
+    assert.ok(top0 >= 8.3 && top1 >= 8.3);
+    if (layer === bass) {
+      assert.equal(bottom0, 31.0); // 20 + (20 × 0.94 × 0.585), rounded for SVG.
+      assert.ok(bottom0 > bottom1);
+    }
+    else assert.equal(bottom0, bottom1);
   }
-  else assert.equal(bottom0, bottom1);
+  assert.deepEqual(wavePaths(points, 20, structureGain([])), base);
 }
-assert.deepEqual(wavePaths(points, 20, structureGain([])), base);
