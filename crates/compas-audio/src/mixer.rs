@@ -1001,6 +1001,15 @@ impl DeckPlayer {
         }
     }
 
+    /// Loop bounds and the slip position belong to a particular track.
+    fn clear_track_loop(&mut self) {
+        self.loop_in = 0.0;
+        self.loop_out = 0.0;
+        self.loop_active = false;
+        self.roll_active = false;
+        self.slip_playhead = 0.0;
+    }
+
     /// Engage or release slip-reverse. RT-SAFE.
     fn set_censor(&mut self, active: bool) {
         if active {
@@ -2032,12 +2041,11 @@ impl Mixer {
                         d.keylock.set_active(false);
                         d.keylock.set_pitch_semitones(0.0);
                         d.fx.reset();
-                        d.loop_active = false;
+                        d.clear_track_loop();
                         d.cue_point = 0.0;
                         d.cue_previewing = false;
                         d.censoring = false;
                         d.censor_was_playing = false;
-                        d.slip_playhead = 0.0;
                         d.pregain.set(1.0);
                         d.beat_offset = beat_offset;
                         d.beat_interval = beat_interval;
@@ -2277,11 +2285,10 @@ impl Mixer {
                         d.keylock.set_pitch_semitones(0.0);
                         d.fx.reset();
                         d.playhead = 0.0;
-                        d.loop_active = false;
+                        d.clear_track_loop();
                         d.cue_previewing = false;
                         d.censoring = false;
                         d.censor_was_playing = false;
-                        d.slip_playhead = 0.0;
                         d.sync_master = None;
                         d.sync_tempo = None;
                         d.beat_interval = 0.0;
@@ -2803,6 +2810,73 @@ mod tests {
             ctx,
             Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new())),
         )
+    }
+
+    #[test]
+    fn replacing_or_ejecting_during_roll_discards_old_slip_position_and_loop_bounds() {
+        for eject in [false, true] {
+            let (mut tx, mut mixer) = mixer_with_commands();
+            let load = || AudioCommand::LoadDeck {
+                deck: 0,
+                buffer: small_buffer(0.25),
+                beat_offset: 0.0,
+                beat_interval: 0.0,
+            };
+            let roll = |active| AudioCommand::SetLoopRoll {
+                deck: 0,
+                in_frame: 1.0,
+                out_frame: 5.0,
+                active,
+            };
+            tx.push(load()).unwrap();
+            tx.push(AudioCommand::SeekDeck {
+                deck: 0,
+                frame: 3.0,
+            })
+            .unwrap();
+            tx.push(roll(true)).unwrap();
+            mixer.drain_commands();
+            assert!(mixer.decks[0].roll_active);
+            tx.push(if eject {
+                AudioCommand::UnloadDeck { deck: 0 }
+            } else {
+                load()
+            })
+            .unwrap();
+            tx.push(AudioCommand::SetLoopActive {
+                deck: 0,
+                active: true,
+            })
+            .unwrap();
+            mixer.drain_commands();
+            assert!(
+                !mixer.decks[0].loop_active,
+                "reloop recalled the previous track's bounds"
+            );
+            assert!(!mixer.decks[0].roll_active);
+            if eject {
+                tx.push(load()).unwrap();
+            }
+            tx.push(AudioCommand::SeekDeck {
+                deck: 0,
+                frame: 9.0,
+            })
+            .unwrap();
+            tx.push(AudioCommand::SetLoop {
+                deck: 0,
+                in_frame: 6.0,
+                out_frame: 12.0,
+                active: true,
+            })
+            .unwrap();
+            tx.push(roll(false)).unwrap();
+            mixer.drain_commands();
+            assert_eq!(mixer.decks[0].playhead, 9.0);
+            assert!(
+                mixer.decks[0].loop_active,
+                "late release stopped the replacement loop"
+            );
+        }
     }
 
     fn arm_sync_decks(mixer: &mut Mixer) {
