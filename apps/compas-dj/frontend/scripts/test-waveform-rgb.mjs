@@ -48,8 +48,11 @@ for (const layer of [bass, mids, highs]) {
   assert.deepEqual([x0, x1, x2, x3], [0, 1, 1, 0]);
   assert.equal(top0 + bottom0, 40);
   assert.equal(top1 + bottom1, 40);
-  assert.ok(top0 >= 14 && top1 >= 14);
-  if (layer === bass) assert.ok(bottom0 > bottom1);
+  assert.ok(top0 >= 12.2 && top1 >= 12.2);
+  if (layer === bass) {
+    assert.equal(bottom0, 27.3); // 20 + (20 × 0.94 × 0.39), rounded for SVG.
+    assert.ok(bottom0 > bottom1);
+  }
   else assert.equal(bottom0, bottom1);
 }
 assert.deepEqual(wavePaths(points, 20, structureGain([])), base);

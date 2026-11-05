@@ -24,7 +24,7 @@ Current source baseline: aefba51 plus T025–T031 reliability changes in this de
 | 4 | Reproducible release candidate | Green hosted CI, toolchain/platform matrix, audit callback risks and dependency/license provenance |
 | 5 | Distribution | Signed/notarized build, clean-Mac installation, tested recovery instructions, checksums matching tested revision |
 
-Do not add features ahead of outstanding reliability failures. Full historical milestones below retain their strict acceptance criteria; implemented features alone do not close multi-part gates. Latest completed coding task: [T037](tasks/T-037.md); T027 audio-test review and lint gates remain open. Recent handoffs: [T025](handoffs/T-025-20261103-01.md), [T026](handoffs/T-026-20261104-01.md).
+Do not add features ahead of outstanding reliability failures. Full historical milestones below retain their strict acceptance criteria; implemented features alone do not close multi-part gates. Latest completed coding task: [T038](#t038--frequency-core-size); T027 audio-test review and lint gates remain open. Recent handoffs: [T025](handoffs/T-025-20261103-01.md), [T026](handoffs/T-026-20261104-01.md).
 
 ## Milestones and acceptance gates
 
@@ -476,3 +476,8 @@ Limit scope: PCM accumulator only; codec internals, analysis arrays, total RSS a
 ## T037 — Centered frequency core and desktop restart
 
 - [x] Cap the centered bands at 30% of local waveform height. Build, install, then restart by default. [Task and handoff](tasks/T-037.md)
+
+## T038 — Frequency core size
+
+- [x] Increased the centered frequency bands by 30% relative to T037. Root integrated and rgb_review checked the 39% cap, symmetry and bass-dropout fixture. Frontend typecheck, tests and desktop bundle build passed on base 06642b9.
+- [ ] Install the rebuilt bundle via scripts/opendeck-install.sh. Applications replacement was denied before restart.

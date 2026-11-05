@@ -92,8 +92,8 @@ export function rgbPaths(points: WavePoint[], center: number) {
 export function wavePaths(points: WavePoint[], center: number, gain: number) {
   const paths = rgbPaths(points, center);
   if (!gain || !paths.length || points.length < 2) return paths;
-  // Each side of the core may occupy up to 30% of the local peak radius.
-  const coreFraction = 0.30;
+  // Each side of the core may occupy up to 39% of the local peak radius.
+  const coreFraction = 0.39;
   const layers = Array.from({ length: 3 }, () => ({ upper: [] as string[], lower: [] as string[] }));
   const visible = [false, false, false];
   for (const point of points) {
