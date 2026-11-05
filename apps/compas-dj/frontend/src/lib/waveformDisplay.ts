@@ -89,7 +89,7 @@ export function rgbPaths(points: WavePoint[], center: number) {
   return Array.from(paths, ([fill, segments]) => ({ fill, d: segments.join('') }));
 }
 
-export function wavePaths(points: WavePoint[], center: number, gain: number) {
+export function wavePaths(points: WavePoint[], center: number, gain: number, bandScale = 1) {
   const paths = rgbPaths(points, center);
   if (!gain || !paths.length || points.length < 2) return paths;
   const layers = Array.from({ length: 3 }, () => ({ upper: [] as string[], lower: [] as string[] }));
@@ -100,7 +100,7 @@ export function wavePaths(points: WavePoint[], center: number, gain: number) {
     // Keep the spectral rim visible at thumbnail size. Sustained energy fills
     // slightly more of the peak envelope than short transients.
     const relativeEnergy = Math.min(1, sum * gain);
-    const bodyRadius = point.amp * (0.68 + 0.08 * relativeEnergy);
+    const bodyRadius = point.amp * (0.68 + 0.08 * relativeEnergy) * bandScale;
     const scale = sum > 0 ? bodyRadius / sum : 0;
     const depths = [sum * scale, (mid + high) * scale, high * scale];
     for (let i = 0; i < 3; i++) {

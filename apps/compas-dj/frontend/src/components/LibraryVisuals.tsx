@@ -97,7 +97,7 @@ export function useTrackVisuals(path: string | null, enabled = true, includeArtw
   return result?.path === path ? result.state : { status: "loading" };
 }
 
-export function MiniWaveform({ peaks, bands = [], label = "Track frequency and amplitude overview" }: { peaks: number[]; bands?: [number, number, number][]; label?: string }) {
+export function MiniWaveform({ peaks, bands = [], bandScale = 1, label = "Track frequency and amplitude overview" }: { peaks: number[]; bands?: [number, number, number][]; bandScale?: number; label?: string }) {
   const paths = useMemo(() => {
     const gain = waveformScale(peaks);
     const count = Math.min(peaks.length, 256);
@@ -105,8 +105,8 @@ export function MiniWaveform({ peaks, bands = [], label = "Track frequency and a
       ...waveColumn(peaks, bands, Math.floor(i * peaks.length / count), Math.floor((i + 1) * peaks.length / count), gain, 19, 'preview'),
       x: ((i + 0.5) * 256) / count,
     }));
-    return wavePaths(points, 20, structureGain(bands));
-  }, [peaks, bands]);
+    return wavePaths(points, 20, structureGain(bands), bandScale);
+  }, [peaks, bands, bandScale]);
   if (!peaks.length) return <span className="mini-waveform-state">No waveform</span>;
   return <svg className="mini-waveform" viewBox="0 0 256 40" preserveAspectRatio="none" role="img" aria-label={label}>
     <title>{RGB_WAVE_KEY}</title>
@@ -148,7 +148,7 @@ export function TrackCells({ path, title, artist, color, afterArtist, beforeWave
     {beforeWave}
     <span className="tl-spacer" aria-hidden="true" />
     <span className="tl-mini-wave" style={color ? { color } : undefined}>
-      {visual.status === "ready" && visual.data?.peaks.length ? <MiniWaveform peaks={visual.data.peaks} bands={visual.data.band_peaks} /> : <span className="mini-waveform-state">{visual.status === "loading" ? "…" : "—"}</span>}
+      {visual.status === "ready" && visual.data?.peaks.length ? <MiniWaveform bandScale={0.5} peaks={visual.data.peaks} bands={visual.data.band_peaks} /> : <span className="mini-waveform-state">{visual.status === "loading" ? "…" : "—"}</span>}
     </span>
   </>;
 }

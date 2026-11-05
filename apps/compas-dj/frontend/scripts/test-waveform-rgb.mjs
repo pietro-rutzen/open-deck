@@ -44,7 +44,14 @@ for (const view of ['preview', 'detail']) {
   assert.deepEqual(hybrid.slice(0, base.length), base);
   const [bass, mids, highs] = hybrid.slice(base.length);
   const coordinates = layer => layer.d.match(/-?\d+\.\d+/g).map(Number);
-  for (const layer of [bass, mids, highs]) {
+  const thumbnail = wavePaths(points, 20, structureGain(bands), 0.5);
+  assert.deepEqual(thumbnail.slice(0, base.length), base);
+  for (const [index, layer] of [bass, mids, highs].entries()) {
+    const original = coordinates(layer);
+    const scaled = coordinates(thumbnail[base.length + index]);
+    for (let y = 1; y < original.length; y += 2) {
+      assert.ok(Math.abs(scaled[y] - (20 + (original[y] - 20) / 2)) <= 0.1);
+    }
     const [x0, top0, x1, top1, x2, bottom1, x3, bottom0] = coordinates(layer);
     assert.deepEqual([x0, x1, x2, x3], [0, 1, 1, 0]);
     assert.equal(top0 + bottom0, 40);
