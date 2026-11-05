@@ -1,7 +1,7 @@
 // Display-only. Height encodes amplitude and hue encodes the measured spectral mix.
 type Bands = readonly [number, number, number];
 const finite = (value: number) => Number.isFinite(value) ? Math.max(0, value) : 0;
-export const RGB_WAVE_KEY = 'Waveform colors: bass red, mids green, treble sky blue. Mixed frequencies blend. In the centered core, band thickness shows bass (blue), mids (amber) and treble (ivory).';
+export const RGB_WAVE_KEY = 'Band thickness shows bass (blue), mids (amber) and treble (ivory). The outer rim blends bass red, mid green and treble sky blue.';
 const NEUTRAL = '#8996a4';
 
 export function waveformScale(peaks: number[]) {
@@ -92,14 +92,16 @@ export function rgbPaths(points: WavePoint[], center: number) {
 export function wavePaths(points: WavePoint[], center: number, gain: number) {
   const paths = rgbPaths(points, center);
   if (!gain || !paths.length || points.length < 2) return paths;
-  // Each side of the core may occupy up to 58.5% of the local peak radius.
-  const coreFraction = 0.585;
   const layers = Array.from({ length: 3 }, () => ({ upper: [] as string[], lower: [] as string[] }));
   const visible = [false, false, false];
   for (const point of points) {
     const [low, mid, high] = point.rms ?? [0, 0, 0];
     const sum = low + mid + high;
-    const scale = sum > 0 ? coreFraction * Math.min(center * 0.94 * gain, point.amp / sum) : 0;
+    // Keep the spectral rim visible at thumbnail size. Sustained energy fills
+    // slightly more of the peak envelope than short transients.
+    const relativeEnergy = Math.min(1, sum * gain);
+    const bodyRadius = point.amp * (0.68 + 0.08 * relativeEnergy);
+    const scale = sum > 0 ? bodyRadius / sum : 0;
     const depths = [sum * scale, (mid + high) * scale, high * scale];
     for (let i = 0; i < 3; i++) {
       const x = point.x.toFixed(1);

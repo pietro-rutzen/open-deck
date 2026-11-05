@@ -35,7 +35,7 @@ assert.ok(deep[2] > deep[0] && deep[0] > deep[1], 'bass-led mixed energy reads a
 assert.ok(light[2] > light[0] && light[1] > deep[1] + 50, 'more treble opens violet into lavender');
 assert.ok(channels(1, .2, 0)[0] > 200, 'bass without treble stays warm');
 
-// With equal peaks and a bass dropout, only the outer band should retreat.
+// With equal peaks and a bass dropout, the blue bass band should disappear while the RGB rim stays visible.
 const bands = [[.6, .2, .1], [0, .2, .1]];
 for (const view of ['preview', 'detail']) {
   const points = bands.map((_, x) => ({ x, ...waveColumn([1, 1], bands, x, x + 1, 1, 20, view) }));
@@ -49,12 +49,14 @@ for (const view of ['preview', 'detail']) {
     assert.deepEqual([x0, x1, x2, x3], [0, 1, 1, 0]);
     assert.equal(top0 + bottom0, 40);
     assert.equal(top1 + bottom1, 40);
-    assert.ok(top0 >= 8.3 && top1 >= 8.3);
+    assert.ok(top0 >= 4.8 && top1 >= 4.8);
     if (layer === bass) {
-      assert.equal(bottom0, 31.0); // 20 + (20 × 0.94 × 0.585), rounded for SVG.
+      assert.equal(bottom0, 35.2); // The body fills 76% at full measured energy.
+      assert.ok(bottom1 >= 33.6); // Even quieter band data fills at least 68%.
       assert.ok(bottom0 > bottom1);
     }
-    else assert.equal(bottom0, bottom1);
+    else assert.ok(bottom1 > bottom0);
   }
+  assert.equal(coordinates(bass)[5], coordinates(mids)[5]); // No visible blue at x=1.
   assert.deepEqual(wavePaths(points, 20, structureGain([])), base);
 }
