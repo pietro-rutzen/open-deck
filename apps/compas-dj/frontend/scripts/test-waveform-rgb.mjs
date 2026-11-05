@@ -26,3 +26,11 @@ for (const peak of [0, .25, 1]) {
   if (peak === .25) assert.ok(preview.amp > detail.amp);
   else assert.equal(preview.amp, detail.amp);
 }
+
+// Treble in a full mix can sit well below bass RMS. It must visibly change the hue.
+const channels = (low, mid, high) => frequencyColor(low, mid, high).match(/\d+/g).map(Number);
+const deep = channels(1, .08, .24);
+const light = channels(1, .08, .45);
+assert.ok(deep[2] > deep[0] && deep[0] > deep[1], 'bass-led mixed energy reads as violet');
+assert.ok(light[2] > light[0] && light[1] > deep[1] + 50, 'more treble opens violet into lavender');
+assert.ok(channels(1, .2, 0)[0] > 200, 'bass without treble stays warm');
