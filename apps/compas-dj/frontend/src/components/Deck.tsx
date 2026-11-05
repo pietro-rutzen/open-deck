@@ -1196,7 +1196,7 @@ const OverviewWave = memo(function OverviewWave({
   const step = Math.max(1, Math.ceil(N / Math.max(1, W)));
   const samples: WavePoint[] = [];
   for (let i = 0; i < N; i += step) {
-    const column = waveColumn(peaks, bands, i, Math.min(N, i + step), gain, cy * 0.94);
+    const column = waveColumn(peaks, bands, i, Math.min(N, i + step), gain, cy * 0.94, 'preview');
     samples.push({ ...column, x: column.loudest / N * W });
   }
   return (

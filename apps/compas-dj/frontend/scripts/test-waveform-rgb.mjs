@@ -16,3 +16,13 @@ assert.equal(combined.loudest, 1);
 assert.equal(waveColumn([.4], [], 0, 1, 1, 20).color, frequencyColor(0,0,0));
 assert.deepEqual(rgbPaths([{x:0,amp:0,color:'red'}, {x:1,amp:0,color:'red'}],20), []);
 console.log('RGB waveforms: primary bands, level independence, mixed-column energy, missing bands and silence passed');
+
+// Preview lift keeps a quiet section readable while preserving silence and peak headroom.
+for (const peak of [0, .25, 1]) {
+  const args = [[peak], [[0, 0, 1]], 0, 1, 1, 19];
+  const preview = waveColumn(...args, 'preview');
+  const detail = waveColumn(...args, 'detail');
+  assert.equal(preview.color, detail.color);
+  if (peak === .25) assert.ok(preview.amp > detail.amp);
+  else assert.equal(preview.amp, detail.amp);
+}

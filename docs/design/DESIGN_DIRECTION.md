@@ -88,3 +88,5 @@ The library inspector uses a square segmented control: Summary, Info, and Artwor
 ## Frequency colors (T033)
 
 Use red for bass, green for mids and blue for treble across track rows, the inspector, full-track overviews and scrolling decks. Blend the measured bands for each visible time interval. Shape carries amplitude. Use neutral gray for amplitude-only data. Deck identity belongs on controls and labels. Cue flags retain their assigned colors.
+
+The CDJ sweep in the maintainer’s reference recording shows saturated red, lime and sky blue. Use those anchors in every view. Lift quiet passages slightly in previews so the frequency mix remains visible at list size. Keep the scrolling waveform’s amplitude scale for reading transients.

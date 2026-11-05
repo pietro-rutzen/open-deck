@@ -24,7 +24,7 @@ Current source baseline: aefba51 plus T025–T031 reliability changes in this de
 | 4 | Reproducible release candidate | Green hosted CI, toolchain/platform matrix, audit callback risks and dependency/license provenance |
 | 5 | Distribution | Signed/notarized build, clean-Mac installation, tested recovery instructions, checksums matching tested revision |
 
-Do not add features ahead of outstanding reliability failures. Full historical milestones below retain their strict acceptance criteria; implemented features alone do not close multi-part gates. Latest completed coding task: [T033](tasks/T-033.md); T027 audio-test review and lint gates remain open. Recent handoffs: [T025](handoffs/T-025-20261103-01.md), [T026](handoffs/T-026-20261104-01.md).
+Do not add features ahead of outstanding reliability failures. Full historical milestones below retain their strict acceptance criteria; implemented features alone do not close multi-part gates. Latest completed coding task: [T034](tasks/T-034.md); T027 audio-test review and lint gates remain open. Recent handoffs: [T025](handoffs/T-025-20261103-01.md), [T026](handoffs/T-026-20261104-01.md).
 
 ## Milestones and acceptance gates
 
@@ -460,3 +460,7 @@ Limit scope: PCM accumulator only; codec internals, analysis arrays, total RSS a
 ## T033 — RGB frequency waveforms
 
 - [x] Shared RGB coloring for previews and playing waveforms, including phase-safe stereo band analysis. [Task and handoff](tasks/T-033.md)
+
+## T034 — Brighter CDJ-style waveform previews
+
+- [x] Tune frequency hues against the supplied recording and lift quiet preview passages. [Task and handoff](tasks/T-034.md)

@@ -1,7 +1,7 @@
 // Display-only. Height encodes amplitude and hue encodes the measured spectral mix.
 type Bands = readonly [number, number, number];
 const finite = (value: number) => Number.isFinite(value) ? Math.max(0, value) : 0;
-export const RGB_WAVE_KEY = 'Waveform colors: bass red, mids green, treble blue. Mixed frequencies blend.';
+export const RGB_WAVE_KEY = 'Waveform colors: bass red, mids green, treble sky blue. Mixed frequencies blend.';
 const NEUTRAL = '#8996a4';
 
 export function waveformScale(peaks: number[]) {
@@ -15,9 +15,11 @@ export function frequencyColor(low: number, mid: number, high: number) {
   const r = finite(low), g = finite(mid), b = finite(high);
   const max = Math.max(r, g, b);
   if (max === 0) return NEUTRAL;
-  const level = (value: number) => Math.round(5 * value / max) / 5;
+  // Strong band contrasts survive downscaling into a narrow library column.
+  const level = (value: number) => Math.round(7 * (value / max) ** 1.35) / 7;
   const red = level(r), green = level(g), blue = level(b);
-  return `rgb(${Math.round(40 + 215 * red)},${Math.round(47 + 157 * green + 45 * blue)},${Math.round(53 + 32 * green + 170 * blue)})`;
+  const channel = (a: number, b: number, c: number) => Math.round(Math.max(a * red, b * green, c * blue));
+  return `rgb(${channel(255, 66, 8)},${channel(16, 255, 151)},${channel(33, 10, 255)})`;
 }
 
 export interface WavePoint { x: number; amp: number; color: string }
@@ -25,7 +27,7 @@ export interface WavePoint { x: number; amp: number; color: string }
 // Pool power across the whole output column, so a kick cannot erase a quieter hi-hat
 // from its color. The peak from that same interval supplies the silhouette.
 export function waveColumn(peaks: number[], bands: Bands[], start: number, end: number,
-  gain: number, radius: number) {
+  gain: number, radius: number, view: 'detail' | 'preview' = 'detail') {
   let loudest = start, peak = 0, low = 0, mid = 0, high = 0;
   const measured = bands.length === peaks.length;
   for (let i = start; i < end; i++) {
@@ -37,7 +39,8 @@ export function waveColumn(peaks: number[], bands: Bands[], start: number, end: 
       high += finite(bands[i][2]) ** 2;
     }
   }
-  return { loudest, amp: Math.pow(Math.min(1, peak * gain), 0.72) * radius,
+  const exponent = view === 'preview' ? 0.56 : 0.72;
+  return { loudest, amp: Math.pow(Math.min(1, peak * gain), exponent) * radius,
     color: frequencyColor(Math.sqrt(low), Math.sqrt(mid), Math.sqrt(high)) };
 }
 

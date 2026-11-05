@@ -102,7 +102,7 @@ export function MiniWaveform({ peaks, bands = [], label = "Track frequency and a
     const gain = waveformScale(peaks);
     const count = Math.min(peaks.length, 256);
     const points = Array.from({ length: count }, (_, i) => ({
-      ...waveColumn(peaks, bands, Math.floor(i * peaks.length / count), Math.floor((i + 1) * peaks.length / count), gain, 19),
+      ...waveColumn(peaks, bands, Math.floor(i * peaks.length / count), Math.floor((i + 1) * peaks.length / count), gain, 19, 'preview'),
       x: ((i + 0.5) * 256) / count,
     }));
     return rgbPaths(points, 20);

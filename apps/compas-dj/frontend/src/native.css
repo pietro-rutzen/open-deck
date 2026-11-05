@@ -233,7 +233,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .wf-now { background: #fff; }
 .wf-scrim { background: #080a0d12; }
 .wf-svg, .ov-svg, .mini-waveform { opacity: 1; }
-.mini-waveform { height: 25px; }
+.mini-waveform { height: 25px; background: #090b10; shape-rendering: crispEdges; }
 .tl-mini-wave { height: 26px; }
 /* Content determines deck height. Secondary controls are explicit rather than cropped. */
 .content { overflow-y: auto; }
