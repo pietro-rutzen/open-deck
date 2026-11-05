@@ -1081,7 +1081,11 @@ impl DeckPlayer {
                 }
             }
             CueMode::Gated => {
-                // Play from the cue point while held; return to it on release.
+                // A release from an old controller session may arrive after track replacement.
+                if !pressed && !self.cue_previewing {
+                    return;
+                }
+                self.cue_previewing = pressed;
                 self.playhead = self.cue_point;
                 self.playing = pressed;
                 self.keylock.mark_jumped();
@@ -1351,8 +1355,8 @@ impl HeadphoneDelay {
         } else {
             0.0
         };
-        let samples = (f64::from(milliseconds) * f64::from(device_rate.max(1.0)) / 1000.0).round()
-            as usize;
+        let samples =
+            (f64::from(milliseconds) * f64::from(device_rate.max(1.0)) / 1000.0).round() as usize;
         self.delay_samples = samples.min(self.left.len().saturating_sub(1));
     }
 
@@ -2274,6 +2278,7 @@ impl Mixer {
                         d.fx.reset();
                         d.playhead = 0.0;
                         d.loop_active = false;
+                        d.cue_previewing = false;
                         d.censoring = false;
                         d.censor_was_playing = false;
                         d.slip_playhead = 0.0;
@@ -3812,6 +3817,17 @@ mod tests {
     }
 
     #[test]
+    fn late_gated_release_preserves_playback_without_an_active_hold() {
+        let mut d = DeckPlayer::new(48_000.0);
+        d.cue_mode = CueMode::Gated;
+        d.playhead = 1500.0;
+        d.playing = true;
+        d.cue_button(false);
+        assert!(d.playing);
+        assert_eq!(d.playhead, 1500.0);
+    }
+
+    #[test]
     fn gated_cue_plays_from_point_and_returns_on_release() {
         let mut d = ramp_deck();
         d.cue_mode = CueMode::Gated;
@@ -3884,3 +3900,7 @@ mod tests {
         assert!(d.playhead <= 99.0, "play-head clamps to the last frame");
     }
 }
+
+#[cfg(test)]
+#[path = "mixer_reliability_tests.rs"]
+mod reliability_tests;

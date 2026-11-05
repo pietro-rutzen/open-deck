@@ -47,3 +47,7 @@ A specialist returns ready-for-review; the orchestrator marks done only after ac
 ## Review rules
 
 Flag callback allocations/locks, UI-controlled timing, unbounded queues, unsafe lifetime changes, unvalidated IPC/MIDI values, audible device-switch failures and unsupported compatibility claims. DSP changes need audio/DSP review; device/controller changes need macOS/MIDI review; engine boundary changes need both backend and DSP review. Never bypass failing checks to mark a milestone complete.
+
+## Maintainer delivery preference
+
+After completing and verifying a change, rebuild with `./scripts/opendeck-build.sh` and install the finished bundle with `./scripts/opendeck-install.sh`. The maintainer uses `/Applications/Open Deck.app`. Commit finished project changes and push to the configured origin branch. Verify the remote revision and report any failed installation or push. Preserve unrelated working files.

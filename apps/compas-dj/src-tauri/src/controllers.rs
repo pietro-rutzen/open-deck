@@ -310,15 +310,85 @@ const FLX4_ZOOM_CC: u8 = 0x64;
 const FLX4_BROWSE_PRESS_NOTES: [u8; 2] = [0x41, 0x42];
 const FLX4_LOAD_NOTES: [u8; 2] = [0x46, 0x47];
 
+// Stateless press decoding: PFL, transport and prior releases cannot latch LOAD off.
+fn flx4_load_pressed(status: u8, note: u8, velocity: u8) -> Option<usize> {
+    (status == 0x96 && velocity > 0)
+        .then(|| {
+            FLX4_LOAD_NOTES
+                .iter()
+                .position(|candidate| *candidate == note)
+        })
+        .flatten()
+}
+
 struct LoopInHold {
     since: Instant,
     heard_frame: Option<f64>,
     fired: bool,
 }
 
+/// A physical button may disappear before its release arrives. Track only the two
+/// native deck actions whose effect lasts until release, never latched headphone PFL.
+#[derive(Default)]
+struct HeldDeckButtons {
+    cue: [bool; DECK_COUNT],
+    censor: [bool; DECK_COUNT],
+}
+
+impl HeldDeckButtons {
+    fn send(
+        &mut self,
+        tx: &crate::engine_commands::Sender<crate::EngineMsg>,
+        message: crate::EngineMsg,
+    ) -> Result<(), String> {
+        use crate::EngineMsg;
+        let edge = match &message {
+            EngineMsg::CueButton { deck, pressed } => {
+                self.cue.get_mut(*deck).map(|v| (v, *pressed))
+            }
+            EngineMsg::SetCensor { deck, active } => {
+                self.censor.get_mut(*deck).map(|v| (v, *active))
+            }
+            _ => None,
+        };
+        tx.send(message)?;
+        if let Some((held, pressed)) = edge {
+            *held = pressed;
+        }
+        Ok(())
+    }
+
+    fn release(
+        &mut self,
+        tx: &crate::engine_commands::Sender<crate::EngineMsg>,
+    ) -> Result<(), String> {
+        let mut releases = Vec::new();
+        for deck in 0..DECK_COUNT {
+            if self.censor[deck] {
+                releases.push(crate::EngineMsg::SetCensor {
+                    deck,
+                    active: false,
+                });
+            }
+            if self.cue[deck] {
+                releases.push(crate::EngineMsg::CueButton {
+                    deck,
+                    pressed: false,
+                });
+            }
+        }
+        if !releases.is_empty() {
+            tx.send_group(releases)?;
+            *self = Self::default();
+        }
+        Ok(())
+    }
+}
+
 /// Routes resolved controller updates: natively owned controls go straight to the engine queue,
 /// continuous UI-owned controls are coalesced, discrete actions are delivered immediately.
 struct Router {
+    held: HeldDeckButtons,
     midi_received: Option<Instant>,
     app: AppHandle,
     telemetry: Arc<DeckTelemetry>,
@@ -394,11 +464,11 @@ impl Router {
         ) {
             let engine = self.app.state::<crate::EngineHandle>();
             let commanded = action.message.is_some() || !action.messages.is_empty();
-            if let Some(message) = action.message {
-                let _ = engine.send(message);
-            }
-            for message in action.messages {
-                let _ = engine.send(message);
+            for message in action.message.into_iter().chain(action.messages) {
+                if let Err(error) = self.held.send(&engine.tx, message) {
+                    tracing::warn!("Controller action could not reach the engine: {error}");
+                    return;
+                }
             }
             if commanded {
                 self.probe();
@@ -436,7 +506,9 @@ impl Router {
             update.heard_frame.get_or_insert(position.heard_frame);
         }
         self.flush();
-        let _ = self.app.emit("controller:update", update);
+        if let Err(error) = self.app.emit("controller:update", update) {
+            tracing::warn!("controller update delivery failed: {error}");
+        }
     }
 
     fn flush(&mut self) {
@@ -540,6 +612,7 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
 
     let telemetry = app.state::<crate::EngineHandle>().telemetry.clone();
     let mut router = Router {
+        held: HeldDeckButtons::default(),
         midi_received: None,
         app: app.clone(),
         telemetry: telemetry.clone(),
@@ -690,6 +763,18 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        if matches!(
+            &msg,
+            ControllerMsg::SetOutputPort(None)
+                | ControllerMsg::Activate(_)
+                | ControllerMsg::Deactivate
+        ) {
+            if let Err(error) = router.held.release(&app.state::<crate::EngineHandle>().tx) {
+                tracing::warn!("Controller button release failed: {error}");
+            }
+            loop_in_holds = [None, None];
+            clear_loop_adjust(&app);
+        }
         match msg {
             ControllerMsg::Learn(active) => learning = active,
             ControllerMsg::SetOutputPort(name) => {
@@ -735,8 +820,6 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 flx4_profile = profile.id == "pioneer-ddj-flx4";
                 meter_last = [255; 2];
                 router.tempo_range = [FLX4_TEMPO_RANGES[0], FLX4_TEMPO_RANGES[0]];
-                clear_loop_adjust(&app);
-                loop_in_holds = [None, None];
                 high_resolution = [[0; 32]; 16];
                 mapping = profile.mapping();
                 script = profile
@@ -764,8 +847,6 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 pad_mode = [None, None];
                 flx4_profile = false;
                 router.tempo_range = [FLX4_TEMPO_RANGES[0], FLX4_TEMPO_RANGES[0]];
-                clear_loop_adjust(&app);
-                loop_in_holds = [None, None];
                 mapping = Mapping::default();
                 script = None;
                 current.clear();
@@ -914,8 +995,9 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                             break 'resolve true;
                         }
                         if status == 0x96 && FLX4_LOAD_NOTES.contains(&d1) {
-                            let deck = usize::from(d1 - FLX4_LOAD_NOTES[0]);
-                            if raw_d2 > 0 && !telemetry.is_playing(deck) {
+                            // LOAD follows the same explicit replacement policy as drag/drop.
+                            // Playing telemetry must not silently disable a physical button.
+                            if let Some(deck) = flx4_load_pressed(status, d1, raw_d2) {
                                 router.emit_now(ControllerUpdateEvent::new(
                                     format!("library.load.{deck}"),
                                     1.0,
@@ -1238,6 +1320,67 @@ fn midi_bytes(channel: u8, input: InputKind, value: u8) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_end_releases_only_still_held_controls_once() {
+        use crate::EngineMsg::{CueButton, SetCensor};
+        let (tx, mut rx) = crate::engine_commands::channel();
+        let mut held = HeldDeckButtons::default();
+        for msg in [
+            CueButton {
+                deck: 0,
+                pressed: true,
+            },
+            CueButton {
+                deck: 0,
+                pressed: false,
+            },
+            SetCensor {
+                deck: 1,
+                active: true,
+            },
+            CueButton {
+                deck: 2,
+                pressed: true,
+            },
+        ] {
+            held.send(&tx, msg).unwrap();
+            rx.recv_timeout(Duration::ZERO).unwrap();
+        }
+        held.release(&tx).unwrap();
+        held.release(&tx).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::ZERO),
+            Ok(SetCensor {
+                deck: 1,
+                active: false
+            })
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::ZERO),
+            Ok(CueButton {
+                deck: 2,
+                pressed: false
+            })
+        ));
+        assert!(rx.recv_timeout(Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn flx4_load_is_repeatable_and_independent_of_transport_and_pfl() {
+        for _ in 0..10_000 {
+            // Browsing, PFL presses/releases and playback do not participate in LOAD admission.
+            for (status, note, value) in [(0xb6, 0x40, 1), (0x90, 0x54, 127), (0x80, 0x54, 0)] {
+                assert_eq!(flx4_load_pressed(status, note, value), None);
+            }
+            for (deck, note) in FLX4_LOAD_NOTES.into_iter().enumerate() {
+                assert_eq!(flx4_load_pressed(0x96, note, 127), Some(deck));
+                assert_eq!(flx4_load_pressed(0x96, note, 0), None);
+                assert_eq!(flx4_load_pressed(0x86, note, 64), None);
+                assert_eq!(flx4_load_pressed(0x96, note, 1), Some(deck));
+            }
+        }
+    }
 
     #[test]
     fn flx4_high_resolution_crossfade_endpoints_and_lsb_and_jog_isolation() {

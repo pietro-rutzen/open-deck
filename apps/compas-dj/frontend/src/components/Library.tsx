@@ -66,6 +66,7 @@ import {
   reorderPaths,
   writeFolderOrders,
 } from '../lib/libraryFolders';
+import { controllerLoadPath, selectedControllerRow, stepControllerRow } from '../lib/libraryController';
 import { filterLibraryTracks } from '../lib/librarySearch';
 import { listeningModeActive, setListeningMode } from '../lib/listeningMode';
 import { enqueueOnDeck, forgetQueuedPaths, readQueuedPaths, retargetNextQueuePaths, subscribeNextQueue } from '../lib/nextQueue';
@@ -281,7 +282,23 @@ export const Library = memo(
     useImperativeHandle(ref, () => rootRef.current as HTMLElement);
     // Search results (engine grammar) and a "suggest next" override; null = show the full library.
     const [results, setResults] = useState<DbTrack[] | null>(null);
-    const [selectedPath, setSelectedPath] = useState<string | null>(null);
+    // Both the controller and the mouse own the same row identity. Update the ref
+    // synchronously so several MIDI events before React renders cannot reuse an old index.
+    const [browseKey, storeBrowseKey] = useState<string | null>(null);
+    const selectionKeyRef = useRef<string | null>(null);
+    const setBrowseKey = (next: string | null | ((key: string | null) => string | null)) => {
+      const key = typeof next === 'function' ? next(selectionKeyRef.current) : next;
+      selectionKeyRef.current = key;
+      storeBrowseKey(key);
+    };
+    const selectedPath = browseKey?.startsWith('track:') ? browseKey.slice(6) : null;
+    const setSelectedPath = (next: string | null | ((path: string | null) => string | null)) => {
+      const key = selectionKeyRef.current;
+      const current = key?.startsWith('track:') ? key.slice(6) : null;
+      const path = typeof next === 'function' ? next(current) : next;
+      if (typeof next === 'function' && path === current) return;
+      setBrowseKey(path == null ? null : `track:${path}`);
+    };
     const [, setNextQueueVersion] = useState(0);
     useEffect(() => subscribeNextQueue(() => setNextQueueVersion((version) => version + 1)), []);
     useEffect(() => {
@@ -312,7 +329,6 @@ export const Library = memo(
     const folderEditBusy = useRef(false);
     const [folderRenameBusy, setFolderRenameBusy] = useState(false);
     const closeFolderMenu = useCallback(() => setFolderMenu(null), []);
-    const [browseKey, setBrowseKey] = useState<string | null>(null);
     const openedInitialFolder = useRef(readStoredView() !== 'unset');
     const reportError = (error: unknown) => setActionError(String(error));
     const load = async (deck: number, path: string) => {
@@ -400,6 +416,7 @@ export const Library = memo(
     const clearView = () => {
       openedInitialFolder.current = true;
       setFolderPath(null);
+      setBrowseKey(null);
       setResults(null);
       setQ('');
     };
@@ -712,9 +729,6 @@ export const Library = memo(
         setFolders((current) =>
           current.map((folder) => retargetFolderPath(folder, edit.from, next)),
         );
-        setSelectedPath((path) =>
-          path ? retargetFolderPath(path, edit.from, next) : path,
-        );
         setBrowseKey((key) => retargetBrowseKey(key, edit.from, next));
         retargetStoredFolder(PLAYING_FOLDER_KEY, edit.from, next);
         retargetStoredFolder(VIEW_FOLDER_KEY, edit.from, next);
@@ -729,9 +743,6 @@ export const Library = memo(
         const updatedOrders = folderOrdersAfterDelete(folderOrders, edit.from);
         writeFolderOrders(updatedOrders);
         setFolderOrders(updatedOrders);
-        setSelectedPath((path) =>
-          path && isInside(edit.from, path) ? null : path,
-        );
         setBrowseKey((key) => retargetBrowseKey(key, edit.from, null));
         retargetStoredFolder(PLAYING_FOLDER_KEY, edit.from, null);
         retargetStoredFolder(VIEW_FOLDER_KEY, edit.from, null);
@@ -1020,25 +1031,14 @@ export const Library = memo(
     const selectedBrowse =
       browseRows.find((row) => row.key === browseKey) ?? null;
     useEffect(() => {
-      if (!selectedPath) return;
-      if (folderTracks.some((track) => track.path === selectedPath)) {
+      if (selectedPath && folderTracks.some((track) => track.path === selectedPath))
         movedTo.current.clear();
-        return;
-      }
-      if ([...movedTo.current.values()].includes(selectedPath)) return;
-      setSelectedPath(null);
+      // Keep identity through asynchronous refreshes. LOAD resolves against the
+      // current visible rows and reports a missing selection instead of loading another row.
     }, [folderTracks, selectedPath]);
-    const browseIndexRef = useRef(-1);
     const sourceIndexRef = useRef(0);
     const browseRowsRef = useRef(browseRows);
     browseRowsRef.current = browseRows;
-    useEffect(() => {
-      browseIndexRef.current = browseRows.findIndex(
-        (row) =>
-          row.key === browseKey ||
-          (row.kind === 'track' && row.track.path === selectedPath),
-      );
-    }, [browseRows, browseKey, selectedPath]);
     useEffect(() => {
       if (folderPath)
         sourceIndexRef.current =
@@ -1051,6 +1051,7 @@ export const Library = memo(
     }, [folderPath, folders]);
     const revealRow = (key: string) =>
       requestAnimationFrame(() => {
+        if (selectionKeyRef.current !== key) return;
         const row = rootRef.current?.querySelector<HTMLElement>(
           `[data-browse-key="${CSS.escape(key)}"]`,
         );
@@ -1058,11 +1059,9 @@ export const Library = memo(
         row?.scrollIntoView({ block: 'nearest' });
       });
     const selectBrowse = (index: number, focus = false) => {
-      const row = browseRows[index];
+      const row = browseRowsRef.current[index];
       if (!row) return;
-      browseIndexRef.current = index;
       setBrowseKey(row.key);
-      setSelectedPath(row.kind === 'track' ? row.track.path : null);
       if (focus) revealRow(row.key);
     };
     const enterBrowse = (row: BrowseRow) => {
@@ -1102,7 +1101,7 @@ export const Library = memo(
     );
     hardwareRef.current = (control, value) => {
       if (control === 'library.focus' && value > 0) {
-        const row = browseRowsRef.current[browseIndexRef.current];
+        const row = selectedControllerRow(browseRowsRef.current, selectionKeyRef.current);
         if (browseTarget === 'tracks' && row && row.kind !== 'track') {
           enterBrowse(row);
           return;
@@ -1114,30 +1113,34 @@ export const Library = memo(
       if (control === 'library.browse' && value !== 0) {
         if (browseTarget === 'sources') browseSources(Math.trunc(value));
         else {
-          const rows = browseRowsRef.current;
-          const next = Math.max(
-            0,
-            Math.min(
-              rows.length - 1,
-              browseIndexRef.current + Math.trunc(value),
-            ),
-          );
-          selectBrowse(next, true);
+          const row = stepControllerRow(browseRowsRef.current, selectionKeyRef.current, value);
+          if (row) {
+            setBrowseKey(row.key);
+            revealRow(row.key);
+          }
         }
       }
       const target = control.match(/^library\.load\.([01])$/);
-      const row = browseRowsRef.current[browseIndexRef.current];
-      if (target && row?.kind === 'track' && value > 0)
-        load(Number(target[1]), row.track.path);
+      if (target && value > 0) {
+        try {
+          const path = controllerLoadPath(browseRowsRef.current, selectionKeyRef.current);
+          void load(Number(target[1]), path);
+        } catch (error) { reportError(error); }
+      }
     };
     useEffect(() => {
       if (!inTauri()) return;
-      const un = onControllerUpdate((u) =>
-        hardwareRef.current(u.control, u.value),
-      );
-      return () => {
-        un.then((fn) => fn());
-      };
+      let alive = true;
+      let stop: (() => void) | undefined;
+      onControllerUpdate((u) => {
+        if (alive) hardwareRef.current(u.control, u.value);
+      }).then((unlisten) => {
+        if (alive) stop = unlisten;
+        else unlisten();
+      }).catch((error) => {
+        if (alive) reportError(`Controller library connection failed: ${String(error)}`);
+      });
+      return () => { alive = false; stop?.(); };
     }, []);
 
     return (
@@ -1411,8 +1414,7 @@ export const Library = memo(
               ) : (
                 browseRows.map((row, index) => {
                   const selectedRow =
-                    row.key === browseKey ||
-                    (row.kind === 'track' && row.track.path === selectedPath);
+                    row.key === browseKey;
                   const move = (next: number) =>
                     selectBrowse(
                       Math.max(0, Math.min(browseRows.length - 1, next)),
@@ -1594,8 +1596,7 @@ export const Library = memo(
                       }
                       onClick={() => selectBrowse(index)}
                       onFocus={() => {
-                        setBrowseKey(row.key);
-                        setSelectedPath(t.path);
+                        if (selectionKeyRef.current !== row.key) setBrowseKey(row.key);
                       }}
                       onDoubleClick={() => {
                         selectBrowse(index);

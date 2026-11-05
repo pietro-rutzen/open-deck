@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "icons": "node scripts/gen-icons.mjs",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "node scripts/test-library-controller.mjs && node scripts/test-hot-cue-markers.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

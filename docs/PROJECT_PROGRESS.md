@@ -1,6 +1,6 @@
 # OpenDeck project progress
 
-Updated: 2026-10-30 (Europe/Helsinki). This is the authoritative project resume index; task records contain detailed claims and evidence.
+Updated: 2026-11-05 (Europe/Helsinki). This is the authoritative project resume index; task records contain detailed claims and evidence.
 
 ## Current status
 
@@ -12,13 +12,19 @@ Spotify mixing is blocked on partner access: public Spotify developer tools proh
 
 ## Active work and next action
 
-| Task | State | Owner/session | Reviewer | Evidence |
-|---|---|---|---|---|
-| T-001: local native prototype | in_progress | orchestrator / current chat | controller_audit specialist | [Task](tasks/T-001.md) |
+The local app has been used at a party. User reported a LOAD failure after extended use; T025 fixes identified selection races and a silent hardware-only playing gate, but the exact long-session incident has not been reproduced. T026 user-confirmed unplug/replug, browse and LOAD work without relaunch (2026-11-04). This is a limited hardware pass, not complete M5/M6 qualification.
 
-Engine `cargo test --locked` passed (two reference cases ignored); frontend build passed. Native debug app bundle built and launched. Generated WAV loaded/analyzed; bundled FLX4 profile displays 20 bindings. Physical FLX4 response and audible playback NOT TESTED. User can connect controller and choose tracks. Generated WAVs available in `samples/`.
+Current source baseline: aefba51 plus T025–T031 reliability changes in this delivery. Native prototype supports local files, controller mapping/LEDs, master/cue routing and responsive library/decks. No production release has been qualified.
 
-Next action: user connects FLX4 and chooses local tracks; verify playback, actual mapped controls and output routing. Keep routing/jog limitations visible. Milestone acceptance remains open until its full criteria pass.
+| Priority | Next gate | Status / evidence |
+|---|---|---|
+| 1 | Repeatable reliability regression checks | T027 in progress: real offline mixer stress plus library/marker CI tests |
+| 2 | Bounded command/load admission and state recovery | Audit remaining unbounded control queue, decoder concurrency and device-restart state; fix with explicit failure behavior |
+| 3 | Measured hardware endurance and latency | At least 60-minute real two-deck session with analysis/controller activity; capture dropout counters and separate physical loopback latency |
+| 4 | Reproducible release candidate | Green hosted CI, toolchain/platform matrix, audit callback risks and dependency/license provenance |
+| 5 | Distribution | Signed/notarized build, clean-Mac installation, tested recovery instructions, checksums matching tested revision |
+
+Do not add features ahead of outstanding reliability failures. Full historical milestones below retain their strict acceptance criteria; implemented features alone do not close multi-part gates. Latest completed coding task: [T031](tasks/T-031.md); T027 audio-test review and lint gates remain open. Recent handoffs: [T025](handoffs/T-025-20261103-01.md), [T026](handoffs/T-026-20261104-01.md).
 
 ## Milestones and acceptance gates
 
@@ -126,7 +132,7 @@ Acceptance: installable verified artifact and matching source/evidence. Never re
 | R1 | Compás core may require maintained extraction/fork | architect-planner | Pinned build, dependency and API audit in M1 |
 | R2 | Upstream real-time claims are unverified here | audio-dsp | Callback audit plus instrumented target build |
 | R3 | FLX4 channel layout, mapping and firmware behavior unverified | macos-midi | Actual enumeration, captures and physical tests |
-| R4 | No source checkout, hardware or release credentials assessed | orchestrator | Inventory in actual repository/session |
+| R4 | Release credentials and clean-machine installation not assessed | orchestrator | Inventory in actual repository/session |
 | R5 | Parallel agents can conflict on contracts/shared files | orchestrator | Exclusive claims and sequential integration records |
 
 ## Decision log
@@ -139,7 +145,7 @@ Acceptance: installable verified artifact and matching source/evidence. Never re
 
 ## Handoff index and update rules
 
-No product task handoff exists yet. Initial resume context is this tracker and README. Add newest handoff link to each active task and append an index entry here at session end.
+Product handoffs are in docs/handoffs; the active-work section and each task entry link the latest evidence. Historical notes below describe their original checkpoints.
 
 Orchestrator is the single writer unless an exclusive docs-release assignment is recorded. Update after claim/status/review/integration/blocker changes and session end. Include owner/session, reviewer, revision, evidence and next action. Only check criteria with actual evidence. Reopen invalidated items with reason. Preserve stable IDs and historical failures. Detailed protocol: [workflow](AGENT_WORKFLOW.md); reusable records: [task](templates/TASK.md), [handoff](templates/HANDOFF.md), [verification](templates/VERIFICATION.md), [ADR](templates/ADR.md).
 
@@ -361,3 +367,84 @@ Owner root; controller specialist controller_audit; reviewer deck_layout_review.
 - [ ] Physical party rehearsal: FLX4 master plus headphones, and laptop-output playback. NOT RUN.
 
 Owner root. [Task](tasks/T-024.md), [handoff](handoffs/T-024-20261030-01.md). No latency or hardware certification. Beat FX and the listening pass remain open.
+
+## T025 — Post-party LOAD reliability and scrolling hot cues (2026-11-03)
+
+User reports party mostly successful, but hardware LOAD stopped even with destination paused; drag/drop still worked. This is a real unresolved hardware incident, not a passed soak test.
+
+- [x] Remove hardware-only silent playing lock; controller LOAD follows existing UI replacement behavior.
+- [x] Replace stale browser indexes/conflicting selection identities with one synchronous stable key; protect against delayed focus reversal; visible selection/listener errors.
+- [x] Add scrolling numbered cue markers sharing the overview/pad palette, with source-rate/tempo/resize-aware placement.
+- [x] Selection regression script (10,000 refresh/reorder cycles), marker projection tests, frontend build and 126 native tests pass; one known local Trash-permission test excluded.
+- [x] Final bundle and native marker visual verification; app reopened paused.
+- [ ] Extended physical FLX4 load session (controller now connected; short reconnect/LOAD check passed).
+
+Owner root; implementation load_failure_audit (library), root (native/markers); review load_fix_review. [Task](tasks/T-025.md). No claim of exact incident reproduction or long-session reliability from unit tests.
+
+T025 [handoff](handoffs/T-025-20261103-01.md): existing saved cue visibly confirmed in scrolling waveform at 32s zoom. Exact incident reproduction remains open.
+
+## T026 — Persistent MIDI discovery
+
+- [x] Found and removed per-second MIDI client creation; initialize reusable discovery on main thread before MIDI workers.
+- [x] Independent review, 127 native tests, bundle and native launch (one known local Trash test excluded).
+- [x] User confirmed unplug/replug, browse and LOAD without relaunch on 2026-11-04 (limited hardware check).
+
+Owner root; reviewer hotplug_audit. [Task](tasks/T-026.md). T025 user connected FLX4; restart visibly restored MIDI connection and headphones. That startup observation preceded the later user-confirmed unplug/replug pass.
+
+T026 [handoff](handoffs/T-026-20261104-01.md): 2026-11-04 build opened; user subsequently confirmed unplug/replug, browsing and LOAD without restart.
+
+## T027 — Repeatable reliability qualification
+
+Owner root (took over audio tests after specialist usage limit); reviewer reliability_review approved CI wiring, audio review pending. [Task](tasks/T-027.md), [handoff](handoffs/T-027-20261104-01.md).
+
+- [x] Offline hour PASS: 7,200 deck replacements in 125.25 seconds; synthetic sample time only.
+- [x] Default offline mixer regression: repeated replacement, PFL/faders, pause, looping and buffer ownership.
+- [x] Library selection and cue-marker tests wired into npm test and CI.
+- [x] Frontend test/typecheck/build; 92 engine and 127 native tests passed (one known local Trash test excluded).
+- [ ] Independent audio-test review; specialist capacity exhausted this session.
+- [ ] Strict lint/hosted CI green: existing audio Clippy warnings remain blockers.
+- [ ] Physical session/latency qualification remains open.
+
+Next: clear strict lint blockers, independently review the harness, then bound simultaneous full-track decodes to protect memory during rapid LOAD use.
+
+## T028 — Bound rapid deck loads
+
+Owner root/backend; independent reviewer load_admission_review. [Task](tasks/T-028.md), [handoff](handoffs/T-028-20261104-01.md).
+
+- [x] Single process-lifetime decoder, one latest pending request per deck, round-robin service.
+- [x] Stale queued requests skip decoding; generation guards preserve latest-only publication.
+- [x] Panic isolation and latest-only error handling keep later loads serviceable.
+- [x] Backend independent review found no blockers.
+- [x] Final integrated tests: 129 PASS (one known local Trash exclusion), desktop bundle PASS; see handoff.
+
+This bounds simultaneous deck jobs, not individual track size or upstream engine messages. Current decode cannot be interrupted. No new hardware qualification claimed.
+
+## T029 — Track PCM limit and cooperative cancellation
+
+Owner root/backend; reviewer load_admission_review. [Task](tasks/T-029.md), [handoff](handoffs/T-029-20261104-01.md).
+
+- [x] Actual decoded deck PCM capped at 512 MiB; no duration-based allocation.
+- [x] Superseded loads stop between source reads; stale failures remain suppressed.
+- [x] Geometric fallible allocation, rate/empty/stereo validation, additional analysis-stage generation checks.
+- [x] Independent backend review PASS; 134 native tests PASS (one known local Trash exclusion).
+- [x] Final desktop bundle PASS; evidence recorded in handoff.
+
+Limit scope: PCM accumulator only; codec internals, analysis arrays, total RSS and uninterruptible I/O remain outside this guarantee. Next reliability gate: bounded upstream engine command admission and recoverable stream state; T027 independent audio-test review/strict lint and physical endurance remain open.
+
+## T030 — Grouped track load commands
+
+- [x] Submit track audio, replay gain and pitch reset in one channel message.
+- [x] Record current and peak queue depth. Closing the receiver clears the reported live backlog.
+- [x] Backend and DSP reviews, native tests and desktop build passed on 2026-11-05.
+- [ ] Protect paired press/release commands and remaining multi-command operations before enforcing an upstream capacity limit.
+
+[Task](tasks/T-030.md) · [Verification and handoff](handoffs/T-030-20261105-01.md)
+
+## T031 — Held controls on controller disconnect
+
+- [x] End native deck CUE/reverse holds when an input closes or a mapping changes.
+- [x] Preserve new track playback if a gated cue release arrives after its old hold ended.
+- [x] Controller/mixer regression tests and DSP review passed.
+- [ ] Physical held-button disconnect check.
+
+[Task](tasks/T-031.md) · [Handoff](handoffs/T-031-20261105-01.md)

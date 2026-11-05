@@ -165,6 +165,8 @@ export interface EngineStatus {
   sample_rate: number;
   audio_online: boolean;
   audio_restarting: boolean;
+  command_queue_outstanding: number;
+  command_queue_high_water: number;
   audio_restarts: number;
   audio_error: string | null;
   master_device: string | null;

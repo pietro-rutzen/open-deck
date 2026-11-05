@@ -70,6 +70,9 @@ jobs:
       - name: Typecheck
         working-directory: apps/compas-dj/frontend
         run: npm run typecheck
+      - name: Regression tests
+        working-directory: apps/compas-dj/frontend
+        run: npm test
       - name: Build
         working-directory: apps/compas-dj/frontend
         run: npm run build

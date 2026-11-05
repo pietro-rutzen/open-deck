@@ -3,7 +3,7 @@
 //! Threading: the real-time audio engine (`compas-audio`) lives on its own thread
 //! because `cpal::Stream` is not `Send`. Tauri commands send coarse [`EngineMsg`]s over
 //! an mpsc channel; the engine thread forwards them as lock-free `AudioCommand`s.
-//! Decoding/analysis runs on a per-load worker thread and reports back via Tauri events.
+//! Decoding/analysis runs on a shared bounded-admission worker thread and reports back via Tauri events.
 //! A telemetry thread samples lock-free deck position/state and emits it at UI rate.
 
 use std::fs::File;
@@ -18,6 +18,7 @@ mod controller_session;
 mod controllers;
 mod db;
 mod device_rate;
+mod engine_commands;
 mod export;
 mod flx4_jog;
 mod flx4_runtime;
@@ -28,6 +29,8 @@ mod headphone;
 mod hid;
 mod master_route;
 use headphone::CueState;
+mod deck_decode_worker;
+mod deck_loading;
 mod deck_loads;
 mod library_analysis;
 #[cfg(target_os = "macos")]
@@ -305,7 +308,7 @@ enum EngineMsg {
 /// Tauri-managed handle: a channel to the audio thread plus shared telemetry and output health.
 struct EngineHandle {
     jog_output: flx4_runtime::JogOutput,
-    tx: Sender<EngineMsg>,
+    tx: engine_commands::Sender<EngineMsg>,
     telemetry: Arc<DeckTelemetry>,
     audio: Arc<AudioRuntimeStatus>,
     /// True while a master recording is in progress (guards against double-start).
@@ -481,7 +484,7 @@ fn spawn_engine() -> EngineHandle {
         AtomicU64::new(flx4_runtime::INACTIVE)
     }));
     let jog_for_thread = jog_output.clone();
-    let (tx, rx) = channel::<EngineMsg>();
+    let (tx, mut rx) = engine_commands::channel::<EngineMsg>();
     let telemetry = Arc::new(DeckTelemetry::new());
     let audio = Arc::new(AudioRuntimeStatus::new());
 
@@ -942,6 +945,8 @@ struct DeckErrorEvent {
 
 #[derive(Serialize)]
 struct EngineStatus {
+    command_queue_outstanding: usize,
+    command_queue_high_water: usize,
     controller_probe_count: u64,
     controller_probe_last_us: u64,
     controller_probe_max_us: u64,
@@ -1025,7 +1030,10 @@ fn engine_status_snapshot(
         })
         .collect();
     let master = master_route::session(&state.audio);
+    let (command_queue_outstanding, command_queue_high_water) = state.tx.diagnostics();
     EngineStatus {
+        command_queue_outstanding,
+        command_queue_high_water,
         controller_probe_count: state.telemetry.controller_probe_count(),
         controller_probe_last_us: state.telemetry.controller_probe_last_us(),
         controller_probe_max_us: state.telemetry.controller_probe_max_us(),
@@ -1165,6 +1173,7 @@ fn load_track(
     deck: usize,
     path: String,
 ) -> Result<(), String> {
+    let worker = deck_decode_worker::DecodeWorker::shared()?;
     let ticket = app.state::<deck_loads::DeckLoads>().begin(deck, || {
         jog.reset();
         let _ = app.emit(
@@ -1176,103 +1185,173 @@ fn load_track(
         );
     })?;
     let tx = state.tx.clone();
-    thread::spawn(move || {
-        let (buffer, metadata) = match compas_sources::decode_full(&path) {
-            Ok(v) => v,
-            Err(e) => {
-                // A retired worker must not replace a newer load's status with its error.
+    let error_app = app.clone();
+    let job_app = app.clone();
+    let job = Box::new(move || {
+        let app = job_app;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Queued requests invalidated by another LOAD or eject do no decode work.
+            if !app
+                .state::<deck_loads::DeckLoads>()
+                .current(deck, ticket)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let (buffer, metadata) = match deck_loading::decode(std::path::Path::new(&path), || {
+                app.state::<deck_loads::DeckLoads>()
+                    .current(deck, ticket)
+                    .unwrap_or(false)
+            }) {
+                Ok(Some(v)) => v,
+                Ok(None) => return,
+                Err(e) => {
+                    // A retired worker must not replace a newer load's status with its error.
+                    let _ = app
+                        .state::<deck_loads::DeckLoads>()
+                        .commit(deck, ticket, || {
+                            let _ = app.emit(
+                                "deck:error",
+                                DeckErrorEvent {
+                                    deck,
+                                    message: format!("decode failed: {e}"),
+                                },
+                            );
+                            Ok(())
+                        });
+                    return;
+                }
+            };
+            if !app
+                .state::<deck_loads::DeckLoads>()
+                .current(deck, ticket)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let peaks = compute_peaks(&buffer.samples, WAVEFORM_BIN_FRAMES);
+            let silence = silence_spans(&buffer.samples, buffer.source_rate);
+            let buffer = buffer.with_silence(silence.clone());
+            let band_peaks = compas_dsp::analysis::band_peaks(
+                &buffer.samples,
+                buffer.source_rate,
+                WAVEFORM_BIN_FRAMES,
+            );
+            if !app
+                .state::<deck_loads::DeckLoads>()
+                .current(deck, ticket)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let (grid, key) = analyze_track(&buffer);
+            if !app
+                .state::<deck_loads::DeckLoads>()
+                .current(deck, ticket)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            let replay_gain = compas_dsp::analysis::replaygain_linear(&buffer.samples);
+            let sr = buffer.source_rate as f64;
+            let beat_offset = grid.first_beat_sec as f64 * sr;
+            let beat_interval = grid.beat_interval_sec as f64 * sr;
+            let loaded = DeckLoadedEvent {
+                deck,
+                path: metadata.provider_id.clone(),
+                title: metadata.title.clone(),
+                artist: metadata.artist.clone(),
+                duration_ms: buffer.duration_ms(),
+                source_rate: buffer.source_rate,
+                frames: buffer.frames(),
+                bpm: grid.bpm,
+                bpm_confidence: grid.confidence,
+                first_beat_sec: grid.first_beat_sec,
+                beat_interval_sec: grid.beat_interval_sec,
+                key_camelot: key.camelot,
+                key_name: key.name,
+                peaks,
+                band_peaks,
+                replay_gain,
+                silence,
+            };
+
+            let result = app
+                .state::<deck_loads::DeckLoads>()
+                .commit(deck, ticket, || {
+                    // Submit load, loudness and pitch reset as one channel envelope.
+                    // This is all-or-none admission, not atomic callback application.
+                    let mut group = Some(vec![
+                        EngineMsg::Load {
+                            deck,
+                            buffer: Arc::new(buffer),
+                            beat_offset,
+                            beat_interval,
+                        },
+                        EngineMsg::SetDeckReplayGain {
+                            deck,
+                            gain: replay_gain,
+                        },
+                    ]);
+                    let snapshot = app.state::<native_effects::NativeEffects>().update(
+                        deck,
+                        native_effects::EffectUpdate::Pitch { semitones: 0.0 },
+                        |message| {
+                            let mut commands =
+                                group.take().ok_or("Load pitch reset sent more than once")?;
+                            commands.push(message);
+                            tx.send_group(commands)
+                        },
+                    )?;
+                    app.state::<native_controls::PerformanceState>()
+                        .install_track(deck, beat_offset, beat_interval, sr, f64::from(grid.bpm));
+                    let _ = app.emit("effects:update", snapshot);
+                    // Commands are enqueued before publication; this is not an audio-callback ack.
+                    let _ = app.emit("deck:loaded", loaded);
+                    Ok(())
+                });
+            if let Err(message) = result {
                 let _ = app
                     .state::<deck_loads::DeckLoads>()
                     .commit(deck, ticket, || {
-                        let _ = app.emit(
-                            "deck:error",
-                            DeckErrorEvent {
-                                deck,
-                                message: format!("decode failed: {e}"),
-                            },
-                        );
+                        let _ = app.emit("deck:error", DeckErrorEvent { deck, message });
                         Ok(())
                     });
-                return;
             }
-        };
-        if !app
-            .state::<deck_loads::DeckLoads>()
-            .current(deck, ticket)
-            .unwrap_or(false)
-        {
-            return;
-        }
-        let peaks = compute_peaks(&buffer.samples, WAVEFORM_BIN_FRAMES);
-        let silence = silence_spans(&buffer.samples, buffer.source_rate);
-        let buffer = buffer.with_silence(silence.clone());
-        let band_peaks = compas_dsp::analysis::band_peaks(
-            &buffer.samples,
-            buffer.source_rate,
-            WAVEFORM_BIN_FRAMES,
-        );
-        let (grid, key) = analyze_track(&buffer);
-        let replay_gain = compas_dsp::analysis::replaygain_linear(&buffer.samples);
-        let sr = buffer.source_rate as f64;
-        let beat_offset = grid.first_beat_sec as f64 * sr;
-        let beat_interval = grid.beat_interval_sec as f64 * sr;
-        let loaded = DeckLoadedEvent {
-            deck,
-            path: metadata.provider_id.clone(),
-            title: metadata.title.clone(),
-            artist: metadata.artist.clone(),
-            duration_ms: buffer.duration_ms(),
-            source_rate: buffer.source_rate,
-            frames: buffer.frames(),
-            bpm: grid.bpm,
-            bpm_confidence: grid.confidence,
-            first_beat_sec: grid.first_beat_sec,
-            beat_interval_sec: grid.beat_interval_sec,
-            key_camelot: key.camelot,
-            key_name: key.name,
-            peaks,
-            band_peaks,
-            replay_gain,
-            silence,
-        };
-
-        let result = app
-            .state::<deck_loads::DeckLoads>()
-            .commit(deck, ticket, || {
-                tx.send(EngineMsg::Load {
-                    deck,
-                    buffer: Arc::new(buffer),
-                    beat_offset,
-                    beat_interval,
-                })
-                .map_err(|e| e.to_string())?;
-                tx.send(EngineMsg::SetDeckReplayGain {
-                    deck,
-                    gain: replay_gain,
-                })
-                .map_err(|e| e.to_string())?;
-                // Keep the authoritative pitch memory consistent with LoadDeck's zero-pitch reset.
-                let snapshot = app.state::<native_effects::NativeEffects>().update(
-                    deck,
-                    native_effects::EffectUpdate::Pitch { semitones: 0.0 },
-                    |message| tx.send(message).map_err(|e| e.to_string()),
-                )?;
-                app.state::<native_controls::PerformanceState>()
-                    .install_track(deck, beat_offset, beat_interval, sr, f64::from(grid.bpm));
-                let _ = app.emit("effects:update", snapshot);
-                // Commands are enqueued before publication; this is not an audio-callback ack.
-                let _ = app.emit("deck:loaded", loaded);
-                Ok(())
-            });
-        if let Err(message) = result {
+        }));
+        if outcome.is_err() {
             let _ = app
                 .state::<deck_loads::DeckLoads>()
                 .commit(deck, ticket, || {
-                    let _ = app.emit("deck:error", DeckErrorEvent { deck, message });
+                    let _ = app.emit(
+                        "deck:error",
+                        DeckErrorEvent {
+                            deck,
+                            message: "Track decoding failed unexpectedly; try another track".into(),
+                        },
+                    );
                     Ok(())
                 });
         }
     });
+    let submitted = app
+        .state::<deck_loads::DeckLoads>()
+        .commit(deck, ticket, || worker.submit(deck, job));
+    if let Err(message) = submitted {
+        let _ = error_app
+            .state::<deck_loads::DeckLoads>()
+            .commit(deck, ticket, || {
+                let _ = error_app.emit(
+                    "deck:error",
+                    DeckErrorEvent {
+                        deck,
+                        message: message.clone(),
+                    },
+                );
+                Ok(())
+            });
+        return Err(message);
+    }
     Ok(())
 }
 
@@ -3289,13 +3368,51 @@ fn spawn_controller_autoconnect(app: AppHandle) {
     publish_controller_session(&app);
     thread::spawn(move || {
         let midi = app.state::<MidiState>();
+        let mut discovery_error: Option<String> = None;
         loop {
             {
                 let Ok(_operation) = midi.operation.lock() else {
                     return;
                 };
                 let snapshot = midi.session.lock().map(|s| s.clone()).unwrap_or_default();
-                if let Ok(ports) = midi_list_ports() {
+                let discovered = midi_list_ports();
+                if let Err(error) = &discovered {
+                    discovery_error = Some(error.clone());
+                    let changed = if let Ok(mut session) = midi.session.lock() {
+                        let changed = session.error.as_ref() != Some(error);
+                        session.error = Some(error.clone());
+                        changed
+                    } else {
+                        false
+                    };
+                    if changed {
+                        publish_controller_session(&app);
+                    }
+                    // Retry only on the main event loop; never create the first CoreMIDI
+                    // client on this sleeping worker. Success is retained for all polls.
+                    if !MIDI_DISCOVERY_RETRY_PENDING.swap(true, Ordering::AcqRel) {
+                        if app
+                            .run_on_main_thread(|| {
+                                initialize_midi_discovery();
+                                MIDI_DISCOVERY_RETRY_PENDING.store(false, Ordering::Release);
+                            })
+                            .is_err()
+                        {
+                            MIDI_DISCOVERY_RETRY_PENDING.store(false, Ordering::Release);
+                        }
+                    }
+                }
+                if let Ok(ports) = discovered {
+                    if let Some(previous_error) = discovery_error.take() {
+                        let changed = if let Ok(mut session) = midi.session.lock() {
+                            clear_discovery_error(&mut session.error, &previous_error)
+                        } else {
+                            false
+                        };
+                        if changed {
+                            publish_controller_session(&app);
+                        }
+                    }
                     if snapshot
                         .connected
                         .as_ref()
@@ -3443,9 +3560,28 @@ fn sampler_pad_count() -> usize {
 }
 
 /// List connected MIDI input port names (index = position in this list).
+static MIDI_DISCOVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
+static MIDI_DISCOVERY: std::sync::OnceLock<Mutex<Result<MidiInput, String>>> =
+    std::sync::OnceLock::new();
+
+// Only called on the main event-loop thread (setup or scheduled retry).
+fn initialize_midi_discovery() {
+    let state =
+        MIDI_DISCOVERY.get_or_init(|| Mutex::new(Err("MIDI discovery not initialized".into())));
+    if let Ok(mut client) = state.lock() {
+        if client.is_err() {
+            *client = MidiInput::new("opendeck-discovery").map_err(|error| error.to_string());
+        }
+    }
+}
+
 #[tauri::command]
 fn midi_list_ports() -> Result<Vec<String>, String> {
-    let midi_in = MidiInput::new("compas-probe").map_err(|e| e.to_string())?;
+    let discovery = MIDI_DISCOVERY
+        .get()
+        .ok_or("MIDI discovery not initialized")?;
+    let guard = discovery.lock().map_err(|e| e.to_string())?;
+    let midi_in = guard.as_ref().map_err(Clone::clone)?;
     Ok(midi_in
         .ports()
         .iter()
@@ -3617,11 +3753,37 @@ fn midi_connect(app: AppHandle, index: usize) -> Result<String, String> {
     result
 }
 
+fn clear_discovery_error(current: &mut Option<String>, recovered: &str) -> bool {
+    if current.as_deref() == Some(recovered) {
+        *current = None;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::clear_discovery_error;
+    #[test]
+    fn recovery_clears_only_the_discovery_error() {
+        let mut error = Some("discovery unavailable".into());
+        assert!(clear_discovery_error(&mut error, "discovery unavailable"));
+        assert_eq!(error, None);
+        error = Some("port connection failed".into());
+        assert!(!clear_discovery_error(&mut error, "discovery unavailable"));
+        assert_eq!(error.as_deref(), Some("port connection failed"));
+    }
+}
+
 fn connect_midi_port(
     app: &AppHandle,
     index: usize,
     expected_name: Option<&str>,
 ) -> Result<String, String> {
+    // If setup initialization failed, wait for the scheduled main-thread retry.
+    // A manual Connect must not become the first CoreMIDI client on an IPC worker.
+    midi_list_ports()?;
     let midi = app.state::<MidiState>();
     let ctrl = app.state::<controllers::ControllerEngine>();
     let jog = app.state::<flx4_runtime::JogRuntime>();
@@ -3818,6 +3980,10 @@ pub fn run() {
         .manage(FolderWatch::default())
         .manage(Analyzer::default())
         .setup(move |app| {
+            // CoreMIDI binds notifications to the run loop of its first client.
+            // Create it here on the main thread before any controller worker starts,
+            // then reuse it: the pinned CoreMIDI dependency does not dispose clients.
+            initialize_midi_discovery();
             #[cfg(target_os = "macos")]
             macos_drag::keep_html_drags_with_the_webview();
             spawn_telemetry(app.handle().clone(), telemetry.clone());

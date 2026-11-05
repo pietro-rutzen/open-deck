@@ -1,3 +1,4 @@
+import { CUE_COLORS } from "../lib/hotCueMarkers";
 import {
   type CSSProperties,
   memo,
@@ -51,19 +52,6 @@ const ROLLS: { v: number; label: string }[] = [
   { v: 0.125, label: '⅛' },
   { v: 0.25, label: '¼' },
   { v: 0.5, label: '½' },
-];
-
-// Per-slot hot-cue colors (Serato-style 8-color palette). Hex so an alpha suffix (`${c}30`) is
-// valid CSS — a CSS var like `var(--accent)` can't take an appended alpha.
-const CUE_COLORS = [
-  '#ff5b4c',
-  '#ff8c1a',
-  '#ffcf3a',
-  '#3ddc97',
-  '#28e0ff',
-  '#2ea6ff',
-  '#9b6bff',
-  '#ff5bbf',
 ];
 
 // The ending light comes on with one minute left: white, then yellow, then a gradual

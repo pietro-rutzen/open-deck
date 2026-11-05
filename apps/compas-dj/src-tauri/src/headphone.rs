@@ -838,7 +838,10 @@ fn clamp_delay_ms(milliseconds: f32) -> Result<u32, String> {
 }
 
 fn delay_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
-    let base = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&base).map_err(|error| error.to_string())?;
     Ok(base.join(DELAY_FILE))
 }

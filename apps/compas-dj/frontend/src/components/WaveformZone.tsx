@@ -1,3 +1,4 @@
+import { hotCueMarkers } from "../lib/hotCueMarkers";
 import { type CSSProperties, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { useElementSize } from "../hooks/useElementSize";
 import type { DeckState } from "../hooks/useDeck";
@@ -245,6 +246,7 @@ const WaveGraphic = memo(function WaveGraphic({
           </g>
         ))}
       </g>
+
     </g>
   );
 });
@@ -411,6 +413,17 @@ const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; vi
                 vectorEffect="non-scaling-stroke"
               />
             )}
+      <g className="wf-hot-cues" pointerEvents="none" aria-label="Hot cues">
+        {hotCueMarkers(state.hotCues, sr, stretch, origin, view, VW, view * WAVE_SPAN).map(({ slot, x, color: cueColor }) => (
+          <g key={slot} aria-label={`Hot cue ${slot + 1}`}>
+            <title>{`Hot cue ${slot + 1}`}</title>
+            <line x1={x} x2={x} y1={0} y2={VH} stroke="#080a0d" strokeWidth={4} vectorEffect="non-scaling-stroke" />
+            <line x1={x} x2={x} y1={0} y2={VH} stroke={cueColor} strokeWidth={2} vectorEffect="non-scaling-stroke" />
+            <path d={`M ${x} ${VH} L ${x} ${Math.max(0, VH - 17)} L ${x + 19} ${Math.max(0, VH - 17)} L ${x + 19} ${Math.max(0, VH - 4)} Z`} fill={cueColor} />
+            <text x={x + 5} y={VH - 6} fill="#080a0d" fontSize={10} fontWeight={700}>{slot + 1}</text>
+          </g>
+        ))}
+      </g>
           </svg>
         </div>
       )}
