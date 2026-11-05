@@ -4,7 +4,7 @@ Open-source macOS DJ prototype based on MIT-licensed Compás commit `102d2d3b6fd
 
 ## Build and run
 
-From repository root, run `./scripts/opendeck-dev.sh` for development or `./scripts/opendeck-build.sh` for a local debug app bundle. Dependencies use project-local caches. First native build takes several minutes.
+From repository root, run `./scripts/opendeck-dev.sh` for development or `./scripts/opendeck-build.sh` to build and install the local debug app. After verifying the installed bundle, the script quits any running Open Deck and opens the copy in Applications. Use `./scripts/opendeck-build.sh --build-only` to build while keeping your current session running. Dependencies use project-local caches. First native build takes several minutes.
 
 Generated test tracks: `samples/compas-test-120bpm.wav` and `samples/compas-test-128bpm.wav`. Regenerate with `node scripts/make-test-audio.mjs`.
 

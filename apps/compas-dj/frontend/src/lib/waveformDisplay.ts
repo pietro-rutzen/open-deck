@@ -1,7 +1,7 @@
 // Display-only. Height encodes amplitude and hue encodes the measured spectral mix.
 type Bands = readonly [number, number, number];
 const finite = (value: number) => Number.isFinite(value) ? Math.max(0, value) : 0;
-export const RGB_WAVE_KEY = 'Waveform colors: bass red, mids green, treble sky blue. Mixed frequencies blend. Below center, band thickness shows bass (blue), mids (amber) and treble (ivory).';
+export const RGB_WAVE_KEY = 'Waveform colors: bass red, mids green, treble sky blue. Mixed frequencies blend. In the narrow center core, band thickness shows bass (blue), mids (amber) and treble (ivory).';
 const NEUTRAL = '#8996a4';
 
 export function waveformScale(peaks: number[]) {
@@ -89,27 +89,29 @@ export function rgbPaths(points: WavePoint[], center: number) {
   return Array.from(paths, ([fill, segments]) => ({ fill, d: segments.join('') }));
 }
 
-/** Keep the upper RGB silhouette legible. Stack measured RMS below the center:
- * brighter highs near the axis, mids next, and a blue bass skirt at the edge. */
 export function wavePaths(points: WavePoint[], center: number, gain: number) {
   const paths = rgbPaths(points, center);
   if (!gain || !paths.length || points.length < 2) return paths;
-  const layers: string[][] = [[], [], []];
+  // Each side of the core may occupy up to 30% of the local peak radius.
+  const coreFraction = 0.30;
+  const layers = Array.from({ length: 3 }, () => ({ upper: [] as string[], lower: [] as string[] }));
   const visible = [false, false, false];
   for (const point of points) {
     const [low, mid, high] = point.rms ?? [0, 0, 0];
     const sum = low + mid + high;
-    const scale = sum > 0 ? Math.min(center * 0.94 * gain, point.amp / sum) : 0;
+    const scale = sum > 0 ? coreFraction * Math.min(center * 0.94 * gain, point.amp / sum) : 0;
     const depths = [sum * scale, (mid + high) * scale, high * scale];
     for (let i = 0; i < 3; i++) {
-      layers[i].push(point.x.toFixed(1) + ' ' + (center + depths[i]).toFixed(1));
+      const x = point.x.toFixed(1);
+      layers[i].upper.push(x + ' ' + (center - depths[i]).toFixed(1));
+      layers[i].lower.push(x + ' ' + (center + depths[i]).toFixed(1));
       visible[i] ||= depths[i] > 0;
     }
   }
   const fills = ['#137fff', '#ffa916', '#fff4d9'];
   for (let i = 0; i < layers.length; i++) {
     if (visible[i]) paths.push({ fill: fills[i],
-      d: `M${points[0].x.toFixed(1)} ${center}L${layers[i].join(' ')}L${points[points.length - 1].x.toFixed(1)} ${center}Z` });
+      d: `M${layers[i].upper.join(' ')}L${layers[i].lower.reverse().join(' ')}Z` });
   }
   return paths;
 }

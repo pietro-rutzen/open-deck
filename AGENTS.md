@@ -50,4 +50,4 @@ Flag callback allocations/locks, UI-controlled timing, unbounded queues, unsafe 
 
 ## Maintainer delivery preference
 
-After completing and verifying a change, rebuild with `./scripts/opendeck-build.sh` and install the finished bundle with `./scripts/opendeck-install.sh`. The maintainer uses `/Applications/Open Deck.app`. Commit finished project changes and push to the configured origin branch. Verify the remote revision and report any failed installation or push. Preserve unrelated working files.
+After completing and verifying a change, run `./scripts/opendeck-build.sh` to build, install, and relaunch the verified bundle. The standalone installer can retry delivery from a finished build. The maintainer uses `/Applications/Open Deck.app`. Commit finished project changes and push to the configured origin branch. Verify the remote revision and report any failed installation or push. Preserve unrelated working files.

@@ -42,8 +42,14 @@ const base = rgbPaths(points, 20);
 const hybrid = wavePaths(points, 20, structureGain(bands));
 assert.deepEqual(hybrid.slice(0, base.length), base);
 const [bass, mids, highs] = hybrid.slice(base.length);
-const depths = layer => [...layer.d.matchAll(/(?:L0\.0| 1\.0) (\d+\.\d+)/g)].map(match => Number(match[1]));
-const [before, after] = depths(bass);
-assert.ok(before > after);
-for (const layer of [mids, highs]) assert.equal(depths(layer)[0], depths(layer)[1]);
+const coordinates = layer => layer.d.match(/-?\d+\.\d+/g).map(Number);
+for (const layer of [bass, mids, highs]) {
+  const [x0, top0, x1, top1, x2, bottom1, x3, bottom0] = coordinates(layer);
+  assert.deepEqual([x0, x1, x2, x3], [0, 1, 1, 0]);
+  assert.equal(top0 + bottom0, 40);
+  assert.equal(top1 + bottom1, 40);
+  assert.ok(top0 >= 14 && top1 >= 14);
+  if (layer === bass) assert.ok(bottom0 > bottom1);
+  else assert.equal(bottom0, bottom1);
+}
 assert.deepEqual(wavePaths(points, 20, structureGain([])), base);

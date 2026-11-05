@@ -39,3 +39,26 @@ else:
 PY
 /usr/bin/diff -qr "$src" "$dest"
 printf '%s\n' "Installed and verified $dest"
+
+# Quit only after installation succeeds so a failed build or swap leaves playback alone.
+bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$dest/Contents/Info.plist")
+/usr/bin/osascript -l JavaScript - "$bundle_id" <<'JXA'
+ObjC.import('AppKit')
+function run(argv) {
+  const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(argv[0])
+  const running = []
+  for (let i = 0; i < apps.count; i++) {
+    const app = apps.objectAtIndex(i)
+    if (!app.terminated && !app.terminate && !app.terminated)
+      throw Error('Open Deck declined to quit. Quit it manually, then reopen the installed app.')
+    running.push(app)
+  }
+  const deadline = Date.now() + 15000
+  while (running.some(app => !app.terminated)) {
+    if (Date.now() >= deadline)
+      throw Error('Open Deck is still closing. Quit it manually, then reopen the installed app.')
+    $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.1))
+  }
+}
+JXA
+/usr/bin/open "$dest"
