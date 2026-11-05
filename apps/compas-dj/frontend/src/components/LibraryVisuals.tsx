@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { rgbPaths, RGB_WAVE_KEY, waveColumn, waveformScale } from "../lib/waveformDisplay";
+import { wavePaths, structureGain, RGB_WAVE_KEY, waveColumn, waveformScale } from "../lib/waveformDisplay";
 import { inTauri } from "../lib/ipc";
 
 export interface TrackVisuals {
@@ -105,7 +105,7 @@ export function MiniWaveform({ peaks, bands = [], label = "Track frequency and a
       ...waveColumn(peaks, bands, Math.floor(i * peaks.length / count), Math.floor((i + 1) * peaks.length / count), gain, 19, 'preview'),
       x: ((i + 0.5) * 256) / count,
     }));
-    return rgbPaths(points, 20);
+    return wavePaths(points, 20, structureGain(bands));
   }, [peaks, bands]);
   if (!peaks.length) return <span className="mini-waveform-state">No waveform</span>;
   return <svg className="mini-waveform" viewBox="0 0 256 40" preserveAspectRatio="none" role="img" aria-label={label}>

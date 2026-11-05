@@ -1,7 +1,7 @@
 // Display-only. Height encodes amplitude and hue encodes the measured spectral mix.
 type Bands = readonly [number, number, number];
 const finite = (value: number) => Number.isFinite(value) ? Math.max(0, value) : 0;
-export const RGB_WAVE_KEY = 'Waveform colors: bass red, mids green, treble sky blue. Mixed frequencies blend.';
+export const RGB_WAVE_KEY = 'Waveform colors: bass red, mids green, treble sky blue. Mixed frequencies blend. Below center, band thickness shows bass (blue), mids (amber) and treble (ivory).';
 const NEUTRAL = '#8996a4';
 
 export function waveformScale(peaks: number[]) {
@@ -40,7 +40,14 @@ export function frequencyColor(low: number, mid: number, high: number) {
   return `rgb(${channel(0)},${channel(1)},${channel(2)})`;
 }
 
-export interface WavePoint { x: number; amp: number; color: string }
+export interface WavePoint { x: number; amp: number; color: string; rms?: Bands }
+
+// One scale for the whole track keeps a breakdown quiet when the scrolling view zooms in.
+export function structureGain(bands: Bands[]) {
+  let peak = 0;
+  for (const [l, m, h] of bands) peak = Math.max(peak, finite(l) + finite(m) + finite(h));
+  return peak > 1e-5 ? 1 / peak : 0;
+}
 
 // Pool power across the whole output column, so a kick cannot erase a quieter hi-hat
 // from its color. The peak from that same interval supplies the silhouette.
@@ -58,8 +65,11 @@ export function waveColumn(peaks: number[], bands: Bands[], start: number, end: 
     }
   }
   const exponent = view === 'preview' ? 0.56 : 0.72;
-  return { loudest, amp: Math.pow(Math.min(1, peak * gain), exponent) * radius,
-    color: frequencyColor(Math.sqrt(low), Math.sqrt(mid), Math.sqrt(high)) };
+  const count = Math.max(1, end - start);
+  const rms: Bands | undefined = measured
+    ? [Math.sqrt(low / count), Math.sqrt(mid / count), Math.sqrt(high / count)] : undefined;
+  return { loudest, rms, amp: Math.pow(Math.min(1, peak * gain), exponent) * radius,
+    color: rms ? frequencyColor(...rms) : NEUTRAL };
 }
 
 // Adjacent columns share their interpolated edge. Batch all polygons of one hue
@@ -77,4 +87,29 @@ export function rgbPaths(points: WavePoint[], center: number) {
     if (group) group.push(path); else paths.set(p.color, [path]);
   }
   return Array.from(paths, ([fill, segments]) => ({ fill, d: segments.join('') }));
+}
+
+/** Keep the upper RGB silhouette legible. Stack measured RMS below the center:
+ * brighter highs near the axis, mids next, and a blue bass skirt at the edge. */
+export function wavePaths(points: WavePoint[], center: number, gain: number) {
+  const paths = rgbPaths(points, center);
+  if (!gain || !paths.length || points.length < 2) return paths;
+  const layers: string[][] = [[], [], []];
+  const visible = [false, false, false];
+  for (const point of points) {
+    const [low, mid, high] = point.rms ?? [0, 0, 0];
+    const sum = low + mid + high;
+    const scale = sum > 0 ? Math.min(center * 0.94 * gain, point.amp / sum) : 0;
+    const depths = [sum * scale, (mid + high) * scale, high * scale];
+    for (let i = 0; i < 3; i++) {
+      layers[i].push(point.x.toFixed(1) + ' ' + (center + depths[i]).toFixed(1));
+      visible[i] ||= depths[i] > 0;
+    }
+  }
+  const fills = ['#137fff', '#ffa916', '#fff4d9'];
+  for (let i = 0; i < layers.length; i++) {
+    if (visible[i]) paths.push({ fill: fills[i],
+      d: `M${points[0].x.toFixed(1)} ${center}L${layers[i].join(' ')}L${points[points.length - 1].x.toFixed(1)} ${center}Z` });
+  }
+  return paths;
 }

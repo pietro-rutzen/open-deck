@@ -19,7 +19,7 @@ import { audibleFramesRemaining } from '../lib/silence';
 import {
   waveColumn,
   RGB_WAVE_KEY,
-  rgbPaths,
+  wavePaths, structureGain,
   type WavePoint,
   waveformScale,
 } from '../lib/waveformDisplay';
@@ -1193,6 +1193,7 @@ const OverviewWave = memo(function OverviewWave({
   const cy = H / 2;
   const N = peaks.length;
   const gain = useMemo(() => waveformScale(peaks), [peaks]);
+  const bandGain = useMemo(() => structureGain(bands), [bands]);
   const step = Math.max(1, Math.ceil(N / Math.max(1, W)));
   const samples: WavePoint[] = [];
   for (let i = 0; i < N; i += step) {
@@ -1207,7 +1208,7 @@ const OverviewWave = memo(function OverviewWave({
       preserveAspectRatio="none"
     >
       <title>{RGB_WAVE_KEY}</title>
-      {rgbPaths(samples, cy).map(path => <path key={path.fill} {...path} />)}
+      {wavePaths(samples, cy, bandGain).map(path => <path key={path.fill} {...path} />)}
     </svg>
   );
 });

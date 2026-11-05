@@ -2,7 +2,7 @@ import { hotCueMarkers } from "../lib/hotCueMarkers";
 import { type CSSProperties, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { useElementSize } from "../hooks/useElementSize";
 import type { DeckState } from "../hooks/useDeck";
-import { rgbPaths, RGB_WAVE_KEY, waveColumn, waveformScale, type WavePoint } from "../lib/waveformDisplay";
+import { wavePaths, structureGain, RGB_WAVE_KEY, waveColumn, waveformScale, type WavePoint } from "../lib/waveformDisplay";
 import { inTauri, onControllerUpdate } from "../lib/ipc";
 
 const NOW_FRAC = 0.38; // NOW playhead sits 38% from the left; track scrolls under it
@@ -174,6 +174,7 @@ const WaveGraphic = memo(function WaveGraphic({
   stretch: number;
 }) {
   const displayScale = useMemo(() => waveformScale(peaks), [peaks]);
+  const bandGain = useMemo(() => structureGain(bands), [bands]);
   const centerY = height / 2;
   const pixelsPerSecond = width / Math.max(view, 0.001);
   const span = view * WAVE_SPAN;
@@ -192,8 +193,8 @@ const WaveGraphic = memo(function WaveGraphic({
       const column = waveColumn(peaks, bands, index, end + 1, displayScale, centerY * 0.94);
       points.push({ ...column, x: (column.loudest * binSec / stretch - origin) * pixelsPerSecond });
     }
-    return rgbPaths(points, centerY);
-  }, [bands, binSec, centerY, displayScale, origin, peaks, pixelsPerSecond, span, stretch, width]);
+    return wavePaths(points, centerY, bandGain);
+  }, [bands, bandGain, binSec, centerY, displayScale, origin, peaks, pixelsPerSecond, span, stretch, width]);
   const beats = useMemo(() => {
     if (beatInterval <= 0.05 || width <= 0 || stretch <= 0) return [];
     const end = origin + span;
