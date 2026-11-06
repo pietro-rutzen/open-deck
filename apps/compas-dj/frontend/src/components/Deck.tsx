@@ -630,7 +630,7 @@ export function Deck({
       {/* full-track overview (rekordbox-style): summary waveform, hot-cue/loop markers,
           and click/drag-to-seek across the whole track. */}
       {dsp && !!meters.mask && <DeckMeterStrip deck={ctrl.deck} mask={meters.mask}
-        active={!!meta && (playing || state.rate !== 0 || state.level > 0.001)} track={meta?.path ?? ""} />}
+        active={!!meta && (playing || state.rate !== 0 || state.level > 0.001)} track={meta?.path ?? ""} color={color} />}
       <OverviewBar
         state={state}
         color={color}

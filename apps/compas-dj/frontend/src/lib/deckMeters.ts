@@ -40,6 +40,14 @@ export const spectrumThresholds = [
 /** Analyzer floor. 0 dBFS is the top of the spectrum plot; this level is the bottom. */
 export const spectrumFloorDb = -72;
 
+export function resolvedDeckColor(declared: string, lookup: (name: string) => string) {
+  const named = declared.trim();
+  const match = /^var\(\s*(--[\w-]+)\s*(?:,[^)]*)?\)$/.exec(named);
+  if (!match) return named;
+  const value = lookup(match[1]).trim();
+  return value || named;
+}
+
 export function spectrumPlotX(
   hz: number,
   lowHz: number,

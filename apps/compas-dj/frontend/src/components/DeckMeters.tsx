@@ -4,6 +4,7 @@ import {
   readDeckMeters,
   spectrumFloorDb,
   spectrumLabelPlacements,
+  resolvedDeckColor,
   spectrumPlotX,
   spectrumPlotY,
   spectrumThresholds,
@@ -216,7 +217,7 @@ function drawStatic(panel: MeterPanel, frame: DeckMeterFrame | null) {
   ctx.stroke();
 }
 
-function drawTrace(panel: MeterPanel, frame: DeckMeterFrame | null) {
+function drawTrace(panel: MeterPanel, frame: DeckMeterFrame | null, traceColor: string) {
   const { cssW: w, cssH: h, kind } = panel;
   const ctx = panel.traceCtx;
   prepare(ctx, panel.trace, panel);
@@ -235,7 +236,7 @@ function drawTrace(panel: MeterPanel, frame: DeckMeterFrame | null) {
     ) {
       return;
     }
-    ctx.strokeStyle = "#b2c8db";
+    ctx.strokeStyle = traceColor;
     ctx.beginPath();
     let started = false;
     for (let i = 0; i < spectrum.length; i++) {
@@ -269,7 +270,7 @@ function drawTrace(panel: MeterPanel, frame: DeckMeterFrame | null) {
   const radius = (bottom - top) / 2;
   const n = frame.left.length;
   const last = Math.max(1, n - 1);
-  ctx.strokeStyle = kind === 1 ? "#f5cc6d" : "#b2c8db";
+  ctx.strokeStyle = kind === 1 ? "#f5cc6d" : traceColor;
   ctx.beginPath();
   for (let i = 0; i < n; i++) {
     const left = frame.left[i];
@@ -289,7 +290,7 @@ function drawTrace(panel: MeterPanel, frame: DeckMeterFrame | null) {
   ctx.stroke();
   if (kind === 2) {
     ctx.beginPath();
-    ctx.strokeStyle = "rgba(110,173,218,0.65)";
+    ctx.strokeStyle = traceColor;
     for (let i = 0; i < frame.right.length; i++) {
       const x = (i * w) / last;
       const y = mid - frame.right[i] * radius;
@@ -300,11 +301,11 @@ function drawTrace(panel: MeterPanel, frame: DeckMeterFrame | null) {
   }
 }
 
-function paintPanels(panels: MeterPanel[], frame: DeckMeterFrame | null) {
+function paintPanels(panels: MeterPanel[], frame: DeckMeterFrame | null, traceColor: string) {
   for (const panel of panels) {
     if (!panel.cssW || !panel.cssH) continue;
     drawStatic(panel, frame);
-    drawTrace(panel, frame);
+    drawTrace(panel, frame, traceColor);
   }
 }
 
@@ -313,11 +314,13 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
   mask,
   active,
   track,
+  color,
 }: {
   deck: number;
   mask: number;
   active: boolean;
   track: string;
+  color: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -349,8 +352,11 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
     let unsubscribe = () => {};
     let latest: DeckMeterFrame | null = null;
     let painted = 0;
+    const traceColor = resolvedDeckColor(color, (name) =>
+      getComputedStyle(document.documentElement).getPropertyValue(name),
+    );
     const enabled = () => !disposed && visible && active && !document.hidden;
-    const repaint = () => paintPanels(panels, latest);
+    const repaint = () => paintPanels(panels, latest, traceColor);
     const fit = () => {
       let changed = false;
       for (const panel of panels) {
@@ -436,7 +442,7 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
       scaleMedia.removeEventListener("change", onScale);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [deck, mask, active, track]);
+  }, [deck, mask, active, track, color]);
   return (
     <div className="deck-meter-strip" ref={ref}>
       {widgets
