@@ -1108,6 +1108,60 @@ export function Deck({
                   </div>
                 )}
               </div>
+              {dsp && (
+                <div className="key-group">
+                  <button
+                    className={`keylock-btn ${state.keylock ? 'keylock-btn--on' : ''}`}
+                    style={
+                      state.keylock
+                        ? { color, borderColor: `${color}80` }
+                        : undefined
+                    }
+                    onClick={actions.toggleKeylock}
+                    disabled={!meta}
+                    title="Key-lock: change tempo without changing pitch (master tempo)"
+                  >
+                    {state.keylock ? '🔒 KEY' : 'KEY'}
+                  </button>
+                  <div
+                    className="key-shift"
+                    title="Key shift: transpose ± semitones without changing tempo"
+                  >
+                    <button
+                      onClick={() => actions.setPitchShift(state.pitchShift - 1)}
+                      disabled={!meta || state.pitchShift <= -12}
+                      title="Pitch down a semitone"
+                    >
+                      −
+                    </button>
+                    <span
+                      className="mono key-shift-val"
+                      style={state.pitchShift !== 0 ? { color } : undefined}
+                    >
+                      {state.pitchShift > 0
+                        ? `+${state.pitchShift}`
+                        : state.pitchShift}
+                    </span>
+                    <button
+                      onClick={() => actions.setPitchShift(state.pitchShift + 1)}
+                      disabled={!meta || state.pitchShift >= 12}
+                      title="Pitch up a semitone"
+                    >
+                      +
+                    </button>
+                  </div>
+                  {onKeySync && (
+                    <button
+                      className="chip key-sync-btn"
+                      onClick={onKeySync}
+                      disabled={!keySyncEnabled}
+                      title="Key Sync: transpose this deck to harmonically match the other deck"
+                    >
+                      KEY⇄
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
             {dsp && (
               <div className="tempo-side">
@@ -1150,60 +1204,6 @@ export function Deck({
               </div>
             )}
           </div>
-          {dsp && (
-            <div className="key-group">
-              <button
-                className={`keylock-btn ${state.keylock ? 'keylock-btn--on' : ''}`}
-                style={
-                  state.keylock
-                    ? { color, borderColor: `${color}80` }
-                    : undefined
-                }
-                onClick={actions.toggleKeylock}
-                disabled={!meta}
-                title="Key-lock: change tempo without changing pitch (master tempo)"
-              >
-                {state.keylock ? '🔒 KEY' : 'KEY'}
-              </button>
-              <div
-                className="key-shift"
-                title="Key shift: transpose ± semitones without changing tempo"
-              >
-                <button
-                  onClick={() => actions.setPitchShift(state.pitchShift - 1)}
-                  disabled={!meta || state.pitchShift <= -12}
-                  title="Pitch down a semitone"
-                >
-                  −
-                </button>
-                <span
-                  className="mono key-shift-val"
-                  style={state.pitchShift !== 0 ? { color } : undefined}
-                >
-                  {state.pitchShift > 0
-                    ? `+${state.pitchShift}`
-                    : state.pitchShift}
-                </span>
-                <button
-                  onClick={() => actions.setPitchShift(state.pitchShift + 1)}
-                  disabled={!meta || state.pitchShift >= 12}
-                  title="Pitch up a semitone"
-                >
-                  +
-                </button>
-              </div>
-              {onKeySync && (
-                <button
-                  className="chip key-sync-btn"
-                  onClick={onKeySync}
-                  disabled={!keySyncEnabled}
-                  title="Key Sync: transpose this deck to harmonically match the other deck"
-                >
-                  KEY⇄
-                </button>
-              )}
-            </div>
-          )}
         </div>
       </div>
       {/* EQ/gain knobs live in the mixer channel strip per the design. */}

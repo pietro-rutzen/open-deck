@@ -520,3 +520,4 @@ Limit scope: PCM accumulator only; codec internals, analysis arrays, total RSS a
 - [x] Give mirrored deck controls explicit grid areas and size them against each deck. Bound saved mixer/sidebar widths and let short performance panes scroll as one unit. Checked the full app in WebKit at 1280×768, 1544×865, 1920×1080 and 3440×1280, including enabled meters and four decks.
 
 - [x] Refitted every meter canvas on panel and display-scale changes. WebKit verified both layers at three widths, paused and active. Widget names appear on hover.
+- [x] Key controls sit on the tempo fader, centered for both deck directions, and stay inside that column so a resize does not leave them under the library. Headless Chrome check at 1440×800 and 900×800 with a 520px deck pane: centered on the fader, level with the other controls, clear of the search.
