@@ -1,21 +1,48 @@
-# OpenDeck prototype
+# Open Deck
 
-Open-source macOS DJ prototype based on MIT-licensed Compás commit `102d2d3b6fd049efcd670c5a11bcc304ee726612`. Original copyright and LICENSE retained. UI still contains upstream branding.
+Open Deck is a macOS DJ app for a local, DRM-free party set. The normal layout is two decks. Four decks are available when you want them. It is meant to be direct to use: load a track, cue it, and mix. This checkout is a prototype. It does not claim a measured startup time, a measured end-to-end latency, or a complete controller certification.
 
-## Build and run
+The audio engine is MIT-licensed [Compás](https://github.com/sergiogallegos/compas), pinned in this tree at commit [`102d2d3b6fd049efcd670c5a11bcc304ee726612`](https://github.com/sergiogallegos/compas/commit/102d2d3b6fd049efcd670c5a11bcc304ee726612). Copyright (c) 2026 Sergio Gallegos. That license is [LICENSE](LICENSE). The window title is still `Open Deck — Compás prototype`. The title bar and status bar say Open Deck.
 
-From repository root, run `./scripts/opendeck-dev.sh` for development or `./scripts/opendeck-build.sh` to build and install the local debug app. After verifying the installed bundle, the script quits any running Open Deck and opens the copy in Applications. Use `./scripts/opendeck-build.sh --build-only` to build while keeping your current session running. Dependencies use project-local caches. First native build takes several minutes.
+## Party use on a DDJ-FLX4
 
-Generated test tracks: `samples/compas-test-120bpm.wav` and `samples/compas-test-128bpm.wav`. Regenerate with `node scripts/make-test-audio.mjs`.
+The owner reports playing a full party on a Pioneer DDJ-FLX4. That is owner-reported use, not an independent hardware test.
 
-## Controller setup
+A later session lost hardware LOAD while drag and drop still worked. The exact failure was not reproduced. The owner then confirmed that unplugging and reconnecting the controller, browsing, and LOAD worked without restarting the app. Those reports are not an all-night soak, a firmware check, or a pass for every mapped control.
 
-Connect FLX4 by USB. Choose the master output in macOS Sound settings before launching. Open top-bar **Controller profiles (mapping & learn)**; select **Pioneer DDJ-FLX4**, choose MIDI input, **Connect**, then **Activate**. Repeat activation after restart. Keep the separate legacy MIDI Mapping panel empty.
+## What you can do
 
-Mapping covers play/cue/sync, gain/EQ/filter/tempo and crossfader. Hardware validation is pending. Jog wheels, channel faders and built-in FLX4 headphone channel routing are not ready. Soft takeover is disabled: hardware movement applies immediately, so start output volume low. Cue monitoring currently uses a separate output-device path.
+- Play, cue, tempo, sync, key lock, and key shift.
+- Three-band EQ, filter, channel faders, and a crossfader.
+- Loops, hot cues, and beat jump.
+- Per-deck echo, flanger, reverb, and bit-crusher. These are Open Deck inserts, not another DJ app's effect set.
+- A library of local files, with folders and crates, and recording of the master mix to WAV.
+- Optional oscilloscope, stereo image, and spectrum on each deck. A live comparison against MiniMeters has not been run. Do not read the meters as matched to MiniMeters.
 
-Spotify mixing needs partner access unavailable to this project; see [feasibility](docs/SPOTIFY_FEASIBILITY.md). Use local files or generated samples.
+The folder scanner accepts `mp3`, `flac`, `wav`, `m4a`, `aac`, `ogg`, `oga`, `aiff`, and `aif`. Decode uses Symphonia with MP3, FLAC, WAV/PCM, Ogg Vorbis, and partial ISO MP4/AAC. A listed extension is not a promise that every file of that type opens. Spotify mixing is not available. See [docs/SPOTIFY_FEASIBILITY.md](docs/SPOTIFY_FEASIBILITY.md).
 
-## Development workflow
+## DDJ-FLX4
 
-Read [AGENTS.md](AGENTS.md), [progress](docs/PROJECT_PROGRESS.md) and [workflow](docs/AGENT_WORKFLOW.md). AI coding agents develop OpenDeck; AI features are excluded from the DJ product. Actual source paths: `apps/compas-dj/frontend`, `apps/compas-dj/src-tauri`, `crates/compas-*`. Original conflicting docs are preserved in `docs/upstream-baseline/`.
+Connect the controller by USB. Pick the speaker output before launch. Open **Controller profiles**, choose **Pioneer DDJ-FLX4**, select the MIDI input, connect, and activate. Activate again after a restart.
+
+The bundled profile includes play, cue, sync, tempo, trim, three-band EQ, filter, channel volume, crossfader, headphone cue, and jog scratch and bend, plus loops, hot cues, and beat jump. A hardware move applies immediately. Soft takeover is off, so start with the level down.
+
+Jog wheels and channel faders are implemented. They are not unsupported. This repository also does not contain an independent physical sign-off for them. Headphones can use channels 3/4 on the same device as the master, or a separate output. The owner confirmed headphone cue on the FLX4 during setup. Clock recovery and every failure path are not fully qualified.
+
+Not implemented on the controller: keyboard mode, stem pads, Pad FX, Smart CFX, and Smart Fader. The written control list, including checks that are still open, is [docs/testing/FLX4_FUNCTIONALITY_AUDIT.md](docs/testing/FLX4_FUNCTIONALITY_AUDIT.md).
+
+## Run it on this Mac
+
+From the repository root:
+
+- `./scripts/opendeck-dev.sh` starts a development session.
+- `./scripts/opendeck-build.sh` builds a debug app and installs `/Applications/Open Deck.app`.
+- `./scripts/opendeck-build.sh --build-only` builds without replacing the app you have open.
+
+[pietro-rutzen/open-deck](https://github.com/pietro-rutzen/open-deck) has no GitHub release. The tag `v0.1.0` is the older upstream release [Compás DJ v0.1.0](https://github.com/sergiogallegos/compas/releases/tag/v0.1.0) (24 June 2026, 08:50 Europe/Helsinki). That is not this prototype. CI compiles the engine on Linux, Windows, and macOS and builds the macOS app. That is not a Windows or Linux product test.
+
+Practice tracks: `samples/compas-test-120bpm.wav` and `samples/compas-test-128bpm.wav`. Regenerate them with `node scripts/make-test-audio.mjs`.
+
+## Development
+
+Read [AGENTS.md](AGENTS.md), [docs/PROJECT_PROGRESS.md](docs/PROJECT_PROGRESS.md), and [docs/AGENT_WORKFLOW.md](docs/AGENT_WORKFLOW.md). Source is `apps/compas-dj/frontend`, `apps/compas-dj/src-tauri`, and `crates/compas-*`. AI tools are for development only. The app does not include a model or a chat feature.
