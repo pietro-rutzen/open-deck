@@ -23,6 +23,7 @@
 }
 .deck-meter-options input {
   accent-color: var(--deck-color);
+  border-color: var(--deck-color);
 }
 .deck-meter-options input:checked {
   border-color: var(--deck-color);
