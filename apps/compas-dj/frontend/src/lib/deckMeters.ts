@@ -70,7 +70,17 @@ export function spectrumLabelPlacements(
     const labelWidth = measure(marker.label);
     if (!(labelWidth > 0) || !(width > labelWidth + gap)) continue;
     const line = spectrumPlotX(marker.hz, lowHz, highHz, width);
-    const candidates = [line + gap, line - labelWidth - 3];
+    const preferred = line + gap;
+    const nextLine = markers.reduce((nearest, other) => {
+      if (!(other.hz > marker.hz) || other.hz <= lowHz || other.hz >= highHz) return nearest;
+      const otherLine = spectrumPlotX(other.hz, lowHz, highHz, width);
+      return otherLine < nearest ? otherLine : nearest;
+    }, width);
+    const clearOfBlocker = occupied
+      .filter((taken) => preferred < taken.right + gap && preferred + labelWidth + gap > taken.left)
+      .map((taken) => taken.right + gap)
+      .filter((x) => x <= line + labelWidth && x + labelWidth + gap <= nextLine);
+    const candidates = [preferred, ...clearOfBlocker, line - labelWidth - 3];
     const spot = candidates.find((x) => {
       const right = x + labelWidth;
       if (x < 2 || right > width - 2) return false;
