@@ -1,11 +1,19 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { readDeckMeters, stereoImagePoint, type DeckMeterFrame } from "../lib/deckMeters";
+import {
+  readDeckMeters,
+  spectrumFloorDb,
+  spectrumPlotX,
+  spectrumPlotY,
+  spectrumThresholds,
+  stereoImagePoint,
+  type DeckMeterFrame,
+} from "../lib/deckMeters";
 import "./deckMeters.css";
 
 const widgets = [
   { bit: 1, name: "Stereo image" },
   { bit: 2, name: "Oscilloscope" },
-  { bit: 4, name: "Spectrogram" },
+  { bit: 4, name: "Spectrum" },
 ] as const;
 
 const key = (deck: number) => `opendeck.deck.${deck}.meter-mask.v1`;
@@ -97,103 +105,72 @@ export const MeterMenu = memo(function MeterMenu({
   );
 });
 
-/** Scrolling log-frequency spectrogram. Each column is the latest calibrated spectrum. */
-const spectrograms = new WeakMap<HTMLCanvasElement, HTMLCanvasElement>();
-
-function dbAt(hz: number, frequencies: number[], levels: number[]) {
-  let lo = 0;
-  let hi = frequencies.length - 1;
-  if (hz <= frequencies[0]) return levels[0];
-  if (hz >= frequencies[hi]) return levels[hi];
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (frequencies[mid] < hz) lo = mid;
-    else hi = mid;
-  }
-  const span = Math.log(frequencies[hi] / frequencies[lo]);
-  const t = span > 0 ? Math.log(hz / frequencies[lo]) / span : 0;
-  return levels[lo] + (levels[hi] - levels[lo]) * t;
-}
-
-function spectrogramColor(db: number) {
-  const stops: Array<[number, number, number, number]> = [
-    [0, 8, 12, 18],
-    [0.18, 18, 42, 110],
-    [0.4, 16, 120, 132],
-    [0.62, 36, 168, 64],
-    [0.82, 232, 196, 42],
-    [1, 255, 250, 240],
-  ];
-  const t = Math.max(0, Math.min(1, (db + 72) / 72));
-  const upper = stops.findIndex((stop) => stop[0] >= t);
-  const b = stops[Math.max(0, upper)];
-  const a = stops[Math.max(0, upper - 1)];
-  const span = b[0] - a[0] || 1;
-  const mix = (t - a[0]) / span;
-  const channel = (from: number, to: number) => Math.round(from + (to - from) * mix);
-  return `rgb(${channel(a[1], b[1])}, ${channel(a[2], b[2])}, ${channel(a[3], b[3])})`;
-}
-
-function paintSpectrogram(
+function paintSpectrum(
   ctx: CanvasRenderingContext2D,
-  canvas: HTMLCanvasElement,
   w: number,
   h: number,
   frame: DeckMeterFrame | null,
 ) {
   const low = frame?.minHz ?? 20;
   const high = frame?.maxHz ?? 20000;
-  const plot = spectrograms.get(canvas) ?? document.createElement("canvas");
-  if (plot.width !== canvas.width || plot.height !== canvas.height) {
-    plot.width = canvas.width;
-    plot.height = canvas.height;
-  }
-  spectrograms.set(canvas, plot);
-  const plotCtx = plot.getContext("2d");
-  if (!plotCtx) return;
-  const { spectrum, spectrumHz } = frame ?? { spectrum: [], spectrumHz: [] };
-  if (spectrum.length > 1 && spectrumHz.length === spectrum.length) {
-    const shift = Math.max(1, Math.round(canvas.width / w));
-    if (plot.width > shift) {
-      const image = plotCtx.getImageData(shift, 0, plot.width - shift, plot.height);
-      plotCtx.putImageData(image, 0, 0);
-    }
-    const x = plot.width - shift;
-    for (let y = 0; y < plot.height; y++) {
-      const fraction = 1 - y / Math.max(1, plot.height - 1);
-      const hz = low * (high / low) ** fraction;
-      plotCtx.fillStyle = spectrogramColor(dbAt(hz, spectrumHz, spectrum));
-      plotCtx.fillRect(x, y, shift, 1);
-    }
-  }
-  ctx.drawImage(plot, 0, 0, w, h);
-  ctx.font = "9px system-ui";
-  ctx.fillStyle = "#99a7b3";
-  ctx.strokeStyle = "rgba(255,255,255,0.14)";
+  const top = 13;
+  const bottom = h - 2;
+  const axis = high > low && low > 0;
   ctx.lineWidth = 1;
+  ctx.font = "9px system-ui";
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
   ctx.beginPath();
-  for (const hz of [50, 100, 200, 500, 1000, 2000, 5000, 10000]) {
-    if (hz <= low || hz >= high) continue;
-    const y = h * (1 - Math.log(hz / low) / Math.log(high / low));
-    ctx.moveTo(0, y);
-    ctx.lineTo(w, y);
-    if (w > 160 && [100, 1000, 10000].includes(hz)) {
-      ctx.fillText(hz >= 1000 ? `${hz / 1000}k` : String(hz), 4, y - 2);
+  if (axis) {
+    for (const marker of spectrumThresholds) {
+      if (marker.hz <= low || marker.hz >= high) continue;
+      const x = spectrumPlotX(marker.hz, low, high, w);
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
     }
   }
   ctx.stroke();
-  if (spectrum.length === 0) return;
+  ctx.fillStyle = "#99a7b3";
+  ctx.textAlign = "left";
+  if (axis) {
+    for (const marker of spectrumThresholds) {
+      if (marker.hz <= low || marker.hz >= high) continue;
+      const x = spectrumPlotX(marker.hz, low, high, w);
+      const labelWidth = ctx.measureText(marker.label).width;
+      const toTheRight = x + 4;
+      const labelX =
+        toTheRight + labelWidth <= w - 2 ? toTheRight : Math.max(2, x - labelWidth - 3);
+      ctx.fillText(marker.label, labelX, 11);
+    }
+  }
+  const spectrum = frame?.spectrum ?? [];
+  const spectrumHz = frame?.spectrumHz ?? [];
+  if (spectrum.length < 2 || spectrumHz.length !== spectrum.length || !axis) return;
+  ctx.strokeStyle = "#b2c8db";
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < spectrum.length; i++) {
+    const hz = spectrumHz[i];
+    const db = spectrum[i];
+    if (!(hz > 0) || !Number.isFinite(db)) continue;
+    const x = spectrumPlotX(hz, low, high, w);
+    const y = spectrumPlotY(db, top, bottom);
+    if (!started) {
+      ctx.moveTo(x, y);
+      started = true;
+    } else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
   let peak = 0;
   for (let i = 1; i < spectrum.length; i++) {
     if (spectrum[i] > spectrum[peak]) peak = i;
   }
-  if (w >= 170 && spectrum[peak] > -72) {
+  if (w >= 170 && spectrum[peak] > spectrumFloorDb) {
     ctx.fillStyle = "#e7eef4";
     ctx.textAlign = "right";
     ctx.fillText(
       `${spectrumHz[peak].toFixed(1)} Hz  ${spectrum[peak].toFixed(1)} dBFS`,
       w - 5,
-      11,
+      h - 4,
     );
     ctx.textAlign = "left";
   }
@@ -219,7 +196,7 @@ function paint(
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
   if (kind === 4) {
-    paintSpectrogram(ctx, canvas, w, h, frame);
+    paintSpectrum(ctx, w, h, frame);
     return;
   }
   const top = 13,
@@ -285,7 +262,6 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
     const root = ref.current;
     if (!root) return;
     const canvases = Array.from(root.querySelectorAll("canvas"));
-    canvases.forEach((canvas) => spectrograms.delete(canvas));
     const draw = (frame: DeckMeterFrame | null) =>
       canvases.forEach((c) => paint(c, Number(c.dataset.bit), frame));
     let disposed = false,
