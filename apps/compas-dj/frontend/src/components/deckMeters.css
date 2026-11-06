@@ -45,6 +45,7 @@
   flex: 1;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
   background: #090b0e;
 }
 .deck-meter-panel span {
@@ -52,9 +53,16 @@
   z-index: 1;
   top: 2px;
   left: 5px;
+  padding: 2px 4px;
   color: #a8afb6;
   font: 9px/1 system-ui;
+  background: rgb(9 11 14 / 0.9);
+  opacity: 0;
   pointer-events: none;
+}
+.deck-meter-panel:hover span,
+.deck-meter-panel:focus-within span {
+  opacity: 1;
 }
 .deck-meter-panel canvas {
   position: absolute;

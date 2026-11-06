@@ -514,3 +514,4 @@ Limit scope: PCM accumulator only; codec internals, analysis arrays, total RSS a
 
 - [x] Added demand-driven stereo image, oscilloscope and spectrum above each deck overview. [Measurements and verification](tasks/T-045.md)
 - [x] Meter strips stay within the overview height. Capture is a preallocated ring, an unchanged window skips analysis, and the spectrum runs off the webview.
+- [x] Idle meters draw a full-size grid before audio. Spectrum labels skip collisions, names appear on hover, and deck columns shrink to stay on screen.

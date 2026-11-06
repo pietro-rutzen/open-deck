@@ -681,3 +681,85 @@ button:not(.light), input:not([type="range"]), select, .search, .tile, .art, .pa
   .workspace-upper > .deck-row { min-height: 560px; }
   .workspace-upper { --deck-control-floor: 560px; }
 }
+@media (max-height: 760px) {
+  .workspace-upper > .deck-row { min-height: min-content; }
+  .workspace-upper { --deck-control-floor: 240px; }
+}
+
+/* Expanded decks share the row. Columns shrink with the deck so the outer edge stays on screen. */
+.deck-row { min-width: 0; max-width: 100%; }
+.deck-row > .mixer-size { max-width: 34%; min-width: 0; }
+.deck--expanded:not(.deck--compact) { min-width: 0; max-width: 100%; }
+.deck--expanded:not(.deck--compact) .deck-body {
+  display: grid;
+  grid-template-columns: clamp(64px, 26%, 156px) clamp(72px, 22%, 140px) minmax(0, 1fr);
+  align-items: start;
+  width: 100%;
+  min-width: 0;
+  min-height: min-content;
+  gap: clamp(4px, 1.2cqh, 12px);
+}
+.deck--mirror.deck--expanded:not(.deck--compact) .deck-body {
+  grid-template-columns: minmax(0, 1fr) clamp(72px, 22%, 140px) clamp(64px, 26%, 156px);
+}
+.deck--expanded:not(.deck--compact) .platter-col { grid-column: 1; }
+.deck--expanded:not(.deck--compact) .tempo-col { grid-column: 2; }
+.deck--expanded:not(.deck--compact) .controls-col { grid-column: 3; }
+.deck--mirror.deck--expanded:not(.deck--compact) .controls-col { grid-column: 1; }
+.deck--mirror.deck--expanded:not(.deck--compact) .tempo-col { grid-column: 2; }
+.deck--mirror.deck--expanded:not(.deck--compact) .platter-col { grid-column: 3; }
+.workspace-upper .deck--expanded:not(.deck--compact) .platter-col,
+.workspace-upper .deck--expanded:not(.deck--compact) .tempo-col,
+.workspace-upper .deck--expanded:not(.deck--compact) .controls-col {
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+  flex: none;
+}
+.workspace-upper .deck--expanded:not(.deck--compact) .platter {
+  width: min(100%, clamp(64px, 16.5cqh, 156px));
+  height: auto;
+  aspect-ratio: 1;
+  max-height: clamp(64px, 16.5cqh, 156px);
+}
+.workspace-upper .deck--expanded:not(.deck--compact) .platter-btns {
+  width: 100%;
+  max-width: 100%;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.workspace-upper .deck--expanded:not(.deck--compact) .btn-cue,
+.workspace-upper .deck--expanded:not(.deck--compact) .btn-play {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+}
+.deck--expanded:not(.deck--compact) .btn-play { flex-direction: column; gap: 1px; }
+.deck--expanded:not(.deck--compact) .tempo-stack,
+.deck--expanded:not(.deck--compact) .key-group {
+  flex-wrap: wrap;
+  justify-content: center;
+  max-width: 100%;
+  min-width: 0;
+}
+.deck--expanded:not(.deck--compact) .tempo-main,
+.deck--expanded:not(.deck--compact) .tempo-side { max-width: 100%; min-width: 0; }
+.deck--expanded:not(.deck--compact) .readouts { flex-wrap: wrap; min-width: 0; }
+.deck--expanded:not(.deck--compact) .readouts .tile { min-width: 0; flex: 1 1 64px; }
+.deck--expanded:not(.deck--compact) .loop-controls,
+.deck--expanded:not(.deck--compact) .beat-tools,
+.deck--expanded:not(.deck--compact) .effect-tools {
+  grid-template-columns: repeat(auto-fit, minmax(min(44px, 100%), 1fr));
+}
+.deck--expanded:not(.deck--compact) .chip,
+.deck--expanded:not(.deck--compact) .pad {
+  min-width: 0;
+  letter-spacing: 0;
+}
+.titlebar { min-width: 0; overflow-x: auto; }
+.master-cluster { min-width: 0; }
+.sources { min-width: clamp(140px, 18vw, 260px); max-width: clamp(180px, 28vw, 320px); }
+.track-inspector { width: clamp(168px, 24vw, 300px); min-width: 0; }
+.tl-toolbar .search { min-width: min(260px, 100%); }
+.workspace-lower { overflow: auto; }
+.wf-title { overflow: hidden; text-overflow: ellipsis; max-width: min(42vw, 100%); }

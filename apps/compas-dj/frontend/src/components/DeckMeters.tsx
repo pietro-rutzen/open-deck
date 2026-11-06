@@ -1,8 +1,9 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   onMeterFrame,
   readDeckMeters,
   spectrumFloorDb,
+  spectrumLabelPlacements,
   spectrumPlotX,
   spectrumPlotY,
   spectrumThresholds,
@@ -123,32 +124,39 @@ function displayScale() {
 }
 
 function resizePanel(panel: MeterPanel) {
-  const cssW = panel.trace.clientWidth;
-  const cssH = panel.trace.clientHeight;
+  const host = panel.trace.parentElement;
+  const cssW = host instanceof HTMLElement ? host.clientWidth : 0;
+  const cssH = host instanceof HTMLElement ? host.clientHeight : 0;
   const dpr = displayScale();
   if (!cssW || !cssH) return false;
-  const width = Math.round(cssW * dpr);
-  const height = Math.round(cssH * dpr);
+  const width = Math.max(1, Math.round(cssW * dpr));
+  const height = Math.max(1, Math.round(cssH * dpr));
   const changed =
     panel.cssW !== cssW ||
     panel.cssH !== cssH ||
     panel.dpr !== dpr ||
     panel.trace.width !== width ||
-    panel.trace.height !== height;
+    panel.trace.height !== height ||
+    panel.grid.width !== width ||
+    panel.grid.height !== height;
   panel.cssW = cssW;
   panel.cssH = cssH;
   panel.dpr = dpr;
   if (panel.trace.width !== width || panel.trace.height !== height) {
     panel.trace.width = width;
     panel.trace.height = height;
+  }
+  if (panel.grid.width !== width || panel.grid.height !== height) {
     panel.grid.width = width;
     panel.grid.height = height;
   }
   if (changed) panel.gridKey = "";
-  return cssW > 0 && cssH > 0;
+  return changed;
 }
 
-function prepare(ctx: CanvasRenderingContext2D, panel: MeterPanel) {
+function prepare(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, panel: MeterPanel) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.setTransform(panel.dpr, 0, 0, panel.dpr, 0, 0);
   ctx.lineWidth = 1;
   ctx.font = "9px system-ui";
@@ -162,8 +170,7 @@ function drawStatic(panel: MeterPanel, frame: DeckMeterFrame | null) {
   if (panel.gridKey === key) return;
   panel.gridKey = key;
   const ctx = panel.gridCtx;
-  prepare(ctx, panel);
-  ctx.clearRect(0, 0, w, h);
+  prepare(ctx, panel.grid, panel);
   if (kind === 4) {
     const axis = high > low && low > 0;
     ctx.strokeStyle = "rgba(255,255,255,0.22)";
@@ -180,16 +187,17 @@ function drawStatic(panel: MeterPanel, frame: DeckMeterFrame | null) {
     }
     ctx.stroke();
     if (axis) {
-      for (const marker of spectrumThresholds) {
-        if (marker.hz <= low || marker.hz >= high) continue;
-        const x = spectrumPlotX(marker.hz, low, high, w);
-        const labelWidth = ctx.measureText(marker.label).width;
-        const toTheRight = x + 4;
-        const labelX =
-          toTheRight + labelWidth <= w - 2
-            ? toTheRight
-            : Math.max(2, x - labelWidth - 3);
-        ctx.fillText(marker.label, labelX, 11);
+      const titleWidth = ctx.measureText("Spectrum").width;
+      const placements = spectrumLabelPlacements(
+        spectrumThresholds,
+        low,
+        high,
+        w,
+        (label) => ctx.measureText(label).width,
+        [{ left: 0, right: 16 + titleWidth }],
+      );
+      for (const placement of placements) {
+        ctx.fillText(placement.label, placement.x, 11);
       }
     }
     return;
@@ -211,8 +219,7 @@ function drawStatic(panel: MeterPanel, frame: DeckMeterFrame | null) {
 function drawTrace(panel: MeterPanel, frame: DeckMeterFrame | null) {
   const { cssW: w, cssH: h, kind } = panel;
   const ctx = panel.traceCtx;
-  prepare(ctx, panel);
-  ctx.clearRect(0, 0, w, h);
+  prepare(ctx, panel.trace, panel);
   if (!frame || !w || !h) return;
   const top = 13;
   const bottom = h - 2;
@@ -313,7 +320,7 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
   track: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const root = ref.current;
     if (!root) return;
     const panels: MeterPanel[] = [];
@@ -344,17 +351,23 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
     let painted = 0;
     const enabled = () => !disposed && visible && active && !document.hidden;
     const repaint = () => paintPanels(panels, latest);
+    const fit = () => {
+      let changed = false;
+      for (const panel of panels) {
+        if (resizePanel(panel)) changed = true;
+      }
+      const unpainted = panels.some((panel) => panel.cssW > 0 && panel.gridKey === "");
+      if (!changed && !unpainted) return;
+      repaint();
+      if (latest) painted = latest.sequence;
+    };
     const tick = () => {
       if (!enabled()) {
         stop();
         return;
       }
-      const scale = displayScale();
-      const scaleChanged = panels.some((panel) => panel.cssW > 0 && panel.dpr !== scale);
-      if (scaleChanged) {
-        for (const panel of panels) resizePanel(panel);
-      }
-      if (latest && (latest.sequence !== painted || scaleChanged)) {
+      if (panels.some((panel) => panel.cssW === 0 || panel.dpr !== displayScale())) fit();
+      if (latest && latest.sequence !== painted) {
         repaint();
         painted = latest.sequence;
       }
@@ -393,25 +406,25 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
     });
     observer.observe(root);
     document.addEventListener("visibilitychange", onVisibility);
-    const resize = new ResizeObserver(() => {
-      const dirty = panels.some((panel) => {
-        const previous = `${panel.cssW}x${panel.cssH}@${panel.dpr}`;
-        resizePanel(panel);
-        return previous !== `${panel.cssW}x${panel.cssH}@${panel.dpr}`;
-      });
-      if (!dirty) return;
-      repaint();
-      if (latest) painted = latest.sequence;
-    });
+    const resize = new ResizeObserver(() => fit());
     resize.observe(root);
-    for (const panel of panels) resizePanel(panel);
-    repaint();
+    for (const panel of panels) {
+      const host = panel.trace.parentElement;
+      if (host) resize.observe(host);
+    }
+    window.addEventListener("resize", fit);
+    fit();
+    const retry = panels.every((panel) => panel.cssW > 0)
+      ? 0
+      : requestAnimationFrame(() => fit());
     start();
     return () => {
       disposed = true;
       stop();
+      if (retry) cancelAnimationFrame(retry);
       observer.disconnect();
       resize.disconnect();
+      window.removeEventListener("resize", fit);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [deck, mask, active, track]);
