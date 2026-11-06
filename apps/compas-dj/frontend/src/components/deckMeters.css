@@ -24,6 +24,10 @@
 .deck-meter-options input {
   accent-color: var(--deck-color);
 }
+.deck-meter-options input:checked {
+  border-color: var(--deck-color);
+  background-color: var(--deck-color);
+}
 .deck-meter-strip {
   display: flex;
   gap: 2px;
