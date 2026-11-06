@@ -358,12 +358,6 @@ button:not(.light), input:not([type="range"]), select, .search, .tile, .art, .pa
 .deck--compact .overview { flex: 0 0 56px; height: 56px; min-height: 56px; max-height: 56px; }
 .deck--compact .platter-col { flex-direction: column; width: 120px; flex-basis: 120px; }
 .deck--compact:not(.deck--expanded) .tempo-col { margin-left: auto; }
-@media (max-width: 1200px) {
-  .deck .deck-body { flex-wrap: wrap; }
-  .deck .controls-col { order: 3; flex: 1 0 100%; }
-  .deck .tempo-col { margin-left: auto; }
-  .deck .pad-bank { flex-direction: row; align-items: center; gap: 10px; }
-}
 /* Let tempo span the waveform/transport area, freeing its former empty lower space. */
 .app .deck:not(.deck--compact):not(.deck--expanded) {
   display: grid;
@@ -500,7 +494,7 @@ button:not(.light), input:not([type="range"]), select, .search, .tile, .art, .pa
 .content { overflow: hidden; }
 .workspace-split { display: grid; flex: 1; min-width: 0; min-height: 0; overflow: hidden; }
 .workspace-upper { min-width: 0; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
-.workspace-upper > .deck-row { flex: 1 1 auto; min-height: 0; height: auto; }
+.workspace-upper > .deck-row { flex: 1 0 auto; height: auto; }
 .workspace-lower { min-width: 0; min-height: 0; overflow: hidden; display: flex; }
 .workspace-lower > .library { flex: 1; min-width: 0; min-height: 0; max-width: 100%; overflow: hidden; }
 .workspace-upper, .workspace-lower { position: relative; z-index: 1; }
@@ -513,8 +507,12 @@ button:not(.light), input:not([type="range"]), select, .search, .tile, .art, .pa
 .pane-divider > span { display: none; }
 .pane-divider::after { content: ""; position: absolute; top: 0; bottom: 0; left: 2px; width: 1px; background: transparent; }
 .pane-divider:hover::after, .pane-divider:focus-visible::after { background: rgba(255, 255, 255, 0.28); }
-.mixer-size { display: flex; flex: none; min-width: 0; min-height: 0; align-self: stretch; width: 360px; height: 100%; }
-.mixer-size > .mixer { width: auto; flex: 1 1 auto; height: 100%; min-width: 0; min-height: 0; }
+.mixer-size { display: flex; flex: none; min-width: 0; min-height: 0; align-self: stretch; width: 360px; max-width: 30%; height: auto; }
+.mixer-size > .mixer { width: auto; flex: 1 1 auto; height: auto; min-width: 0; min-height: 0; }
+
+/* Saved desktop sidebar widths must leave space for the library after a resize. */
+.workspace-lower .sources { min-width: min(260px, 20%); max-width: min(640px, 24%); }
+.workspace-lower .track-inspector { max-width: min(560px, 24%); }
 
 /* Artwork is a visual cue inside Title; retain existing column/sort geometry. */
 .tl-title-with-art { display: flex; align-items: center; gap: 8px; min-width: 0; overflow: hidden; }
@@ -568,7 +566,7 @@ button:not(.light), input:not([type="range"]), select, .search, .tile, .art, .pa
 .workspace-upper .deck .tempo-col .sync-btn { min-height: clamp(16px, 2.8cqh, 28px); }
 .workspace-upper .deck .nudge button { min-height: clamp(14px, 2.4cqh, 26px); min-width: clamp(18px, 3cqh, 32px); }
 .workspace-upper .deck-tool-row { row-gap: clamp(3px, 0.7cqh, 6px); }
-.workspace-upper .mixer.mixer--hardware { height: 100%; min-height: 0; overflow: hidden; padding: clamp(4px, 1cqh, 10px); gap: clamp(2px, 0.7cqh, 8px); }
+.workspace-upper .mixer.mixer--hardware { height: auto; min-height: 0; overflow: hidden; padding: clamp(4px, 1cqh, 10px); gap: clamp(2px, 0.7cqh, 8px); }
 .workspace-upper .mixer--hardware .mixer-strips { flex: 1 1 auto; min-height: 0; align-items: center; justify-content: center; }
 .workspace-upper .mixer--hardware .mixer-pair { flex: 0 0 auto; width: auto; max-width: 100%; align-items: center; justify-content: center; gap: 28px; }
 .workspace-upper .mixer--hardware .strip,
@@ -661,11 +659,79 @@ button:not(.light), input:not([type="range"]), select, .search, .tile, .art, .pa
 .next-card { height: 24px; }
 .next-title, .next-artist, .next-bpm { font-size: 11px; line-height: 24px; }
 
+/* A deck's available width changes with both the window and the mixer divider.
+   Place the mirrored controls explicitly on the same row; sparse auto-placement
+   otherwise pushes each right-to-left group onto a new row. */
+.workspace-upper .deck {
+  container: deck / inline-size;
+}
+.workspace-upper .deck--expanded .deck-body {
+  --jog-column: clamp(100px, min(22cqw, 19cqh), 164px);
+  --tempo-column: 114px;
+  display: grid;
+  grid-template-areas: "transport tempo pads";
+  grid-template-columns: var(--jog-column) var(--tempo-column) minmax(0, 1fr);
+  align-items: start;
+  min-width: 0;
+}
+.workspace-upper .deck--mirror.deck--expanded .deck-body {
+  grid-template-areas: "pads tempo transport";
+  grid-template-columns: minmax(0, 1fr) var(--tempo-column) var(--jog-column);
+}
+.workspace-upper .deck .platter-col { grid-area: transport; width: 100%; }
+.workspace-upper .deck .controls-col { grid-area: pads; min-width: 0; }
+.workspace-upper .deck .tempo-col { grid-area: tempo; justify-self: center; margin: 0; }
+.workspace-upper .deck--compact .deck-body { --tempo-column: 58px; }
+.workspace-upper .deck .platter { max-width: 100%; height: auto; aspect-ratio: 1; }
+.workspace-upper .deck .platter-btns {
+  width: 100%; max-width: 126px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.workspace-upper .deck .platter-btns button { width: 100%; min-width: 0; }
+.workspace-upper .deck .key-group { max-width: 100%; flex-wrap: wrap; }
+.workspace-upper .deck .readouts { flex-wrap: wrap; gap: 5px clamp(6px, 2cqw, 18px); }
+.workspace-upper .deck .readouts .tile { flex: 1 1 auto; min-width: 0; }
+.workspace-upper .deck .effect-tools { margin-top: 0; }
+
+@container deck (min-width: 740px) {
+  .workspace-upper .deck .controls-col {
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    align-content: start;
+  }
+  .deck .controls-col > * { grid-column: 1 / -1; }
+  .deck .controls-col > .beat-tools { grid-column: 1; }
+  .deck .controls-col > .effect-tools { grid-column: 2; }
+}
+/* Below this width a five-button loop row would become too narrow to read.
+   Put transport and tempo together with the pads immediately beneath them. */
+@container deck (max-width: 394px) {
+  .workspace-upper .deck--expanded:not(.deck--compact) .deck-body {
+    grid-template-areas: "transport tempo" "pads pads";
+    grid-template-columns: minmax(0, 1fr) minmax(110px, 1fr);
+  }
+  .workspace-upper .deck--mirror.deck--expanded:not(.deck--compact) .deck-body {
+    grid-template-areas: "tempo transport" "pads pads";
+    grid-template-columns: minmax(110px, 1fr) minmax(0, 1fr);
+  }
+  .workspace-upper .deck .controls-col { gap: 6px; }
+}
+@container deck (max-width: 310px) {
+  .workspace-upper .deck--compact .deck-body,
+  .workspace-upper .deck--mirror.deck--compact .deck-body {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-areas: "transport tempo" "pads pads";
+  }
+  .workspace-upper .deck--mirror.deck--compact .deck-body {
+    grid-template-areas: "tempo transport" "pads pads";
+  }
+}
+
 /* A saved waveform size must yield to usable controls as its pane shrinks.
    Very small panes scroll rather than clipping controls or overlapping the mixer. */
 .workspace-upper { --deck-control-floor: 380px; }
 .workspace-upper > .wf-zone { max-height: max(72px, calc(100% - var(--deck-control-floor))); }
-.workspace-upper > .deck-row { min-height: 380px; }
+.workspace-upper > .deck-row { min-height: max-content; }
 .workspace-upper .mixer--hardware .mixer-head,
 .workspace-upper .mixer--hardware .mixer-strips,
 .workspace-upper .mixer--hardware .xfader { flex-shrink: 0; }
@@ -678,6 +744,19 @@ button:not(.light), input:not([type="range"]), select, .search, .tile, .art, .pa
   .workspace-upper .deck .effect-tools .chip { height: 24px; min-height: 24px; }
 }
 @media (max-width: 1200px) {
-  .workspace-upper > .deck-row { min-height: 560px; }
   .workspace-upper { --deck-control-floor: 560px; }
+}
+
+/* Share the vertical allowance between the optional meters and track overview. */
+.workspace-upper .deck-header-actions { flex-direction: row; align-items: center; }
+@container performance (max-height: 660px) {
+  .workspace-upper .deck:has(> .deck-meter-strip) {
+    --preview-height: clamp(32px, calc(30cqh - 108px), 84px);
+  }
+  .workspace-upper .deck > .deck-meter-strip,
+  .workspace-upper .deck > .deck-meter-strip + .overview {
+    flex: 0 0 var(--preview-height);
+    height: var(--preview-height);
+    min-height: var(--preview-height);
+  }
 }

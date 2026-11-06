@@ -514,3 +514,7 @@ Limit scope: PCM accumulator only; codec internals, analysis arrays, total RSS a
 
 - [x] Added demand-driven stereo image, oscilloscope and spectrum above each deck overview. [Measurements and verification](tasks/T-045.md)
 - [x] Meter strips stay within the overview height. Capture is a preallocated ring, an unchanged window skips analysis, and the spectrum runs off the webview.
+
+## Responsive deck layout repair — 2026-11-06
+
+- [x] Give mirrored deck controls explicit grid areas and size them against each deck. Bound saved mixer/sidebar widths and let short performance panes scroll as one unit. Checked the full app in WebKit at 1280×768, 1544×865, 1920×1080 and 3440×1280, including enabled meters and four decks.

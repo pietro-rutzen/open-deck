@@ -40,6 +40,10 @@ export function PaneDivider({
 }) {
   const drag = useRef<{ x: number; width: number } | null>(null);
   const apply = (next: number) => onChange(clampSize(next, min, max));
+  const paneWidth = (divider: HTMLElement) => {
+    const pane = grow === 1 ? divider.previousElementSibling : divider.nextElementSibling;
+    return pane instanceof HTMLElement ? pane.getBoundingClientRect().width : value;
+  };
   return (
     <div
       className="pane-divider"
@@ -57,9 +61,7 @@ export function PaneDivider({
         event.preventDefault();
         event.currentTarget.focus();
         event.currentTarget.setPointerCapture(event.pointerId);
-        const pane = grow === 1 ? event.currentTarget.previousElementSibling : event.currentTarget.nextElementSibling;
-        const measured = pane instanceof HTMLElement ? pane.getBoundingClientRect().width : value;
-        drag.current = { x: event.clientX, width: measured };
+        drag.current = { x: event.clientX, width: paneWidth(event.currentTarget) };
       }}
       onPointerMove={(event) => {
         const start = drag.current;
@@ -76,7 +78,7 @@ export function PaneDivider({
         if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
         event.preventDefault();
         const step = event.key === "ArrowRight" ? 16 : -16;
-        apply(event.key === "Home" ? min : event.key === "End" ? max : value + step * grow);
+        apply(event.key === "Home" ? min : event.key === "End" ? max : paneWidth(event.currentTarget) + step * grow);
       }}
     ><span aria-hidden="true" /></div>
   );
@@ -135,7 +137,10 @@ export function WorkspaceSplit({ upper, lower }: { upper: ReactNode; lower: Reac
   const available = Math.max(0, height - DIVIDER);
   const min = Math.min(MIN_PANE, available);
   const max = Math.max(min, available - Math.min(MIN_PANE, available));
-  const upperHeight = clamp(available * (ratio ?? DEFAULT_RATIO), min, max);
+  // Leave enough deck height on laptop screens at the default split. An explicit
+  // divider position still wins; the upper pane then scrolls as one unit.
+  const preferred = ratio == null ? Math.max(available * DEFAULT_RATIO, 520) : available * ratio;
+  const upperHeight = clamp(preferred, min, max);
   const moveTo = (pixels: number) => {
     if (available > 0) setRatio(clamp(pixels, min, max) / available);
   };
