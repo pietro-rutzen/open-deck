@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use compas_audio::{ScopeBlock, NUM_DECKS};
+use compas_audio::{ScopeBlock, NUM_DECKS, SPECTRUM_FRAMES};
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use serde::Serialize;
 use tauri::State;
@@ -11,8 +11,10 @@ use tauri::State;
 use crate::EngineHandle;
 
 const TRACE_POINTS: usize = 192;
-const SPECTRUM_BANDS: usize = 72;
 const DB_FLOOR: f32 = -72.0;
+/// Zero-pad the captured window so an off-bin bass peak can be localized.
+const FFT_LEN: usize = 16384;
+const SPECTRUM_ROWS: usize = 384;
 const MIN_POLL: Duration = Duration::from_millis(50);
 const STALE_AFTER: Duration = Duration::from_millis(250);
 
@@ -22,6 +24,7 @@ pub(crate) struct DeckMeterFrame {
     left: Vec<f32>,
     right: Vec<f32>,
     spectrum: Vec<f32>,
+    spectrum_hz: Vec<f32>,
     min_hz: f32,
     max_hz: f32,
 }
@@ -40,77 +43,141 @@ struct MeterSlot {
 struct Spectrum {
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
-    inverse_window_sum_squared: f32,
+    /// Coherent gain. A unit sine's positive-frequency bin has magnitude `window_sum / 2`.
+    window_sum: f32,
     buffer: Vec<Complex32>,
     scratch: Vec<Complex32>,
-    band_bins: Vec<(usize, usize)>,
+    db: Vec<f32>,
     sample_rate: f32,
 }
 
 impl Spectrum {
     fn new(n: usize, sample_rate: f32) -> Self {
-        let fft = FftPlanner::new().plan_fft_forward(n);
+        let fft_len = FFT_LEN.max(n).next_power_of_two();
+        let fft = FftPlanner::new().plan_fft_forward(fft_len);
+        // 4-term Blackman-Harris. Its sidelobes stay near −92 dB, so a tone is a
+        // narrow band. Amplitude still uses the window's coherent gain below.
         let window: Vec<_> = (0..n)
-            .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos())
-            .collect();
-        let inverse_window_sum_squared = window.iter().sum::<f32>().powi(-2);
-        let scratch = vec![Complex32::default(); fft.get_inplace_scratch_len()];
-        let (min_hz, max_hz) = frequency_range(sample_rate);
-        let ratio = (max_hz / min_hz).powf(1.0 / (SPECTRUM_BANDS - 1) as f32);
-        let bin_hz = sample_rate / n as f32;
-        let band_bins = (0..SPECTRUM_BANDS)
             .map(|i| {
-                let hz = min_hz * ratio.powi(i as i32);
-                let lower = ((hz / ratio.sqrt() / bin_hz).ceil() as usize).clamp(1, n / 2);
-                let upper = ((hz * ratio.sqrt() / bin_hz).floor() as usize).clamp(1, n / 2);
-                if lower > upper {
-                    let closest = ((hz / bin_hz).round() as usize).clamp(1, n / 2);
-                    (closest, closest)
-                } else {
-                    (lower, upper)
-                }
+                let phase = std::f32::consts::TAU * i as f32 / n as f32;
+                0.35875 - 0.48829 * phase.cos() + 0.14128 * (2.0 * phase).cos()
+                    - 0.01168 * (3.0 * phase).cos()
             })
             .collect();
+        let window_sum = window.iter().sum::<f32>().max(1.0);
+        let scratch = vec![Complex32::default(); fft.get_inplace_scratch_len()];
         Self {
             fft,
             window,
-            inverse_window_sum_squared,
+            window_sum,
             scratch,
-            band_bins,
+            db: vec![DB_FLOOR; fft_len / 2 + 1],
             sample_rate,
-            buffer: vec![Complex32::default(); n],
+            buffer: vec![Complex32::default(); fft_len],
         }
     }
 
-    fn analyze(&mut self, samples: &[[f32; 2]]) -> Vec<f32> {
-        for ((bin, frame), win) in self.buffer.iter_mut().zip(samples).zip(&self.window) {
-            *bin = Complex32::new(finite(frame[0]) * win, finite(frame[1]) * win);
-        }
-        self.fft
-            .process_with_scratch(&mut self.buffer, &mut self.scratch);
+    fn analyze(&mut self, samples: &[[f32; 2]]) -> (Vec<f32>, Vec<f32>) {
+        self.db.fill(DB_FLOOR);
         let n = self.buffer.len();
-        self.band_bins
-            .iter()
-            .map(|&(lower, upper)| {
-                // One complex FFT carries both real channels. Summing the powers of
-                // conjugate-index bins removes the cross term even for antiphase stereo.
-                let mut peak_power = 0.0_f32;
-                for k in lower..=upper {
-                    let power = if k == n / 2 {
-                        self.buffer[k].norm_sqr() * 0.5
-                    } else {
-                        self.buffer[k].norm_sqr() + self.buffer[n - k].norm_sqr()
-                    };
-                    peak_power = peak_power.max(power);
+        for channel in 0..2 {
+            for slot in &mut self.buffer {
+                *slot = Complex32::default();
+            }
+            for ((bin, frame), win) in self.buffer.iter_mut().zip(samples).zip(&self.window) {
+                *bin = Complex32::new(finite(frame[channel]) * win, 0.0);
+            }
+            self.fft
+                .process_with_scratch(&mut self.buffer, &mut self.scratch);
+            for (k, bin) in self.buffer.iter().take(n / 2 + 1).enumerate() {
+                let mirrors = if k == 0 || k == n / 2 { 1.0 } else { 2.0 };
+                let amplitude = bin.norm() * mirrors / self.window_sum;
+                let db = if amplitude > 1e-8 {
+                    (20.0 * amplitude.log10()).clamp(DB_FLOOR, 12.0)
+                } else {
+                    DB_FLOOR
+                };
+                self.db[k] = self.db[k].max(db);
+            }
+        }
+        let (min_hz, max_hz) = frequency_range(self.sample_rate);
+        let bin_hz = self.sample_rate / n as f32;
+        let first = (min_hz / bin_hz).ceil().max(1.0) as usize;
+        let last = ((max_hz / bin_hz).floor() as usize).clamp(first, n / 2 - 1);
+        let mut row_db = vec![DB_FLOOR; SPECTRUM_ROWS];
+        let mut row_hz = vec![0.0_f32; SPECTRUM_ROWS];
+        let log_span = (max_hz / min_hz).ln();
+        for k in first..=last {
+            let (bin, level) = interpolate_peak(&self.db, k);
+            let frequency = (bin * bin_hz).clamp(min_hz, max_hz);
+            let row = ((frequency / min_hz).ln() / log_span * (SPECTRUM_ROWS - 1) as f32)
+                .round()
+                .clamp(0.0, (SPECTRUM_ROWS - 1) as f32) as usize;
+            if level >= row_db[row] {
+                row_db[row] = level.clamp(DB_FLOOR, 0.0);
+                row_hz[row] = frequency;
+            }
+        }
+        // Bass rows are narrower than one FFT bin. Sample the measured curve
+        // there so a tone is a solid band, while a real peak keeps its own level.
+        for index in 0..SPECTRUM_ROWS {
+            if row_hz[index] > 0.0 {
+                continue;
+            }
+            let center = min_hz * (max_hz / min_hz).powf(index as f32 / (SPECTRUM_ROWS - 1) as f32);
+            row_db[index] = sample_db(&self.db, bin_hz, center).clamp(DB_FLOOR, 0.0);
+            row_hz[index] = center;
+        }
+        let mut previous = 0.0_f32;
+        let hz = (0..SPECTRUM_ROWS)
+            .map(|i| {
+                let center = min_hz * (max_hz / min_hz).powf(i as f32 / (SPECTRUM_ROWS - 1) as f32);
+                let mut frequency = if row_hz[i] > 0.0 { row_hz[i] } else { center };
+                if frequency <= previous {
+                    frequency = center.max(previous + bin_hz * 0.01);
                 }
-                (10.0 * (peak_power * self.inverse_window_sum_squared).log10()).clamp(DB_FLOOR, 0.0)
+                previous = frequency;
+                frequency
             })
-            .collect()
+            .collect();
+        (row_db, hz)
     }
+}
+
+/// Move a local maximum to the parabolic vertex. Off-bin sines otherwise
+/// read low and sit on the nearest FFT-bin center.
+fn interpolate_peak(db: &[f32], k: usize) -> (f32, f32) {
+    let level = db[k];
+    if k == 0 || k + 1 >= db.len() || level <= DB_FLOOR {
+        return (k as f32, level);
+    }
+    let left = db[k - 1];
+    let right = db[k + 1];
+    if left >= level || right >= level {
+        return (k as f32, level);
+    }
+    let curvature = left - 2.0 * level + right;
+    if curvature >= -1e-4 {
+        return (k as f32, level);
+    }
+    let offset = (0.5 * (left - right) / curvature).clamp(-0.5, 0.5);
+    let peak = level - (left - right).powi(2) / (8.0 * curvature);
+    (k as f32 + offset, peak)
 }
 
 fn frequency_range(rate: f32) -> (f32, f32) {
     (20.0, 20_000.0_f32.min(rate / 2.0))
+}
+
+fn sample_db(db: &[f32], bin_hz: f32, hz: f32) -> f32 {
+    if db.len() < 2 || !(bin_hz > 0.0) {
+        return DB_FLOOR;
+    }
+    let position = (hz / bin_hz).clamp(0.0, (db.len() - 1) as f32);
+    let index = position.floor() as usize;
+    let next = (index + 1).min(db.len() - 1);
+    let fraction = position - index as f32;
+    db[index] + (db[next] - db[index]) * fraction
 }
 
 fn finite(v: f32) -> f32 {
@@ -125,15 +192,19 @@ impl MeterSlot {
     fn frame(&mut self, block: &ScopeBlock, include_spectrum: bool) -> DeckMeterFrame {
         let samples = &block.frames;
         let (min_hz, max_hz) = frequency_range(block.sample_rate);
-        let spectrum = if include_spectrum {
-            if self.spectrum.as_ref().is_none_or(|s| {
-                s.sample_rate != block.sample_rate || s.buffer.len() != samples.len()
-            }) {
+        let (spectrum, spectrum_hz) = if include_spectrum {
+            let needs_plan = self.spectrum.as_ref().is_none_or(|spectrum| {
+                spectrum.sample_rate != block.sample_rate || spectrum.window.len() != samples.len()
+            });
+            if needs_plan {
                 self.spectrum = Some(Spectrum::new(samples.len(), block.sample_rate));
             }
-            self.spectrum.as_mut().unwrap().analyze(samples)
+            self.spectrum
+                .as_mut()
+                .map(|spectrum| spectrum.analyze(samples))
+                .unwrap_or_default()
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         // Stable rising-edge trigger for the short waveform. Keep L/R paired for the scope.
         let span =
@@ -161,6 +232,7 @@ impl MeterSlot {
             left,
             right,
             spectrum,
+            spectrum_hz,
             min_hz,
             max_hz,
         }
@@ -197,6 +269,7 @@ pub(crate) async fn read_deck_meters(
     }
     Ok(block
         .filter(|b| b.sample_rate.is_finite() && b.sample_rate > 40.0)
+        .filter(|b| !spectrum || b.frames.len() == SPECTRUM_FRAMES)
         .map(|b| slot.frame(&b, spectrum)))
 }
 
@@ -230,9 +303,8 @@ mod tests {
             .enumerate()
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .unwrap();
-        let hz = stereo.min_hz
-            * (stereo.max_hz / stereo.min_hz).powf(bin as f32 / (SPECTRUM_BANDS - 1) as f32);
-        assert!((hz - 937.5).abs() < 55.0);
+        let hz = stereo.spectrum_hz[bin];
+        assert!((hz - 937.5).abs() < 0.5);
         assert!((db + 6.02).abs() < 0.1);
         assert!((db - inverted.spectrum[bin]).abs() < 0.01);
         assert_eq!(inverted.left.len(), TRACE_POINTS);
@@ -241,6 +313,76 @@ mod tests {
             .iter()
             .zip(&inverted.right)
             .all(|(l, r)| (*l + *r).abs() < 1e-6));
+    }
+
+    fn tones(rate: f32, input: &[(f32, f32)]) -> ScopeBlock {
+        ScopeBlock {
+            sample_rate: rate,
+            frames: (0..SPECTRUM_FRAMES)
+                .map(|i| {
+                    let value = input
+                        .iter()
+                        .map(|(hz, level)| {
+                            level * (std::f32::consts::TAU * hz * i as f32 / rate).sin()
+                        })
+                        .sum();
+                    [value, value]
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn bass_peak_location_and_level_are_accurate_off_bin() {
+        for rate in [44100.0, 48000.0, 96000.0] {
+            let tone = tones(rate, &[(65.36, 0.25)]);
+            let frame = MeterSlot::default().frame(&tone, true);
+            let (i, db) = frame
+                .spectrum
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap();
+            assert!(
+                (frame.spectrum_hz[i] - 65.36).abs() < 0.5,
+                "rate {rate}: peak {} Hz at {db} dBFS",
+                frame.spectrum_hz[i]
+            );
+            assert!((db + 12.0412).abs() < 0.25);
+            assert!(frame.spectrum_hz.windows(2).all(|w| w[0] < w[1]));
+            assert_eq!(frame.spectrum.len(), SPECTRUM_ROWS);
+        }
+        let left_only = ScopeBlock {
+            sample_rate: 48_000.0,
+            frames: (0..SPECTRUM_FRAMES)
+                .map(|i| {
+                    let value = 0.5 * (std::f32::consts::TAU * 937.5 * i as f32 / 48_000.0).sin();
+                    [value, 0.0]
+                })
+                .collect(),
+        };
+        let frame = MeterSlot::default().frame(&left_only, true);
+        let db = frame.spectrum.iter().copied().fold(DB_FLOOR, f32::max);
+        assert!((db + 6.0206).abs() < 0.15, "left-only sine was {db} dBFS");
+    }
+
+    #[test]
+    fn close_treble_tones_have_separate_peaks_and_a_valley() {
+        let frame =
+            MeterSlot::default().frame(&tones(48000.0, &[(8000.0, 0.25), (8240.0, 0.125)]), true);
+        for (hz, db) in [(8000.0, -12.0412), (8240.0, -18.0618)] {
+            let i = frame
+                .spectrum_hz
+                .iter()
+                .position(|f| (f - hz).abs() < 0.5)
+                .expect("tone peak");
+            assert!((frame.spectrum[i] - db).abs() < 0.3);
+        }
+        assert!(frame
+            .spectrum_hz
+            .iter()
+            .zip(&frame.spectrum)
+            .any(|(hz, db)| (8050.0..8190.0).contains(hz) && *db < -36.0));
     }
 
     #[test]
@@ -279,7 +421,7 @@ mod tests {
     #[test]
     #[ignore = "local timing measurement; run with --ignored --nocapture"]
     fn measure_meter_cost() {
-        let block = stereo_tone(-1.0);
+        let block = tones(48000.0, &[(65.36, 0.25), (8240.0, 0.125)]);
         let mut slot = MeterSlot::default();
         const N: usize = 500;
         for spectrum in [false, true] {

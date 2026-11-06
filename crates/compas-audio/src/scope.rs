@@ -1,6 +1,6 @@
 //! One request captures one contiguous stereo block. All audio-side storage is preallocated.
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering::*};
-pub(crate) const FRAMES: usize = 2048;
+pub const FRAMES: usize = 8192;
 const IDLE: u8 = 0;
 const REQUEST: u8 = 1;
 const WRITING: u8 = 2;

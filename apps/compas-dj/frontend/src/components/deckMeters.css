@@ -58,3 +58,9 @@
     flex-basis: clamp(30px, 7cqh, 40px);
   }
 }
+
+/* Give frequency and level differences room to read when the deck has height. */
+.deck-meter-strip--spectrum { height: clamp(72px, 16cqh, 148px); }
+@container performance (max-height: 570px) {
+  .deck-meter-strip--spectrum { height: clamp(56px, 12cqh, 72px); }
+}

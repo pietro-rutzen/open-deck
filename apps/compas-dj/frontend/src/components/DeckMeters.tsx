@@ -5,7 +5,7 @@ import "./deckMeters.css";
 const widgets = [
   { bit: 1, name: "Stereo image" },
   { bit: 2, name: "Oscilloscope" },
-  { bit: 4, name: "Spectrum" },
+  { bit: 4, name: "Spectrogram" },
 ] as const;
 
 const key = (deck: number) => `opendeck.deck.${deck}.meter-mask.v1`;
@@ -97,6 +97,108 @@ export const MeterMenu = memo(function MeterMenu({
   );
 });
 
+/** Scrolling log-frequency spectrogram. Each column is the latest calibrated spectrum. */
+const spectrograms = new WeakMap<HTMLCanvasElement, HTMLCanvasElement>();
+
+function dbAt(hz: number, frequencies: number[], levels: number[]) {
+  let lo = 0;
+  let hi = frequencies.length - 1;
+  if (hz <= frequencies[0]) return levels[0];
+  if (hz >= frequencies[hi]) return levels[hi];
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (frequencies[mid] < hz) lo = mid;
+    else hi = mid;
+  }
+  const span = Math.log(frequencies[hi] / frequencies[lo]);
+  const t = span > 0 ? Math.log(hz / frequencies[lo]) / span : 0;
+  return levels[lo] + (levels[hi] - levels[lo]) * t;
+}
+
+function spectrogramColor(db: number) {
+  const stops: Array<[number, number, number, number]> = [
+    [0, 8, 12, 18],
+    [0.18, 18, 42, 110],
+    [0.4, 16, 120, 132],
+    [0.62, 36, 168, 64],
+    [0.82, 232, 196, 42],
+    [1, 255, 250, 240],
+  ];
+  const t = Math.max(0, Math.min(1, (db + 72) / 72));
+  const upper = stops.findIndex((stop) => stop[0] >= t);
+  const b = stops[Math.max(0, upper)];
+  const a = stops[Math.max(0, upper - 1)];
+  const span = b[0] - a[0] || 1;
+  const mix = (t - a[0]) / span;
+  const channel = (from: number, to: number) => Math.round(from + (to - from) * mix);
+  return `rgb(${channel(a[1], b[1])}, ${channel(a[2], b[2])}, ${channel(a[3], b[3])})`;
+}
+
+function paintSpectrogram(
+  ctx: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  w: number,
+  h: number,
+  frame: DeckMeterFrame | null,
+) {
+  const low = frame?.minHz ?? 20;
+  const high = frame?.maxHz ?? 20000;
+  const plot = spectrograms.get(canvas) ?? document.createElement("canvas");
+  if (plot.width !== canvas.width || plot.height !== canvas.height) {
+    plot.width = canvas.width;
+    plot.height = canvas.height;
+  }
+  spectrograms.set(canvas, plot);
+  const plotCtx = plot.getContext("2d");
+  if (!plotCtx) return;
+  const { spectrum, spectrumHz } = frame ?? { spectrum: [], spectrumHz: [] };
+  if (spectrum.length > 1 && spectrumHz.length === spectrum.length) {
+    const shift = Math.max(1, Math.round(canvas.width / w));
+    if (plot.width > shift) {
+      const image = plotCtx.getImageData(shift, 0, plot.width - shift, plot.height);
+      plotCtx.putImageData(image, 0, 0);
+    }
+    const x = plot.width - shift;
+    for (let y = 0; y < plot.height; y++) {
+      const fraction = 1 - y / Math.max(1, plot.height - 1);
+      const hz = low * (high / low) ** fraction;
+      plotCtx.fillStyle = spectrogramColor(dbAt(hz, spectrumHz, spectrum));
+      plotCtx.fillRect(x, y, shift, 1);
+    }
+  }
+  ctx.drawImage(plot, 0, 0, w, h);
+  ctx.font = "9px system-ui";
+  ctx.fillStyle = "#99a7b3";
+  ctx.strokeStyle = "rgba(255,255,255,0.14)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const hz of [50, 100, 200, 500, 1000, 2000, 5000, 10000]) {
+    if (hz <= low || hz >= high) continue;
+    const y = h * (1 - Math.log(hz / low) / Math.log(high / low));
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    if (w > 160 && [100, 1000, 10000].includes(hz)) {
+      ctx.fillText(hz >= 1000 ? `${hz / 1000}k` : String(hz), 4, y - 2);
+    }
+  }
+  ctx.stroke();
+  if (spectrum.length === 0) return;
+  let peak = 0;
+  for (let i = 1; i < spectrum.length; i++) {
+    if (spectrum[i] > spectrum[peak]) peak = i;
+  }
+  if (w >= 170 && spectrum[peak] > -72) {
+    ctx.fillStyle = "#e7eef4";
+    ctx.textAlign = "right";
+    ctx.fillText(
+      `${spectrumHz[peak].toFixed(1)} Hz  ${spectrum[peak].toFixed(1)} dBFS`,
+      w - 5,
+      11,
+    );
+    ctx.textAlign = "left";
+  }
+}
+
 function paint(
   canvas: HTMLCanvasElement,
   kind: number,
@@ -116,6 +218,10 @@ function paint(
   }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
+  if (kind === 4) {
+    paintSpectrogram(ctx, canvas, w, h, frame);
+    return;
+  }
   const top = 13,
     bottom = h - 2,
     mid = (top + bottom) / 2,
@@ -123,38 +229,17 @@ function paint(
   ctx.lineWidth = 1;
   ctx.strokeStyle = "#30353c";
   ctx.beginPath();
-  if (kind !== 4) {
-    ctx.moveTo(0, mid);
-    ctx.lineTo(w, mid);
-  }
+  ctx.moveTo(0, mid);
+  ctx.lineTo(w, mid);
   if (kind === 1) {
     ctx.moveTo(w / 2, top);
     ctx.lineTo(w / 2, bottom);
-  }
-  const minHz = frame?.minHz ?? 20,
-    maxHz = frame?.maxHz ?? 20000;
-  if (kind === 4) {
-    for (const hz of [100, 1000, 10000]) {
-      if (hz >= maxHz) continue;
-      const x = (w * Math.log(hz / minHz)) / Math.log(maxHz / minHz);
-      ctx.moveTo(x, top);
-      ctx.lineTo(x, h);
-      if (w > 120) {
-        ctx.font = "8px system-ui";
-        ctx.fillStyle = "#8996a4";
-        ctx.fillText(
-          hz === 100 ? "100" : hz === 1000 ? "1k" : "10k",
-          x + 2,
-          top + 5,
-        );
-      }
-    }
   }
   ctx.stroke();
   if (!frame) return;
   ctx.strokeStyle = kind === 1 ? "#f5cc6d" : "#b2c8db";
   ctx.beginPath();
-  const n = kind === 4 ? frame.spectrum.length : frame.left.length;
+  const n = frame.left.length;
   for (let i = 0; i < n; i++) {
     const l = frame.left[i],
       r = frame.right[i];
@@ -164,12 +249,8 @@ function paint(
       const side = Math.min(radius, w / 2);
       x = w / 2 + ((l - r) * side) / 2;
       y = mid - ((l + r) * side) / 2;
-    } else if (kind === 2) {
-      y = mid - l * radius;
     } else {
-      y =
-        top +
-        (bottom - top) * Math.max(0, Math.min(1, -frame.spectrum[i] / 72));
+      y = mid - l * radius;
     }
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
@@ -204,6 +285,7 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
     const root = ref.current;
     if (!root) return;
     const canvases = Array.from(root.querySelectorAll("canvas"));
+    canvases.forEach((canvas) => spectrograms.delete(canvas));
     const draw = (frame: DeckMeterFrame | null) =>
       canvases.forEach((c) => paint(c, Number(c.dataset.bit), frame));
     let disposed = false,
@@ -250,7 +332,7 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
     };
   }, [deck, mask, active, track]);
   return (
-    <div className="deck-meter-strip" ref={ref}>
+    <div className={`deck-meter-strip${mask & 4 ? " deck-meter-strip--spectrum" : ""}`} ref={ref}>
       {widgets
         .filter((w) => mask & w.bit)
         .map((w) => (

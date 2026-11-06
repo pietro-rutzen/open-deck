@@ -1,10 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 
-/** Paired display samples, a dBFS spectrum at evenly spaced log frequencies, and its Hz limits. */
+/** Paired display samples, measured bin frequencies and peak-sine dBFS, and the displayed Hz limits. */
 export interface DeckMeterFrame {
   left: number[];
   right: number[];
   spectrum: number[];
+  spectrumHz: number[];
   minHz: number;
   maxHz: number;
 }

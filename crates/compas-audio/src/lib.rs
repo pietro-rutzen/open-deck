@@ -34,7 +34,7 @@ pub use engine::{AudioEngine, EngineConfig};
 pub use input::{input_device_names, open_aux_input, AuxInput};
 pub use live::{run_live_analysis, LiveBeatClock, LiveBeatSnapshot};
 pub use mixer::{recall_loop_end, AudioCommand, DeckTelemetry, FilterMode, NUM_DECKS};
-pub use scope::ScopeBlock;
+pub use scope::{ScopeBlock, FRAMES as SPECTRUM_FRAMES};
 pub use sampler::NUM_PADS as NUM_SAMPLER_PADS;
 pub use waveform::{compute_peaks, silence_spans};
 
