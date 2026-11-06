@@ -1371,12 +1371,12 @@ export const Library = memo(
               onDrop={dropReorderAtPoint}
             >
               {sortHeader('order', '#')}
+              <span>Waveform</span>
               {sortHeader('title', 'Title')}
               {sortHeader('artist', 'Artist')}
               {sortHeader('bpm', 'BPM')}
               {sortHeader('key', 'Key')}
               <span className="tl-spacer" aria-hidden="true" />
-              <span>Waveform</span>
               {sortHeader('duration', 'Time')}
             </div>
             <div
@@ -1649,7 +1649,7 @@ export const Library = memo(
                         title={t.title || baseName(t.path)}
                         artist={t.artist}
                         color={loadedAs?.color}
-                        afterArtist={
+                        bpmCell={
                           <span
                             className="mono tl-bpm"
                             title={
@@ -1667,7 +1667,7 @@ export const Library = memo(
                                 : '—'}
                           </span>
                         }
-                        beforeWave={
+                        keyCell={
                           <span
                             className="mono tl-key"
                             title={t.key_name ?? undefined}

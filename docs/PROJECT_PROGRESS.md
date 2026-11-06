@@ -1,6 +1,6 @@
 # OpenDeck project progress
 
-Updated: 2026-11-05 (Europe/Helsinki). This is the authoritative project resume index; task records contain detailed claims and evidence.
+Updated: 2026-11-06 (Europe/Helsinki). This is the authoritative project resume index; task records contain detailed claims and evidence.
 
 ## Current status
 
@@ -24,7 +24,7 @@ Current source baseline: aefba51 plus T025–T031 reliability changes in this de
 | 4 | Reproducible release candidate | Green hosted CI, toolchain/platform matrix, audit callback risks and dependency/license provenance |
 | 5 | Distribution | Signed/notarized build, clean-Mac installation, tested recovery instructions, checksums matching tested revision |
 
-Do not add features ahead of outstanding reliability failures. Full historical milestones below retain their strict acceptance criteria; implemented features alone do not close multi-part gates. Latest completed coding task: [T041](#t041--track-list-waveform-core); T027 audio-test review and lint gates remain open. Recent handoffs: [T025](handoffs/T-025-20261103-01.md), [T026](handoffs/T-026-20261104-01.md).
+Do not add features ahead of outstanding reliability failures. Full historical milestones below retain their strict acceptance criteria; implemented features alone do not close multi-part gates. Latest completed coding task: [T042](#t042--track-list-column-order); T027 audio-test review and lint gates remain open. Recent handoffs: [T025](handoffs/T-025-20261103-01.md), [T026](handoffs/T-026-20261104-01.md).
 
 ## Milestones and acceptance gates
 
@@ -495,4 +495,9 @@ Limit scope: PCM accumulator only; codec internals, analysis arrays, total RSS a
 ## T041 — Track-list waveform core
 
 - [x] Halved all three frequency layers in track-list thumbnails. Root integrated. rgb_review checked the scope and geometry.
+- [x] Frontend typecheck and tests passed. Built, installed, verified and reopened the Applications bundle.
+
+## T042 — Track-list column order
+
+- [x] Move the waveform header and thumbnails between the order number and title. Header and rows share the responsive column widths.
 - [x] Frontend typecheck and tests passed. Built, installed, verified and reopened the Applications bundle.

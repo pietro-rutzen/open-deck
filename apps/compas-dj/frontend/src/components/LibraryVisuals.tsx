@@ -115,7 +115,7 @@ export function MiniWaveform({ peaks, bands = [], bandScale = 1, label = "Track 
 }
 
 /** One lazy subscription supplies artwork, tags and waveform for each visible row. */
-export function TrackCells({ path, title, artist, color, afterArtist, beforeWave }: { path: string; title: string; artist: string; color?: string; afterArtist?: ReactNode; beforeWave?: ReactNode }) {
+export function TrackCells({ path, title, artist, color, bpmCell, keyCell }: { path: string; title: string; artist: string; color?: string; bpmCell?: ReactNode; keyCell?: ReactNode }) {
   const ref = useRef<HTMLSpanElement>(null);
   const [visible, setVisible] = useState(false);
   useEffect(() => {
@@ -132,6 +132,9 @@ export function TrackCells({ path, title, artist, color, afterArtist, beforeWave
   const artwork = visual.data?.artwork_data_url;
   useEffect(() => setFailedArtwork(false), [path, artwork]);
   return <>
+    <span className="tl-mini-wave" style={color ? { color } : undefined}>
+      {visual.status === "ready" && visual.data?.peaks.length ? <MiniWaveform bandScale={0.5} peaks={visual.data.peaks} bands={visual.data.band_peaks} /> : <span className="mini-waveform-state">{visual.status === "loading" ? "…" : "—"}</span>}
+    </span>
     <span ref={ref} className="tl-title tl-title-with-art">
       <span className="tl-artwork" aria-hidden="true">
         {artwork && !failedArtwork
@@ -144,11 +147,8 @@ export function TrackCells({ path, title, artist, color, afterArtist, beforeWave
       </span>
     </span>
     <span className="tl-artist">{visual.data?.artist || artist || "—"}</span>
-    {afterArtist}
-    {beforeWave}
+    {bpmCell}
+    {keyCell}
     <span className="tl-spacer" aria-hidden="true" />
-    <span className="tl-mini-wave" style={color ? { color } : undefined}>
-      {visual.status === "ready" && visual.data?.peaks.length ? <MiniWaveform bandScale={0.5} peaks={visual.data.peaks} bands={visual.data.band_peaks} /> : <span className="mini-waveform-state">{visual.status === "loading" ? "…" : "—"}</span>}
-    </span>
   </>;
 }
