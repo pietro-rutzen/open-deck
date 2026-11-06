@@ -529,6 +529,7 @@ dependencies = [
  "objc2-foundation",
  "rtrb",
  "rusqlite",
+ "rustfft",
  "serde",
  "serde_json",
  "symphonia",

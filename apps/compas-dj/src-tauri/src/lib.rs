@@ -32,6 +32,7 @@ use headphone::CueState;
 mod deck_decode_worker;
 mod deck_loading;
 mod deck_loads;
+mod deck_meters;
 mod library_analysis;
 #[cfg(target_os = "macos")]
 mod macos_drag;
@@ -4003,6 +4004,7 @@ pub fn run() {
             preference: Mutex::new(controller_session::SessionPreference::default()),
         })
         .manage(CueState::new())
+        .manage(deck_meters::DeckMeters::default())
         .manage(native_controls::DeckEqState::default())
         .manage(native_effects::NativeEffects::default())
         .manage(deck_loads::DeckLoads::default())
@@ -4070,6 +4072,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            deck_meters::read_deck_meters,
             track_visuals::track_visuals,
             track_visuals::track_file_facts,
             build_info,

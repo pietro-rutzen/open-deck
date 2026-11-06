@@ -1,3 +1,4 @@
+import { DeckMeterStrip, MeterMenu, useMeterSelection } from "./DeckMeters";
 import { nextHotCue, formatCueDistance } from "../lib/cueCountdown";
 import { CUE_COLORS } from "../lib/hotCueMarkers";
 import {
@@ -194,6 +195,7 @@ export function Deck({
   slots?: { label: string; active: boolean; onSelect: () => void }[];
 }) {
   const { state, actions } = ctrl;
+  const meters = useMeterSelection(ctrl.deck);
   const {
     meta,
     frame,
@@ -539,6 +541,7 @@ export function Deck({
           </div>
         </div>
         <div className="deck-header-actions">
+          {dsp && <MeterMenu key={ctrl.deck} deck={ctrl.deck} {...meters} />}
           {loading ? (
             <button className="deck-load" disabled>
               Loading…
@@ -626,6 +629,8 @@ export function Deck({
 
       {/* full-track overview (rekordbox-style): summary waveform, hot-cue/loop markers,
           and click/drag-to-seek across the whole track. */}
+      {dsp && !!meters.mask && <DeckMeterStrip deck={ctrl.deck} mask={meters.mask}
+        active={!!meta && (playing || state.rate !== 0 || state.level > 0.001)} track={meta?.path ?? ""} />}
       <OverviewBar
         state={state}
         color={color}
