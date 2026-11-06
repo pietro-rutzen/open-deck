@@ -51,6 +51,38 @@ export function spectrumPlotX(
   return (width * Math.log(hz / lowHz)) / span;
 }
 
+export type TextSpan = { left: number; right: number };
+
+/** Labels that fit beside their grid lines without covering each other or a reserved title. */
+export function spectrumLabelPlacements(
+  markers: readonly { hz: number; label: string }[],
+  lowHz: number,
+  highHz: number,
+  width: number,
+  measure: (label: string) => number,
+  reserved: readonly TextSpan[],
+) {
+  const gap = 4;
+  const occupied = reserved.map((span) => ({ left: span.left, right: span.right }));
+  const placed: { label: string; x: number }[] = [];
+  for (const marker of markers) {
+    if (marker.hz <= lowHz || marker.hz >= highHz) continue;
+    const labelWidth = measure(marker.label);
+    if (!(labelWidth > 0) || !(width > labelWidth + gap)) continue;
+    const line = spectrumPlotX(marker.hz, lowHz, highHz, width);
+    const candidates = [line + gap, line - labelWidth - 3];
+    const spot = candidates.find((x) => {
+      const right = x + labelWidth;
+      if (x < 2 || right > width - 2) return false;
+      return occupied.every((taken) => right + gap <= taken.left || x >= taken.right + gap);
+    });
+    if (spot == null) continue;
+    occupied.push({ left: spot, right: spot + labelWidth });
+    placed.push({ label: marker.label, x: spot });
+  }
+  return placed;
+}
+
 export function spectrumPlotY(db: number, top: number, bottom: number) {
   const span = bottom - top;
   if (!(span > 0)) return top;
