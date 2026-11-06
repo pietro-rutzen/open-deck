@@ -1,0 +1,19 @@
+.wf-zoom .wf-phase-meter {
+  align-self: center;
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: repeat(2, 8px);
+  gap: 1px 7px;
+  margin-right: 4px;
+}
+.wf-phase-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font: 8px/1 var(--font-mono);
+}
+.wf-phase-row svg { width: clamp(44px, 5vw, 76px); height: 7px; }
+.wf-zone.wf-zone--phase .wf-label { right: min(46%, 270px); }
+.wf-zone.wf-zone--phase-quad .wf-label { right: min(55%, 365px); }
+.wf-zone.wf-zone--phase .wf-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.wf-zone.wf-zone--phase .wf-grid-edit { flex-shrink: 0; }

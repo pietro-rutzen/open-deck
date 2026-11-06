@@ -1,3 +1,4 @@
+import { nextHotCue, formatCueDistance } from "../lib/cueCountdown";
 import { CUE_COLORS } from "../lib/hotCueMarkers";
 import {
   type CSSProperties,
@@ -214,6 +215,7 @@ export function Deck({
     ? { ['--end-light' as string]: endLight }
     : undefined;
   const beatInterval = meta?.beat_interval_sec ?? 0;
+  const nextCue = nextHotCue(state.hotCues, frame, rate, beatInterval, state.loop);
   const beatSynced =
     endWarning &&
     beatInterval > 0 &&
@@ -592,6 +594,14 @@ export function Deck({
             <span className="muted">/ -{fmt(audibleLeft, rate)}</span>
           </span>
         </div>
+        {nextCue && (
+          <div className="tile" style={{ color: CUE_COLORS[nextCue.slot] }}>
+            <span className="overline" style={{ color: 'inherit' }}>CUE {nextCue.slot + 1} IN</span>
+            <span className="mono tile-val small" style={{ color: 'inherit' }}>
+              {formatCueDistance(nextCue.beats)}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* full-track overview (rekordbox-style): summary waveform, hot-cue/loop markers,

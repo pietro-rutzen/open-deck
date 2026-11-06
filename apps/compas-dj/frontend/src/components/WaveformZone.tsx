@@ -1,3 +1,5 @@
+import "./phaseMeter.css";
+import { phaseInBar } from "../lib/phaseMeter";
 import { hotCueMarkers } from "../lib/hotCueMarkers";
 import { type CSSProperties, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { useElementSize } from "../hooks/useElementSize";
@@ -16,6 +18,7 @@ const EMPTY_BANDS: [number, number, number][] = [];
 const WAVE_SPAN = 8;
 const WAVE_PAD = 3.2;
 const WAVE_SLACK = 0.5;
+const PHASE_KEY = "opendeck.waveform.phase.v1";
 const WAVE_HEIGHT_KEY = "opendeck.waveform.height.v1";
 const MIN_WAVE_HEIGHT = 72;
 const DECK_FLOOR = 380;
@@ -51,9 +54,44 @@ interface Lane {
   onResetGrid?: () => void;
 }
 
+function PhaseMeter({ lanes }: { lanes: Lane[] }) {
+  return (
+    <div className="wf-phase-meter" role="group" aria-label="Four-beat phase meter"
+      title="Each row follows one deck across four beats. Aligned markers mean the grids are at the same point in the bar.">
+      {lanes.map(({ state, letter, color }) => {
+        const meta = state.meta;
+        const phase = meta && meta.source_rate > 0 ? phaseInBar(
+          shownPlayheadSeconds({ frame: state.frame, frameAt: state.frameAt, rate: state.rate,
+            playing: state.playing, latencySecs: state.latencySecs, sourceRate: meta.source_rate }),
+          meta.first_beat_sec + state.gridOffset, meta.beat_interval_sec,
+        ) : null;
+        return (
+          <div className="wf-phase-row" key={letter} style={{ color }}>
+            <span aria-hidden="true">{letter}</span>
+            <svg viewBox="0 0 84 7" role="img" preserveAspectRatio="none"
+              aria-label={phase === null ? `Deck ${letter}: no beatgrid` : `Deck ${letter}: beat ${Math.floor(phase) + 1} of 4`}>
+              {[0, 1, 2, 3].map(beat => <rect key={beat} x={beat * 21} y="1" width="20" height="5"
+                fill="currentColor" opacity={phase !== null && Math.floor(phase) === beat ? 0.5 : 0.16} />)}
+              {phase !== null && <rect x={Math.min(82, phase * 21)} width="2" height="7" fill="currentColor" />}
+            </svg>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export function WaveformZone({ lanes }: { lanes: Lane[] }) {
   const [zoneRef, zoneSize] = useElementSize<HTMLDivElement>();
   const drag = useRef<{ startY: number; startHeight: number } | null>(null);
+  const [showPhase, setShowPhase] = useState(() => {
+    try { return localStorage.getItem(PHASE_KEY) === "1"; } catch { return false; }
+  });
+  const togglePhase = () => {
+    const enabled = !showPhase;
+    setShowPhase(enabled);
+    try { localStorage.setItem(PHASE_KEY, enabled ? "1" : "0"); } catch { /* Session setting still works. */ }
+  };
   const [view, setView] = useState(8);
   const [height, setHeight] = useState<number | null>(() => {
     try {
@@ -91,8 +129,11 @@ export function WaveformZone({ lanes }: { lanes: Lane[] }) {
   // Highlight the preset closest to the current (possibly wheel-adjusted) view.
   const nearest = ZOOMS.reduce((a, b) => (Math.abs(b - view) < Math.abs(a - view) ? b : a));
   return (
-    <div className="wf-zone" ref={zoneRef} style={height == null ? undefined : { height }}>
+    <div className={`wf-zone${showPhase ? " wf-zone--phase" : ""}${showPhase && lanes.length > 2 ? " wf-zone--phase-quad" : ""}`} ref={zoneRef} style={height == null ? undefined : { height }}>
       <div className="wf-zoom">
+        {showPhase && <PhaseMeter lanes={lanes} />}
+        <button type="button" className={`wf-zoom-btn ${showPhase ? "wf-zoom-btn--on" : ""}`}
+          aria-pressed={showPhase} aria-label="Show beat phase meter" title="Show beat phase meter" onClick={togglePhase}>Phase</button>
         {ZOOMS.map((z) => (
           <button key={z} className={`wf-zoom-btn ${z === nearest ? "wf-zoom-btn--on" : ""}`} onClick={() => setView(z)}>
             {z}s
