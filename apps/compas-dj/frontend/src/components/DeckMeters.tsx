@@ -270,7 +270,7 @@ function drawTrace(panel: MeterPanel, frame: DeckMeterFrame | null, traceColor: 
   const radius = (bottom - top) / 2;
   const n = frame.left.length;
   const last = Math.max(1, n - 1);
-  ctx.strokeStyle = kind === 1 ? "#f5cc6d" : traceColor;
+  ctx.strokeStyle = traceColor;
   ctx.beginPath();
   for (let i = 0; i < n; i++) {
     const left = frame.left[i];
