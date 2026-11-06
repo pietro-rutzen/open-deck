@@ -1,13 +1,5 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
-import {
-  frequencyAtPlotPosition,
-  readDeckMeters,
-  spectrumFrequencyX,
-  spectrumGridFrequencies,
-  spectrumScaleLabels,
-  stereoImagePoint,
-  type DeckMeterFrame,
-} from "../lib/deckMeters";
+import { readDeckMeters, stereoImagePoint, type DeckMeterFrame } from "../lib/deckMeters";
 import "./deckMeters.css";
 
 const widgets = [
@@ -160,47 +152,36 @@ function paintSpectrogram(
   const plotCtx = plot.getContext("2d");
   if (!plotCtx) return;
   const { spectrum, spectrumHz } = frame ?? { spectrum: [], spectrumHz: [] };
-  const frequencyAxis =
-    spectrum.length > 1 && spectrumHz.length === spectrum.length && high > low && low > 0;
-  if (frequencyAxis) {
-    const shift = Math.max(1, Math.round(canvas.height / h));
-    if (plot.height > shift) {
-      const image = plotCtx.getImageData(0, shift, plot.width, plot.height - shift);
+  if (spectrum.length > 1 && spectrumHz.length === spectrum.length) {
+    const shift = Math.max(1, Math.round(canvas.width / w));
+    if (plot.width > shift) {
+      const image = plotCtx.getImageData(shift, 0, plot.width - shift, plot.height);
       plotCtx.putImageData(image, 0, 0);
     }
-    const row = plot.height - shift;
-    for (let x = 0; x < plot.width; x++) {
-      const hz = frequencyAtPlotPosition(x, low, high, plot.width);
+    const x = plot.width - shift;
+    for (let y = 0; y < plot.height; y++) {
+      const fraction = 1 - y / Math.max(1, plot.height - 1);
+      const hz = low * (high / low) ** fraction;
       plotCtx.fillStyle = spectrogramColor(dbAt(hz, spectrumHz, spectrum));
-      plotCtx.fillRect(x, row, 1, shift);
+      plotCtx.fillRect(x, y, shift, 1);
     }
   }
   ctx.drawImage(plot, 0, 0, w, h);
   ctx.font = "9px system-ui";
+  ctx.fillStyle = "#99a7b3";
   ctx.strokeStyle = "rgba(255,255,255,0.14)";
   ctx.lineWidth = 1;
   ctx.beginPath();
-  if (high > low && low > 0) {
-    for (const hz of spectrumGridFrequencies(low, high)) {
-      const x = spectrumFrequencyX(hz, low, high, w);
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
+  for (const hz of [50, 100, 200, 500, 1000, 2000, 5000, 10000]) {
+    if (hz <= low || hz >= high) continue;
+    const y = h * (1 - Math.log(hz / low) / Math.log(high / low));
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    if (w > 160 && [100, 1000, 10000].includes(hz)) {
+      ctx.fillText(hz >= 1000 ? `${hz / 1000}k` : String(hz), 4, y - 2);
     }
   }
   ctx.stroke();
-  ctx.fillStyle = "#99a7b3";
-  ctx.textAlign = "left";
-  if (high > low && low > 0) {
-    for (const marker of spectrumScaleLabels) {
-      if (marker.hz <= low || marker.hz >= high) continue;
-      const x = spectrumFrequencyX(marker.hz, low, high, w);
-      const labelWidth = ctx.measureText(marker.label).width;
-      const toTheRight = x + 4;
-      const labelX =
-        toTheRight + labelWidth <= w - 2 ? toTheRight : Math.max(2, x - labelWidth - 3);
-      ctx.fillText(marker.label, labelX, 11);
-    }
-  }
   if (spectrum.length === 0) return;
   let peak = 0;
   for (let i = 1; i < spectrum.length; i++) {
@@ -212,7 +193,7 @@ function paintSpectrogram(
     ctx.fillText(
       `${spectrumHz[peak].toFixed(1)} Hz  ${spectrum[peak].toFixed(1)} dBFS`,
       w - 5,
-      h - 4,
+      11,
     );
     ctx.textAlign = "left";
   }
