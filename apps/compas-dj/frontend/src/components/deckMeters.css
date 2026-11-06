@@ -59,8 +59,11 @@
   }
 }
 
+/* Stereo image needs a plot tall enough that full-scale width and height are readable. */
+.deck-meter-strip--stereo { height: clamp(72px, 14cqh, 120px); }
 /* Give frequency and level differences room to read when the deck has height. */
 .deck-meter-strip--spectrum { height: clamp(72px, 16cqh, 148px); }
 @container performance (max-height: 570px) {
+  .deck-meter-strip--stereo { height: clamp(56px, 11cqh, 80px); }
   .deck-meter-strip--spectrum { height: clamp(56px, 12cqh, 72px); }
 }
