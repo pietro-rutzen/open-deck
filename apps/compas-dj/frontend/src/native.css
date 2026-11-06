@@ -368,18 +368,32 @@ button:not(.light), input:not([type="range"]), select, .search, .tile, .art, .pa
 .app .deck:not(.deck--compact):not(.deck--expanded) {
   display: grid;
   grid-template-columns: 132px minmax(156px, 1fr) 58px;
-  grid-template-rows: auto auto 90px auto;
+  grid-template-rows: auto auto auto 90px auto;
   align-content: start;
   column-gap: 12px;
   row-gap: 9px;
 }
 .app .deck:not(.deck--compact):not(.deck--expanded) > .deck-header,
 .app .deck:not(.deck--compact):not(.deck--expanded) > .readouts { grid-column: 1 / -1; }
-.app .deck:not(.deck--compact):not(.deck--expanded) > .overview { grid-column: 1 / 3; grid-row: 3; }
+.app .deck:not(.deck--compact):not(.deck--expanded) > .deck-meter-strip { grid-column: 1 / -1; grid-row: 3; }
+.app .deck:not(.deck--compact):not(.deck--expanded) > .overview { grid-column: 1 / 3; grid-row: 4; }
 .app .deck:not(.deck--compact):not(.deck--expanded) > .deck-body { display: contents; }
-.app .deck:not(.deck--compact):not(.deck--expanded) .platter-col { grid-column: 1; grid-row: 4; }
-.app .deck:not(.deck--compact):not(.deck--expanded) .controls-col { grid-column: 2; grid-row: 4; }
-.app .deck:not(.deck--compact):not(.deck--expanded) .tempo-col { grid-column: 3; grid-row: 3 / 5; margin-left: 0; }
+.app .deck:not(.deck--compact):not(.deck--expanded) .platter-col { grid-column: 1; grid-row: 5; }
+.app .deck:not(.deck--compact):not(.deck--expanded) .controls-col { grid-column: 2; grid-row: 5; }
+.app .deck:not(.deck--compact):not(.deck--expanded) .tempo-col { grid-column: 3; grid-row: 4 / 6; margin-left: 0; }
+.app .deck:not(.deck--compact):not(.deck--expanded):not(:has(> .deck-meter-strip)) {
+  grid-template-rows: auto auto 90px auto;
+}
+.app .deck:not(.deck--compact):not(.deck--expanded):not(:has(> .deck-meter-strip)) > .overview {
+  grid-row: 3;
+}
+.app .deck:not(.deck--compact):not(.deck--expanded):not(:has(> .deck-meter-strip)) .platter-col,
+.app .deck:not(.deck--compact):not(.deck--expanded):not(:has(> .deck-meter-strip)) .controls-col {
+  grid-row: 4;
+}
+.app .deck:not(.deck--compact):not(.deck--expanded):not(:has(> .deck-meter-strip)) .tempo-col {
+  grid-row: 3 / 5;
+}
 @media (max-width: 1200px) {
   .app .deck:not(.deck--compact):not(.deck--expanded) .pad-bank { flex-direction: column; align-items: stretch; gap: 6px; }
 }

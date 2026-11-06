@@ -4004,7 +4004,7 @@ pub fn run() {
             preference: Mutex::new(controller_session::SessionPreference::default()),
         })
         .manage(CueState::new())
-        .manage(deck_meters::DeckMeters::default())
+        .manage(Arc::new(deck_meters::DeckMeters::default()))
         .manage(native_controls::DeckEqState::default())
         .manage(native_effects::NativeEffects::default())
         .manage(deck_loads::DeckLoads::default())

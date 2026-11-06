@@ -79,3 +79,8 @@ opt-level = 2
 
 [profile.dev.package.compas-sources]
 opt-level = 2
+
+# Local installs are debug bundles. Meter analysis lives in the app crate and runs
+# on the UI request path, so compile it the same way as the DSP crates.
+[profile.dev.package.compas-dj]
+opt-level = 2

@@ -513,3 +513,4 @@ Limit scope: PCM accumulator only; codec internals, analysis arrays, total RSS a
 ## T045 — Optional deck meters
 
 - [x] Added demand-driven stereo image, oscilloscope and spectrum above each deck overview. [Measurements and verification](tasks/T-045.md)
+- [x] Meter strips stay within the overview height. Capture is a preallocated ring, an unchanged window skips analysis, and the spectrum runs off the webview.

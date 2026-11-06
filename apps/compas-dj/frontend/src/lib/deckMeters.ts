@@ -8,6 +8,8 @@ export interface DeckMeterFrame {
   spectrumHz: number[];
   minHz: number;
   maxHz: number;
+  /** Advances when the captured window moves. An unchanged value is not a new reading. */
+  sequence: number;
 }
 
 /**
@@ -56,21 +58,72 @@ export function spectrumPlotY(db: number, top: number, bottom: number) {
   return top + span * fraction;
 }
 
-const pending = new Set<number>();
+type MeterRead = {
+  deck: number;
+  spectrum: boolean;
+  since: number;
+  resolve: (frame: DeckMeterFrame | null) => void;
+  reject: (reason: unknown) => void;
+};
 
-/** A read also arms one subsequent short capture. No polling means no ongoing capture. */
-export async function readDeckMeters(
+const pendingReads: MeterRead[] = [];
+let flushScheduled = false;
+
+function flushMeterReads() {
+  flushScheduled = false;
+  const batch = pendingReads.splice(0, pendingReads.length);
+  if (!batch.length) return;
+  void invoke<Array<DeckMeterFrame | null>>("read_deck_meters", {
+    queries: batch.map(({ deck, spectrum, since }) => ({ deck, spectrum, since })),
+  })
+    .then((frames) => {
+      batch.forEach((read, index) => {
+        read.resolve(frames[index] ?? null);
+      });
+    })
+    .catch((error: unknown) => {
+      batch.forEach((read) => {
+        read.reject(error);
+      });
+    });
+}
+
+const frameListeners = new Set<() => void>();
+let meterFrame = 0;
+
+function runMeterFrame() {
+  for (const listener of frameListeners) listener();
+  if (frameListeners.size === 0) {
+    meterFrame = 0;
+    return;
+  }
+  meterFrame = requestAnimationFrame(runMeterFrame);
+}
+
+/** One display callback shared by every visible meter strip. */
+export function onMeterFrame(listener: () => void) {
+  frameListeners.add(listener);
+  if (!meterFrame) meterFrame = requestAnimationFrame(runMeterFrame);
+  return () => {
+    frameListeners.delete(listener);
+    if (frameListeners.size === 0 && meterFrame) {
+      cancelAnimationFrame(meterFrame);
+      meterFrame = 0;
+    }
+  };
+}
+
+/** A read arms capture briefly. Strips started in the same frame share one command. */
+export function readDeckMeters(
   deck: number,
   spectrum: boolean,
+  since = 0,
 ): Promise<DeckMeterFrame | null> {
-  if (pending.has(deck)) return null;
-  pending.add(deck);
-  try {
-    return await invoke<DeckMeterFrame | null>("read_deck_meters", {
-      deck,
-      spectrum,
-    });
-  } finally {
-    pending.delete(deck);
-  }
+  return new Promise((resolve, reject) => {
+    pendingReads.push({ deck, spectrum, since, resolve, reject });
+    if (!flushScheduled) {
+      flushScheduled = true;
+      queueMicrotask(flushMeterReads);
+    }
+  });
 }

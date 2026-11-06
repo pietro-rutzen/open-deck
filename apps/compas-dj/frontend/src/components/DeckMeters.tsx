@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import {
+  onMeterFrame,
   readDeckMeters,
   spectrumFloorDb,
   spectrumPlotX,
@@ -105,105 +106,97 @@ export const MeterMenu = memo(function MeterMenu({
   );
 });
 
-function paintSpectrum(
-  ctx: CanvasRenderingContext2D,
-  w: number,
-  h: number,
-  frame: DeckMeterFrame | null,
-) {
-  const low = frame?.minHz ?? 20;
-  const high = frame?.maxHz ?? 20000;
-  const top = 13;
-  const bottom = h - 2;
-  const axis = high > low && low > 0;
-  ctx.lineWidth = 1;
-  ctx.font = "9px system-ui";
-  ctx.strokeStyle = "rgba(255,255,255,0.22)";
-  ctx.beginPath();
-  if (axis) {
-    for (const marker of spectrumThresholds) {
-      if (marker.hz <= low || marker.hz >= high) continue;
-      const x = spectrumPlotX(marker.hz, low, high, w);
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, h);
-    }
-  }
-  ctx.stroke();
-  ctx.fillStyle = "#99a7b3";
-  ctx.textAlign = "left";
-  if (axis) {
-    for (const marker of spectrumThresholds) {
-      if (marker.hz <= low || marker.hz >= high) continue;
-      const x = spectrumPlotX(marker.hz, low, high, w);
-      const labelWidth = ctx.measureText(marker.label).width;
-      const toTheRight = x + 4;
-      const labelX =
-        toTheRight + labelWidth <= w - 2 ? toTheRight : Math.max(2, x - labelWidth - 3);
-      ctx.fillText(marker.label, labelX, 11);
-    }
-  }
-  const spectrum = frame?.spectrum ?? [];
-  const spectrumHz = frame?.spectrumHz ?? [];
-  if (spectrum.length < 2 || spectrumHz.length !== spectrum.length || !axis) return;
-  ctx.strokeStyle = "#b2c8db";
-  ctx.beginPath();
-  let started = false;
-  for (let i = 0; i < spectrum.length; i++) {
-    const hz = spectrumHz[i];
-    const db = spectrum[i];
-    if (!(hz > 0) || !Number.isFinite(db)) continue;
-    const x = spectrumPlotX(hz, low, high, w);
-    const y = spectrumPlotY(db, top, bottom);
-    if (!started) {
-      ctx.moveTo(x, y);
-      started = true;
-    } else ctx.lineTo(x, y);
-  }
-  ctx.stroke();
-  let peak = 0;
-  for (let i = 1; i < spectrum.length; i++) {
-    if (spectrum[i] > spectrum[peak]) peak = i;
-  }
-  if (w >= 170 && spectrum[peak] > spectrumFloorDb) {
-    ctx.fillStyle = "#e7eef4";
-    ctx.textAlign = "right";
-    ctx.fillText(
-      `${spectrumHz[peak].toFixed(1)} Hz  ${spectrum[peak].toFixed(1)} dBFS`,
-      w - 5,
-      h - 4,
-    );
-    ctx.textAlign = "left";
-  }
+type MeterPanel = {
+  kind: number;
+  trace: HTMLCanvasElement;
+  grid: HTMLCanvasElement;
+  traceCtx: CanvasRenderingContext2D;
+  gridCtx: CanvasRenderingContext2D;
+  cssW: number;
+  cssH: number;
+  dpr: number;
+  gridKey: string;
+};
+
+function displayScale() {
+  return Math.min(2, window.devicePixelRatio || 1);
 }
 
-function paint(
-  canvas: HTMLCanvasElement,
-  kind: number,
-  frame: DeckMeterFrame | null,
-) {
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  const w = canvas.clientWidth,
-    h = canvas.clientHeight;
-  if (!w || !h) return;
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
-  const width = Math.round(w * dpr),
-    height = Math.round(h * dpr);
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
+function resizePanel(panel: MeterPanel) {
+  const cssW = panel.trace.clientWidth;
+  const cssH = panel.trace.clientHeight;
+  const dpr = displayScale();
+  if (!cssW || !cssH) return false;
+  const width = Math.round(cssW * dpr);
+  const height = Math.round(cssH * dpr);
+  const changed =
+    panel.cssW !== cssW ||
+    panel.cssH !== cssH ||
+    panel.dpr !== dpr ||
+    panel.trace.width !== width ||
+    panel.trace.height !== height;
+  panel.cssW = cssW;
+  panel.cssH = cssH;
+  panel.dpr = dpr;
+  if (panel.trace.width !== width || panel.trace.height !== height) {
+    panel.trace.width = width;
+    panel.trace.height = height;
+    panel.grid.width = width;
+    panel.grid.height = height;
   }
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (changed) panel.gridKey = "";
+  return cssW > 0 && cssH > 0;
+}
+
+function prepare(ctx: CanvasRenderingContext2D, panel: MeterPanel) {
+  ctx.setTransform(panel.dpr, 0, 0, panel.dpr, 0, 0);
+  ctx.lineWidth = 1;
+  ctx.font = "9px system-ui";
+}
+
+function drawStatic(panel: MeterPanel, frame: DeckMeterFrame | null) {
+  const { cssW: w, cssH: h, kind } = panel;
+  const low = frame?.minHz ?? 20;
+  const high = frame?.maxHz ?? 20000;
+  const key = `${kind}:${w}:${h}:${panel.dpr}:${low}:${high}`;
+  if (panel.gridKey === key) return;
+  panel.gridKey = key;
+  const ctx = panel.gridCtx;
+  prepare(ctx, panel);
   ctx.clearRect(0, 0, w, h);
   if (kind === 4) {
-    paintSpectrum(ctx, w, h, frame);
+    const axis = high > low && low > 0;
+    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.beginPath();
+    ctx.fillStyle = "#99a7b3";
+    ctx.textAlign = "left";
+    if (axis) {
+      for (const marker of spectrumThresholds) {
+        if (marker.hz <= low || marker.hz >= high) continue;
+        const x = spectrumPlotX(marker.hz, low, high, w);
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+      }
+    }
+    ctx.stroke();
+    if (axis) {
+      for (const marker of spectrumThresholds) {
+        if (marker.hz <= low || marker.hz >= high) continue;
+        const x = spectrumPlotX(marker.hz, low, high, w);
+        const labelWidth = ctx.measureText(marker.label).width;
+        const toTheRight = x + 4;
+        const labelX =
+          toTheRight + labelWidth <= w - 2
+            ? toTheRight
+            : Math.max(2, x - labelWidth - 3);
+        ctx.fillText(marker.label, labelX, 11);
+      }
+    }
     return;
   }
-  const top = 13,
-    bottom = h - 2,
-    mid = (top + bottom) / 2,
-    radius = (bottom - top) / 2;
-  ctx.lineWidth = 1;
+  const top = 13;
+  const bottom = h - 2;
+  const mid = (top + bottom) / 2;
   ctx.strokeStyle = "#30353c";
   ctx.beginPath();
   ctx.moveTo(0, mid);
@@ -213,21 +206,75 @@ function paint(
     ctx.lineTo(w / 2, bottom);
   }
   ctx.stroke();
-  if (!frame) return;
+}
+
+function drawTrace(panel: MeterPanel, frame: DeckMeterFrame | null) {
+  const { cssW: w, cssH: h, kind } = panel;
+  const ctx = panel.traceCtx;
+  prepare(ctx, panel);
+  ctx.clearRect(0, 0, w, h);
+  if (!frame || !w || !h) return;
+  const top = 13;
+  const bottom = h - 2;
+  if (kind === 4) {
+    const low = frame.minHz;
+    const high = frame.maxHz;
+    const spectrum = frame.spectrum;
+    const spectrumHz = frame.spectrumHz;
+    if (
+      !(high > low && low > 0) ||
+      spectrum.length < 2 ||
+      spectrumHz.length !== spectrum.length
+    ) {
+      return;
+    }
+    ctx.strokeStyle = "#b2c8db";
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < spectrum.length; i++) {
+      const hz = spectrumHz[i];
+      const db = spectrum[i];
+      if (!(hz > 0) || !Number.isFinite(db)) continue;
+      const x = spectrumPlotX(hz, low, high, w);
+      const y = spectrumPlotY(db, top, bottom);
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    let peak = 0;
+    for (let i = 1; i < spectrum.length; i++) {
+      if (spectrum[i] > spectrum[peak]) peak = i;
+    }
+    if (w >= 170 && spectrum[peak] > spectrumFloorDb) {
+      ctx.fillStyle = "#e7eef4";
+      ctx.textAlign = "right";
+      ctx.fillText(
+        `${spectrumHz[peak].toFixed(1)} Hz  ${spectrum[peak].toFixed(1)} dBFS`,
+        w - 5,
+        h - 4,
+      );
+    }
+    return;
+  }
+  const mid = (top + bottom) / 2;
+  const radius = (bottom - top) / 2;
+  const n = frame.left.length;
+  const last = Math.max(1, n - 1);
   ctx.strokeStyle = kind === 1 ? "#f5cc6d" : "#b2c8db";
   ctx.beginPath();
-  const n = frame.left.length;
   for (let i = 0; i < n; i++) {
-    const l = frame.left[i],
-      r = frame.right[i];
-    let x = (i * w) / Math.max(1, n - 1),
-      y;
+    const left = frame.left[i];
+    const right = frame.right[i];
+    let x = (i * w) / last;
+    let y: number;
     if (kind === 1) {
-      const point = stereoImagePoint(l, r, w / 2, mid, w / 2, radius);
+      const point = stereoImagePoint(left, right, w / 2, mid, w / 2, radius);
       x = point.x;
       y = point.y;
     } else {
-      y = mid - l * radius;
+      y = mid - left * radius;
     }
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
@@ -236,13 +283,21 @@ function paint(
   if (kind === 2) {
     ctx.beginPath();
     ctx.strokeStyle = "rgba(110,173,218,0.65)";
-    frame.right.forEach((r, i) => {
-      const x = (i * w) / Math.max(1, n - 1),
-        y = mid - r * radius;
+    for (let i = 0; i < frame.right.length; i++) {
+      const x = (i * w) / last;
+      const y = mid - frame.right[i] * radius;
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
-    });
+    }
     ctx.stroke();
+  }
+}
+
+function paintPanels(panels: MeterPanel[], frame: DeckMeterFrame | null) {
+  for (const panel of panels) {
+    if (!panel.cssW || !panel.cssH) continue;
+    drawStatic(panel, frame);
+    drawTrace(panel, frame);
   }
 }
 
@@ -261,69 +316,119 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
   useEffect(() => {
     const root = ref.current;
     if (!root) return;
-    const canvases = Array.from(root.querySelectorAll("canvas"));
-    const draw = (frame: DeckMeterFrame | null) =>
-      canvases.forEach((c) => paint(c, Number(c.dataset.bit), frame));
-    let disposed = false,
-      visible = false,
-      busy = false,
-      timer = 0,
-      generation = 0;
+    const panels: MeterPanel[] = [];
+    for (const trace of root.querySelectorAll<HTMLCanvasElement>("canvas.meter-trace")) {
+      const grid = trace.previousElementSibling;
+      if (!(grid instanceof HTMLCanvasElement)) continue;
+      const traceCtx = trace.getContext("2d");
+      const gridCtx = grid.getContext("2d");
+      if (!traceCtx || !gridCtx) continue;
+      panels.push({
+        kind: Number(trace.dataset.bit),
+        trace,
+        grid,
+        traceCtx,
+        gridCtx,
+        cssW: 0,
+        cssH: 0,
+        dpr: 1,
+        gridKey: "",
+      });
+    }
+    let disposed = false;
+    let visible = false;
+    let busy = false;
+    let listening = false;
+    let unsubscribe = () => {};
+    let latest: DeckMeterFrame | null = null;
+    let painted = 0;
     const enabled = () => !disposed && visible && active && !document.hidden;
-    const poll = async () => {
-      if (!enabled() || busy) return;
-      busy = true;
-      const id = generation;
-      try {
-        const frame = await readDeckMeters(deck, !!(mask & 4));
-        if (enabled() && generation === id && frame) draw(frame);
-      } catch {
-        if (enabled()) draw(null);
-      } finally {
-        busy = false;
-        if (enabled()) timer = window.setTimeout(poll, 65);
+    const repaint = () => paintPanels(panels, latest);
+    const tick = () => {
+      if (!enabled()) {
+        stop();
+        return;
+      }
+      const scale = displayScale();
+      const scaleChanged = panels.some((panel) => panel.cssW > 0 && panel.dpr !== scale);
+      if (scaleChanged) {
+        for (const panel of panels) resizePanel(panel);
+      }
+      if (latest && (latest.sequence !== painted || scaleChanged)) {
+        repaint();
+        painted = latest.sequence;
+      }
+      if (!busy) {
+        busy = true;
+        const since = latest?.sequence ?? 0;
+        void readDeckMeters(deck, (mask & 4) !== 0, since)
+          .then((frame) => {
+            busy = false;
+            if (!enabled()) return;
+            if (frame && frame.sequence !== painted) latest = frame;
+          })
+          .catch(() => {
+            busy = false;
+          });
       }
     };
-    const update = () => {
-      generation++;
-      window.clearTimeout(timer);
-      draw(null);
-      if (enabled()) void poll();
+    const stop = () => {
+      if (!listening) return;
+      listening = false;
+      unsubscribe();
+      unsubscribe = () => {};
+    };
+    const start = () => {
+      if (listening || !enabled()) return;
+      listening = true;
+      unsubscribe = onMeterFrame(tick);
+    };
+    const onVisibility = () => {
+      if (enabled()) start();
+      else stop();
     };
     const observer = new IntersectionObserver(([entry]) => {
       visible = entry.isIntersecting;
-      update();
+      onVisibility();
     });
     observer.observe(root);
-    document.addEventListener("visibilitychange", update);
-    const resize = new ResizeObserver(() => draw(null));
+    document.addEventListener("visibilitychange", onVisibility);
+    const resize = new ResizeObserver(() => {
+      const dirty = panels.some((panel) => {
+        const previous = `${panel.cssW}x${panel.cssH}@${panel.dpr}`;
+        resizePanel(panel);
+        return previous !== `${panel.cssW}x${panel.cssH}@${panel.dpr}`;
+      });
+      if (!dirty) return;
+      repaint();
+      if (latest) painted = latest.sequence;
+    });
     resize.observe(root);
-    draw(null);
+    for (const panel of panels) resizePanel(panel);
+    repaint();
+    start();
     return () => {
       disposed = true;
-      window.clearTimeout(timer);
+      stop();
       observer.disconnect();
       resize.disconnect();
-      document.removeEventListener("visibilitychange", update);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [deck, mask, active, track]);
   return (
-    <div
-      className={[
-        "deck-meter-strip",
-        mask & 1 ? "deck-meter-strip--stereo" : "",
-        mask & 4 ? "deck-meter-strip--spectrum" : "",
-      ]
-        .filter(Boolean)
-        .join(" ")}
-      ref={ref}
-    >
+    <div className="deck-meter-strip" ref={ref}>
       {widgets
         .filter((w) => mask & w.bit)
         .map((w) => (
           <div className="deck-meter-panel" key={w.bit}>
+            <canvas className="meter-grid" aria-hidden="true" />
+            <canvas
+              className="meter-trace"
+              aria-label={w.name}
+              data-bit={w.bit}
+              role="img"
+            />
             <span>{w.name}</span>
-            <canvas aria-label={w.name} data-bit={w.bit} role="img" />
           </div>
         ))}
     </div>

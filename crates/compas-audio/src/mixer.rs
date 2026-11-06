@@ -20,7 +20,7 @@ use rtrb::{Producer, PushError};
 
 use crate::live::LiveBeatClock;
 use crate::sampler::Sampler;
-use crate::scope::{ScopeBlock, ScopeSlot, FRAMES as SCOPE_FRAMES};
+use crate::scope::{monotonic_ns, ScopeBlock, ScopeSlot};
 
 /// Number of decks the engine mixes. MVP uses 2; the array is sized for 4 so the
 /// extension to 4 decks needs no structural change.
@@ -542,11 +542,27 @@ impl DeckTelemetry {
 
     pub fn request_scope(&self, deck: usize) {
         if let Some(slot) = self.scopes.get(deck) {
-            slot.request();
+            slot.arm(500_000_000);
+        }
+    }
+    pub fn release_scope(&self, deck: usize) {
+        if let Some(slot) = self.scopes.get(deck) {
+            slot.release();
         }
     }
     pub fn take_scope(&self, deck: usize) -> Option<ScopeBlock> {
-        self.scopes.get(deck)?.take()
+        let mut frames = Vec::new();
+        let (sample_rate, _) = self.scopes.get(deck)?.copy_window(&mut frames)?;
+        Some(ScopeBlock {
+            sample_rate,
+            frames,
+        })
+    }
+    pub fn copy_scope(&self, deck: usize, dst: &mut Vec<[f32; 2]>) -> Option<(f32, u64)> {
+        self.scopes.get(deck)?.copy_window(dst)
+    }
+    pub fn scope_sequence(&self, deck: usize) -> Option<u64> {
+        self.scopes.get(deck)?.sequence()
     }
     pub fn controller_probe_count(&self) -> u64 {
         self.controller_probe_count.load(Ordering::Relaxed)
@@ -1505,7 +1521,8 @@ pub struct MixerBuses {
 }
 
 pub struct Mixer {
-    scope_cursor: [usize; NUM_DECKS],
+    scope_cursor: [u64; NUM_DECKS],
+    scope_live: [bool; NUM_DECKS],
     decks: [DeckPlayer; NUM_DECKS],
     crossfader: Crossfader,
     master: GainSmoother,
@@ -1539,9 +1556,10 @@ pub struct Mixer {
 
 impl Drop for Mixer {
     fn drop(&mut self) {
-        for (i, cursor) in self.scope_cursor.iter().enumerate() {
-            if *cursor < SCOPE_FRAMES {
-                self.telemetry.scopes[i].cancel(true);
+        for i in 0..NUM_DECKS {
+            if self.scope_live[i] {
+                self.scope_live[i] = false;
+                self.telemetry.scopes[i].end_window();
             }
         }
     }
@@ -1555,7 +1573,8 @@ impl Mixer {
         telemetry: Arc<DeckTelemetry>,
     ) -> Self {
         Mixer {
-            scope_cursor: [SCOPE_FRAMES; NUM_DECKS],
+            scope_cursor: [0; NUM_DECKS],
+            scope_live: [false; NUM_DECKS],
             decks: std::array::from_fn(|i| {
                 let mut d = DeckPlayer::new(device_rate);
                 // Default routing: deck 0 → A side, deck 1 → B side, decks 2/3 → through.
@@ -1809,12 +1828,27 @@ impl Mixer {
             .map(|(i, _)| i)
     }
 
+    fn stop_scope(&mut self, deck: usize) {
+        if self.scope_live[deck] {
+            self.scope_live[deck] = false;
+            self.telemetry.scopes[deck].end_window();
+        }
+    }
+
     /// Apply all pending control commands. RT-SAFE (bounded by ring capacity).
     #[inline]
     pub fn drain_commands(&mut self) {
-        for (i, cursor) in self.scope_cursor.iter_mut().enumerate() {
-            if *cursor == SCOPE_FRAMES && self.telemetry.scopes[i].begin() {
-                *cursor = 0;
+        let now_ns = monotonic_ns();
+        for i in 0..NUM_DECKS {
+            let slot = &self.telemetry.scopes[i];
+            if slot.is_armed(now_ns) {
+                if !self.scope_live[i] {
+                    self.scope_live[i] = true;
+                    slot.begin_window(self.device_rate, self.scope_cursor[i]);
+                }
+            } else if self.scope_live[i] {
+                self.scope_live[i] = false;
+                slot.end_window();
             }
         }
         self.flush_pending_reclaim();
@@ -2070,9 +2104,10 @@ impl Mixer {
                     beat_offset,
                     beat_interval,
                 } => {
+                    if deck < NUM_DECKS {
+                        self.stop_scope(deck);
+                    }
                     if let Some(d) = self.decks.get_mut(deck) {
-                        self.telemetry.scopes[deck].cancel(self.scope_cursor[deck] < SCOPE_FRAMES);
-                        self.scope_cursor[deck] = SCOPE_FRAMES;
                         d.base_ratio = buffer.source_rate as f64 / self.device_rate as f64;
                         d.playhead = 0.0;
                         d.tempo = 1.0;
@@ -2334,9 +2369,10 @@ impl Mixer {
                 }
                 AudioCommand::SetSamplerGain { gain } => self.sampler.set_gain(gain),
                 AudioCommand::UnloadDeck { deck } => {
+                    if deck < NUM_DECKS {
+                        self.stop_scope(deck);
+                    }
                     if let Some(d) = self.decks.get_mut(deck) {
-                        self.telemetry.scopes[deck].cancel(self.scope_cursor[deck] < SCOPE_FRAMES);
-                        self.scope_cursor[deck] = SCOPE_FRAMES;
                         d.playing = false;
                         d.scratching = false;
                         d.scratch_speed = 0.0;
@@ -2378,14 +2414,10 @@ impl Mixer {
             let rendered = deck.next_channels();
             let (dl, dr) = rendered.post_fader;
             let (pl, pr) = rendered.pre_fader;
-            let cursor = &mut self.scope_cursor[i];
-            if *cursor < SCOPE_FRAMES {
-                let slot = &self.telemetry.scopes[i];
-                slot.write(*cursor, pl, pr);
-                *cursor += 1;
-                if *cursor == SCOPE_FRAMES {
-                    slot.publish(self.device_rate);
-                }
+            if self.scope_live[i] {
+                let cursor = self.scope_cursor[i];
+                self.telemetry.scopes[i].write_sample(cursor, pl, pr);
+                self.scope_cursor[i] = cursor.wrapping_add(1);
             }
             let deck_peak = pl.abs().max(pr.abs());
             if deck_peak > self.peak_deck[i] {
@@ -2548,6 +2580,7 @@ impl Mixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scope::FRAMES as SCOPE_FRAMES;
     #[test]
     fn callback_probe_is_ordered_and_measures_only_after_drain() {
         let (mut tx, mut mixer) = mixer_with_commands();
@@ -2917,7 +2950,7 @@ mod tests {
     }
 
     #[test]
-    fn deck_scope_one_shot_is_stereo_prefader_and_transparent_to_audio() {
+    fn armed_scope_is_stereo_prefader_transparent_and_stops_when_released() {
         let mut baseline = scope_test_mixer();
         let mut capture = scope_test_mixer();
         for mixer in [&mut baseline, &mut capture] {
@@ -2942,6 +2975,13 @@ mod tests {
             .iter()
             .any(|f| f[0].abs() > 0.25 && f[0] == -f[1]));
         assert!(capture.telemetry.take_scope(1).is_none());
+        let first = block.frames[0];
+        for _ in 0..64 {
+            capture.next_buses();
+        }
+        let advanced = capture.telemetry.take_scope(0).unwrap();
+        assert_ne!(advanced.frames[0], first);
+        capture.telemetry.release_scope(0);
         capture.drain_commands();
         for _ in 0..SCOPE_FRAMES {
             capture.next_buses();
@@ -2964,12 +3004,12 @@ mod tests {
         })
         .unwrap();
         mixer.drain_commands();
-        assert_eq!(mixer.scope_cursor[0], SCOPE_FRAMES);
+        assert!(!mixer.scope_live[0]);
         assert!(telemetry.take_scope(0).is_none());
         telemetry.request_scope(0);
         mixer.drain_commands();
         mixer.next_buses();
-        assert_eq!(mixer.scope_cursor[0], 1);
+        assert!(telemetry.take_scope(0).is_none());
         drop(mixer);
 
         let (_, commands) = rtrb::RingBuffer::new(16);

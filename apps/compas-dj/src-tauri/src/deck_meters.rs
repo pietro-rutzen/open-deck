@@ -1,11 +1,10 @@
-//! Pull-only deck meters. The callback supplies at most one requested block per deck.
-//! Formatting and the optional windowed FFT run on Tauri's asynchronous command runtime.
+//! Pull-only deck meters. While a strip is visible the audio thread fills a preallocated
+//! stereo ring. Analysis runs on a blocking worker, and an unchanged sample counter skips it.
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use compas_audio::{ScopeBlock, NUM_DECKS, SPECTRUM_FRAMES};
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::EngineHandle;
@@ -15,8 +14,6 @@ const DB_FLOOR: f32 = -72.0;
 /// Zero-pad the captured window so an off-bin bass peak can be localized.
 const FFT_LEN: usize = 16384;
 const SPECTRUM_ROWS: usize = 384;
-const MIN_POLL: Duration = Duration::from_millis(50);
-const STALE_AFTER: Duration = Duration::from_millis(250);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +24,8 @@ pub(crate) struct DeckMeterFrame {
     spectrum_hz: Vec<f32>,
     min_hz: f32,
     max_hz: f32,
+    /// Sample counter for this window. Unchanged means the display can skip the repaint.
+    sequence: u64,
 }
 
 #[derive(Default)]
@@ -36,7 +35,7 @@ pub(crate) struct DeckMeters {
 
 #[derive(Default)]
 struct MeterSlot {
-    last_request: Option<Instant>,
+    captured: Vec<[f32; 2]>,
     spectrum: Option<Spectrum>,
 }
 
@@ -48,6 +47,9 @@ struct Spectrum {
     buffer: Vec<Complex32>,
     scratch: Vec<Complex32>,
     db: Vec<f32>,
+    row_db: Vec<f32>,
+    row_hz: Vec<f32>,
+    ordered_hz: Vec<f32>,
     sample_rate: f32,
 }
 
@@ -72,6 +74,9 @@ impl Spectrum {
             window_sum,
             scratch,
             db: vec![DB_FLOOR; fft_len / 2 + 1],
+            row_db: vec![DB_FLOOR; SPECTRUM_ROWS],
+            row_hz: vec![0.0; SPECTRUM_ROWS],
+            ordered_hz: vec![0.0; SPECTRUM_ROWS],
             sample_rate,
             buffer: vec![Complex32::default(); fft_len],
         }
@@ -104,8 +109,8 @@ impl Spectrum {
         let bin_hz = self.sample_rate / n as f32;
         let first = (min_hz / bin_hz).ceil().max(1.0) as usize;
         let last = ((max_hz / bin_hz).floor() as usize).clamp(first, n / 2 - 1);
-        let mut row_db = vec![DB_FLOOR; SPECTRUM_ROWS];
-        let mut row_hz = vec![0.0_f32; SPECTRUM_ROWS];
+        self.row_db.fill(DB_FLOOR);
+        self.row_hz.fill(0.0);
         let log_span = (max_hz / min_hz).ln();
         for k in first..=last {
             let (bin, level) = interpolate_peak(&self.db, k);
@@ -113,34 +118,36 @@ impl Spectrum {
             let row = ((frequency / min_hz).ln() / log_span * (SPECTRUM_ROWS - 1) as f32)
                 .round()
                 .clamp(0.0, (SPECTRUM_ROWS - 1) as f32) as usize;
-            if level >= row_db[row] {
-                row_db[row] = level.clamp(DB_FLOOR, 0.0);
-                row_hz[row] = frequency;
+            if level >= self.row_db[row] {
+                self.row_db[row] = level.clamp(DB_FLOOR, 0.0);
+                self.row_hz[row] = frequency;
             }
         }
         // Bass rows are narrower than one FFT bin. Sample the measured curve
         // there so a tone is a solid band, while a real peak keeps its own level.
         for index in 0..SPECTRUM_ROWS {
-            if row_hz[index] > 0.0 {
+            if self.row_hz[index] > 0.0 {
                 continue;
             }
             let center = min_hz * (max_hz / min_hz).powf(index as f32 / (SPECTRUM_ROWS - 1) as f32);
-            row_db[index] = sample_db(&self.db, bin_hz, center).clamp(DB_FLOOR, 0.0);
-            row_hz[index] = center;
+            self.row_db[index] = sample_db(&self.db, bin_hz, center).clamp(DB_FLOOR, 0.0);
+            self.row_hz[index] = center;
         }
         let mut previous = 0.0_f32;
-        let hz = (0..SPECTRUM_ROWS)
-            .map(|i| {
-                let center = min_hz * (max_hz / min_hz).powf(i as f32 / (SPECTRUM_ROWS - 1) as f32);
-                let mut frequency = if row_hz[i] > 0.0 { row_hz[i] } else { center };
-                if frequency <= previous {
-                    frequency = center.max(previous + bin_hz * 0.01);
-                }
-                previous = frequency;
-                frequency
-            })
-            .collect();
-        (row_db, hz)
+        for i in 0..SPECTRUM_ROWS {
+            let center = min_hz * (max_hz / min_hz).powf(i as f32 / (SPECTRUM_ROWS - 1) as f32);
+            let mut frequency = if self.row_hz[i] > 0.0 {
+                self.row_hz[i]
+            } else {
+                center
+            };
+            if frequency <= previous {
+                frequency = center.max(previous + bin_hz * 0.01);
+            }
+            previous = frequency;
+            self.ordered_hz[i] = frequency;
+        }
+        (self.row_db.clone(), self.ordered_hz.clone())
     }
 }
 
@@ -235,48 +242,89 @@ impl MeterSlot {
             spectrum_hz,
             min_hz,
             max_hz,
+            sequence: 0,
         }
     }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MeterQuery {
+    deck: usize,
+    spectrum: bool,
+    since: u64,
 }
 
 #[tauri::command]
 pub(crate) async fn read_deck_meters(
     engine: State<'_, EngineHandle>,
-    meters: State<'_, DeckMeters>,
-    deck: usize,
-    spectrum: bool,
-) -> Result<Option<DeckMeterFrame>, String> {
-    let slot = meters.slots.get(deck).ok_or("Invalid meter deck")?;
-    let Ok(mut slot) = slot.try_lock() else {
-        return Ok(None);
-    };
-    let telemetry = &engine.telemetry;
-    let now = Instant::now();
-    let gap = slot
-        .last_request
-        .map(|previous| now.duration_since(previous));
-    if gap.is_some_and(|g| g < MIN_POLL) {
-        return Ok(None);
+    meters: State<'_, Arc<DeckMeters>>,
+    queries: Vec<MeterQuery>,
+) -> Result<Vec<Option<DeckMeterFrame>>, String> {
+    if queries.is_empty() {
+        return Ok(Vec::new());
     }
-    slot.last_request = Some(now);
-    let block = telemetry.take_scope(deck);
-    if !telemetry.is_loaded(deck) {
-        return Ok(None);
+    let telemetry = Arc::clone(&engine.telemetry);
+    let meters = Arc::clone(meters.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        queries
+            .into_iter()
+            .map(|query| {
+                meters
+                    .latest(&telemetry, query.deck, query.spectrum, query.since)
+                    .ok()
+                    .flatten()
+            })
+            .collect()
+    })
+    .await
+    .map_err(|_| "Meter worker stopped".to_string())
+}
+
+impl DeckMeters {
+    fn latest(
+        &self,
+        telemetry: &compas_audio::DeckTelemetry,
+        deck: usize,
+        spectrum: bool,
+        since: u64,
+    ) -> Result<Option<DeckMeterFrame>, String> {
+        let slot = self.slots.get(deck).ok_or("Invalid meter deck")?;
+        let Ok(mut slot) = slot.try_lock() else {
+            return Ok(None);
+        };
+        if !telemetry.is_loaded(deck) {
+            telemetry.release_scope(deck);
+            return Ok(None);
+        }
+        telemetry.request_scope(deck);
+        let Some(sequence) = telemetry.scope_sequence(deck) else {
+            return Ok(None);
+        };
+        if sequence == since {
+            return Ok(None);
+        }
+        if slot.captured.capacity() < SPECTRUM_FRAMES {
+            slot.captured.reserve_exact(SPECTRUM_FRAMES);
+        }
+        let Some((rate, sequence)) = telemetry.copy_scope(deck, &mut slot.captured) else {
+            return Ok(None);
+        };
+        let block = ScopeBlock {
+            sample_rate: rate,
+            frames: std::mem::take(&mut slot.captured),
+        };
+        let mut frame = slot.frame(&block, spectrum);
+        slot.captured = block.frames;
+        frame.sequence = sequence;
+        Ok(Some(frame))
     }
-    telemetry.request_scope(deck);
-    if gap.is_none_or(|g| g > STALE_AFTER) {
-        return Ok(None);
-    }
-    Ok(block
-        .filter(|b| b.sample_rate.is_finite() && b.sample_rate > 40.0)
-        .filter(|b| !spectrum || b.frames.len() == SPECTRUM_FRAMES)
-        .map(|b| slot.frame(&b, spectrum)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::hint::black_box;
+    use std::time::Instant;
 
     fn stereo_tone(phase: f32) -> ScopeBlock {
         let rate = 48000.0;
