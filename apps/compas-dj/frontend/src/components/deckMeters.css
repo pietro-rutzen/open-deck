@@ -21,11 +21,11 @@
   cursor: pointer;
   color: #eee;
 }
-.deck-meter-options input {
+.deck-meter-options input[type="checkbox"] {
   accent-color: var(--deck-color);
   border-color: var(--deck-color);
 }
-.deck-meter-options input:checked {
+.deck-meter-options input[type="checkbox"]:checked {
   border-color: var(--deck-color);
   background-color: var(--deck-color);
 }
