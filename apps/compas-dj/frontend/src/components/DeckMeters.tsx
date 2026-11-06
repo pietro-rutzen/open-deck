@@ -413,6 +413,14 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
       if (host) resize.observe(host);
     }
     window.addEventListener("resize", fit);
+    let scaleMedia = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+    const onScale = () => {
+      scaleMedia.removeEventListener("change", onScale);
+      fit();
+      scaleMedia = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      scaleMedia.addEventListener("change", onScale);
+    };
+    scaleMedia.addEventListener("change", onScale);
     fit();
     const retry = panels.every((panel) => panel.cssW > 0)
       ? 0
@@ -425,6 +433,7 @@ export const DeckMeterStrip = memo(function DeckMeterStrip({
       observer.disconnect();
       resize.disconnect();
       window.removeEventListener("resize", fit);
+      scaleMedia.removeEventListener("change", onScale);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [deck, mask, active, track]);
