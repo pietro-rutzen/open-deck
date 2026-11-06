@@ -622,6 +622,8 @@ export const deckSeek = (deck: number, frame: number) => invoke("deck_seek", { d
 export const deckUnload = (deck: number) => invoke("deck_unload", { deck });
 export const setLoop = (deck: number, inFrame: number, outFrame: number, active: boolean) =>
   invoke("set_loop", { deck, inFrame, outFrame, active });
+export const recallLoop = (deck: number, inFrame: number, outFrame: number) =>
+  invoke("recall_loop", { deck, inFrame, outFrame });
 export const setLoopActive = (deck: number, active: boolean) =>
   invoke("set_loop_active", { deck, active });
 /** Momentary loop-roll with slip. Engage with a grid-snapped region; release (active=false)

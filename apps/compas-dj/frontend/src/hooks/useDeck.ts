@@ -32,6 +32,7 @@ import {
   setDeckGain,
   setDeckTrim,
   setDeckTempo,
+  recallLoop,
   setLoop as setLoopCmd,
   setLoopActive as setLoopActiveCmd,
   setLoopRoll as setLoopRollCmd,
@@ -72,6 +73,13 @@ export interface LoopState {
   outFrame: number;
   /** Manual loop-in set and waiting for OUT (no active loop yet) — for IN/OUT button feedback. */
   armed?: boolean;
+}
+
+/** Exclusive end of a complete, playable loop on this track. */
+export function recallLoopEnd(loop: LoopState, frames: number): number | null {
+  const end = Math.min(loop.outFrame, frames);
+  return !loop.armed && Number.isFinite(loop.outFrame) && loop.inFrame >= 0 &&
+    end - loop.inFrame >= 1 ? end : null;
 }
 
 /** Deck controls the native controller thread applies directly to the engine. */
@@ -871,9 +879,11 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
       },
       toggleLoop: () => {
         const l = loopRef.current;
-        if (l.outFrame <= l.inFrame) return;
-        const next = { ...l, active: !l.active, armed: false };
-        setLoopCmd(deck, l.inFrame, l.outFrame, next.active).catch(swallow);
+        const end = l.active ? l.outFrame : recallLoopEnd(l, meta?.frames ?? 0);
+        if (end === null) return;
+        const next = { ...l, active: !l.active, armed: false, outFrame: end };
+        if (next.active) recallLoop(deck, next.inFrame, next.outFrame).catch(swallow);
+        else setLoopActiveCmd(deck, false).catch(swallow);
         loopRef.current = next;
         setLoopState(next);
         publishLoop(next);

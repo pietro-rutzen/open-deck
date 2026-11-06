@@ -24,6 +24,26 @@ use crate::sampler::Sampler;
 /// Number of decks the engine mixes. MVP uses 2; the array is sized for 4 so the
 /// extension to 4 decks needs no structural change.
 pub const NUM_DECKS: usize = 4;
+
+/// Return a playable exclusive end for a recalled loop, clipped to the actual track.
+/// Require at least one source frame so valid short legacy loops remain usable.
+pub fn recall_loop_end(start: f64, end: f64, track_frames: usize) -> Option<f64> {
+    if !start.is_finite() || !end.is_finite() || start < 0.0 {
+        return None;
+    }
+    let end = end.min(track_frames as f64);
+    (end - start >= 1.0).then_some(end)
+}
+
+/// Wrap even a distant seek in constant time; normal in-loop playback needs no remainder.
+#[inline]
+fn wrap_loop_end(head: f64, start: f64, end: f64) -> f64 {
+    if head >= end && end > start {
+        start + (head - end) % (end - start)
+    } else {
+        head
+    }
+}
 /// RT-side parking capacity for retired buffers when the reclaim ring is briefly full. Sized to
 /// absorb every deck swapping its mix buffer at once, with headroom.
 const PENDING_RECLAIM_CAP: usize = NUM_DECKS + 8;
@@ -303,6 +323,12 @@ pub enum AudioCommand {
         in_frame: f64,
         out_frame: f64,
         active: bool,
+    },
+    /// Recall the stored region and return to its start in one callback command.
+    RecallLoop {
+        deck: usize,
+        in_frame: f64,
+        out_frame: f64,
     },
     /// Toggle an existing loop on/off without changing its region.
     SetLoopActive {
@@ -1041,9 +1067,7 @@ impl DeckPlayer {
         let len = ((self.loop_out - self.loop_in) * factor).max(8.0);
         self.loop_out = self.loop_in + len;
         if self.loop_active {
-            while self.playhead >= self.loop_out {
-                self.playhead -= len;
-            }
+            self.playhead = wrap_loop_end(self.playhead, self.loop_in, self.loop_out);
             if self.playhead < self.loop_in {
                 self.playhead = self.loop_in;
             }
@@ -1241,12 +1265,7 @@ impl DeckPlayer {
             self.keylock.mark_jumped();
             self.silence_fade = self.silence_fade_len;
             if self.loop_active && self.loop_out > self.loop_in && self.playhead >= self.loop_out {
-                let len = self.loop_out - self.loop_in;
-                let mut wraps = 0;
-                while self.playhead >= self.loop_out && wraps < 8 {
-                    self.playhead -= len;
-                    wraps += 1;
-                }
+                self.playhead = wrap_loop_end(self.playhead, self.loop_in, self.loop_out);
                 continue;
             }
             return;
@@ -1268,10 +1287,8 @@ impl DeckPlayer {
             if self.censor_was_playing {
                 self.slip_playhead += advance;
                 if self.loop_active && self.loop_out > self.loop_in {
-                    let len = self.loop_out - self.loop_in;
-                    while self.slip_playhead >= self.loop_out {
-                        self.slip_playhead -= len;
-                    }
+                    self.slip_playhead =
+                        wrap_loop_end(self.slip_playhead, self.loop_in, self.loop_out);
                 }
             }
         } else {
@@ -1286,10 +1303,7 @@ impl DeckPlayer {
             }
             // Beat loop: wrap the play-head back to loop-in once it passes loop-out.
             if self.loop_active && self.loop_out > self.loop_in {
-                let len = self.loop_out - self.loop_in;
-                while self.playhead >= self.loop_out {
-                    self.playhead -= len;
-                }
+                self.playhead = wrap_loop_end(self.playhead, self.loop_in, self.loop_out);
             }
         }
     }
@@ -2156,6 +2170,22 @@ impl Mixer {
                         d.loop_active = active && out_frame > in_frame;
                     }
                 }
+                AudioCommand::RecallLoop {
+                    deck,
+                    in_frame,
+                    out_frame,
+                } => {
+                    if let Some(d) = self.decks.get_mut(deck) {
+                        let frames = d.buffer.as_ref().map_or(0, |buffer| buffer.frames());
+                        if let Some(out_frame) = recall_loop_end(in_frame, out_frame, frames) {
+                            d.loop_in = in_frame;
+                            d.loop_out = out_frame;
+                            d.loop_active = true;
+                            d.playhead = in_frame;
+                            d.keylock.mark_jumped();
+                        }
+                    }
+                }
                 AudioCommand::SetLoopActive { deck, active } => {
                     if let Some(d) = self.decks.get_mut(deck) {
                         d.loop_active = active && d.loop_out > d.loop_in;
@@ -2810,6 +2840,101 @@ mod tests {
             ctx,
             Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new())),
         )
+    }
+
+    #[test]
+    fn recall_loop_rejects_unplayable_bounds_and_clips_a_saved_tail() {
+        let (mut tx, mut mixer) = mixer_with_commands();
+        tx.push(AudioCommand::LoadDeck {
+            deck: 0,
+            buffer: small_buffer(0.25),
+            beat_offset: 0.0,
+            beat_interval: 0.0,
+        })
+        .unwrap();
+        tx.push(AudioCommand::SeekDeck {
+            deck: 0,
+            frame: 4.0,
+        })
+        .unwrap();
+        for (start, end) in [
+            (0.0, 1e-300),
+            (16.0, 18.0),
+            (15.5, 17.0),
+            (-1.0, 3.0),
+            (0.0, f64::INFINITY),
+        ] {
+            tx.push(AudioCommand::RecallLoop {
+                deck: 0,
+                in_frame: start,
+                out_frame: end,
+            })
+            .unwrap();
+            mixer.drain_commands();
+            assert!(!mixer.decks[0].loop_active);
+            assert_eq!(mixer.decks[0].playhead, 4.0);
+        }
+        tx.push(AudioCommand::RecallLoop {
+            deck: 0,
+            in_frame: 15.0,
+            out_frame: 30.0,
+        })
+        .unwrap();
+        mixer.drain_commands();
+        let d = &mixer.decks[0];
+        assert_eq!((d.loop_in, d.loop_out, d.playhead), (15.0, 16.0, 15.0));
+        assert!(d.loop_active);
+        assert_eq!(wrap_loop_end(1_000_000_000.5, 15.0, 16.0), 15.5);
+        assert!(wrap_loop_end(1.0, 0.0, 1e-300) < 1e-300);
+    }
+
+    #[test]
+    fn recall_loop_seeks_to_in_without_changing_transport_and_exit_keeps_bounds() {
+        for playing in [false, true] {
+            let (mut tx, mut mixer) = mixer_with_commands();
+            tx.push(AudioCommand::LoadDeck {
+                deck: 0,
+                buffer: small_buffer(0.25),
+                beat_offset: 0.0,
+                beat_interval: 0.0,
+            })
+            .unwrap();
+            tx.push(AudioCommand::SetDeckPlaying { deck: 0, playing })
+                .unwrap();
+            tx.push(AudioCommand::SeekDeck {
+                deck: 0,
+                frame: 22.0,
+            })
+            .unwrap();
+            tx.push(AudioCommand::RecallLoop {
+                deck: 0,
+                in_frame: 6.0,
+                out_frame: 12.0,
+            })
+            .unwrap();
+            mixer.drain_commands();
+            assert!(mixer.decks[0].loop_active);
+            assert_eq!(mixer.decks[0].playhead, 6.0);
+            assert_eq!(mixer.decks[0].playing, playing);
+            tx.push(AudioCommand::SeekDeck {
+                deck: 0,
+                frame: 9.0,
+            })
+            .unwrap();
+            tx.push(AudioCommand::SetLoopActive {
+                deck: 0,
+                active: false,
+            })
+            .unwrap();
+            mixer.drain_commands();
+            let deck = &mixer.decks[0];
+            assert!(!deck.loop_active);
+            assert_eq!(
+                (deck.loop_in, deck.loop_out, deck.playhead),
+                (6.0, 12.0, 9.0)
+            );
+            assert_eq!(deck.playing, playing);
+        }
     }
 
     #[test]

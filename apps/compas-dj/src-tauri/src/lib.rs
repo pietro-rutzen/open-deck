@@ -197,6 +197,11 @@ enum EngineMsg {
         out_frame: f64,
         active: bool,
     },
+    RecallLoop {
+        deck: usize,
+        in_frame: f64,
+        out_frame: f64,
+    },
     LoopActive {
         deck: usize,
         active: bool,
@@ -751,6 +756,15 @@ fn spawn_engine() -> EngineHandle {
                         out_frame,
                         active,
                     },
+                    EngineMsg::RecallLoop {
+                        deck,
+                        in_frame,
+                        out_frame,
+                    } => AudioCommand::RecallLoop {
+                        deck,
+                        in_frame,
+                        out_frame,
+                    },
                     EngineMsg::LoopActive { deck, active } => {
                         AudioCommand::SetLoopActive { deck, active }
                     }
@@ -1304,7 +1318,14 @@ fn load_track(
                         },
                     )?;
                     app.state::<native_controls::PerformanceState>()
-                        .install_track(deck, beat_offset, beat_interval, sr, f64::from(grid.bpm));
+                        .install_track(
+                            deck,
+                            beat_offset,
+                            beat_interval,
+                            sr,
+                            f64::from(grid.bpm),
+                            loaded.frames,
+                        );
                     let _ = app.emit("effects:update", snapshot);
                     // Commands are enqueued before publication; this is not an audio-callback ack.
                     let _ = app.emit("deck:loaded", loaded);
@@ -2518,6 +2539,24 @@ fn set_loop(
         in_frame,
         out_frame,
         active,
+    })
+}
+
+#[tauri::command]
+fn recall_loop(
+    state: State<'_, EngineHandle>,
+    performance: State<'_, native_controls::PerformanceState>,
+    deck: usize,
+    in_frame: f64,
+    out_frame: f64,
+) -> Result<(), String> {
+    let out_frame = performance
+        .recall_end(deck, in_frame, out_frame)
+        .ok_or("Invalid reloop bounds")?;
+    state.send(EngineMsg::RecallLoop {
+        deck,
+        in_frame,
+        out_frame,
     })
 }
 
@@ -4082,6 +4121,7 @@ pub fn run() {
             deck_unload,
             set_loop,
             set_loop_active,
+            recall_loop,
             set_loop_roll,
             deck_scratch,
             set_deck_tempo,

@@ -276,6 +276,7 @@ struct DeckSnapshot {
     grid_offset: f64,
     grid_interval: f64,
     jump_scale: f64,
+    track_frames: usize,
     loop_in: f64,
     loop_out: f64,
     loop_active: bool,
@@ -295,6 +296,7 @@ impl Default for DeckSnapshot {
             grid_offset: 0.0,
             grid_interval: 0.0,
             jump_scale: 1.0,
+            track_frames: 0,
             loop_in: 0.0,
             loop_out: 0.0,
             loop_active: false,
@@ -411,8 +413,10 @@ impl PerformanceState {
         interval: f64,
         source_rate: f64,
         bpm: f64,
+        frames: usize,
     ) {
         self.with_deck(deck, |snapshot| {
+            snapshot.track_frames = frames;
             snapshot.hot_cues = [None; HOT_CUES];
             snapshot.loop_in = 0.0;
             snapshot.loop_out = 0.0;
@@ -435,8 +439,14 @@ impl PerformanceState {
         });
     }
 
+    pub(crate) fn recall_end(&self, deck: usize, start: f64, end: f64) -> Option<f64> {
+        self.with_deck(deck, |snapshot| {
+            compas_audio::recall_loop_end(start, end, snapshot.track_frames)
+        })?
+    }
+
     pub(crate) fn clear_deck(&self, deck: usize) {
-        self.install_track(deck, 0.0, 0.0, 0.0, 0.0);
+        self.install_track(deck, 0.0, 0.0, 0.0, 0.0, 0);
     }
 }
 
@@ -715,20 +725,32 @@ fn finish_loop(deck: usize, heard: f64, performance: &PerformanceState) -> Optio
 
 fn toggle_loop(deck: usize, performance: &PerformanceState) -> Option<NativeAction> {
     performance.with_deck(deck, |snapshot| {
-        if snapshot.loop_out <= snapshot.loop_in {
-            return single(None, false);
-        }
-        snapshot.loop_active = !snapshot.loop_active;
-        snapshot.loop_armed = false;
-        mirrored_loop(
-            snapshot,
-            Some(EngineMsg::Loop {
+        let message = if snapshot.loop_active {
+            EngineMsg::LoopActive {
+                deck,
+                active: false,
+            }
+        } else {
+            if snapshot.loop_armed {
+                return single(None, false);
+            }
+            let Some(end) = compas_audio::recall_loop_end(
+                snapshot.loop_in,
+                snapshot.loop_out,
+                snapshot.track_frames,
+            ) else {
+                return single(None, false);
+            };
+            snapshot.loop_out = end;
+            EngineMsg::RecallLoop {
                 deck,
                 in_frame: snapshot.loop_in,
                 out_frame: snapshot.loop_out,
-                active: snapshot.loop_active,
-            }),
-        )
+            }
+        };
+        snapshot.loop_active = !snapshot.loop_active;
+        snapshot.loop_armed = false;
+        mirrored_loop(snapshot, Some(message))
     })
 }
 
@@ -1130,6 +1152,35 @@ mod tests {
                 active: false
             })
         ));
+    }
+
+    #[test]
+    fn flx4_loop_toggle_recalls_saved_bounds_and_exits_without_seek() {
+        let performance = PerformanceState::new();
+        performance.install_track(0, 0.0, 0.0, 48_000.0, 0.0, 16);
+        assert!(perform("loop.toggle", None, &performance)
+            .unwrap()
+            .message
+            .is_none());
+        performance.set_loop(0, 8.0, 16.0, false, false, None);
+        let reloop = perform("loop.toggle", None, &performance).unwrap();
+        assert!(
+            matches!(reloop.message, Some(EngineMsg::RecallLoop { deck: 0, in_frame, out_frame }) if in_frame == 8.0 && out_frame == 16.0)
+        );
+        assert_eq!(reloop.performance.unwrap().loop_active, Some(true));
+        let exit = perform("loop.toggle", None, &performance).unwrap();
+        assert!(matches!(
+            exit.message,
+            Some(EngineMsg::LoopActive {
+                deck: 0,
+                active: false
+            })
+        ));
+        let state = exit.performance.unwrap();
+        assert_eq!(
+            (state.loop_in, state.loop_out, state.loop_active),
+            (Some(8.0), Some(16.0), Some(false))
+        );
     }
 
     #[test]

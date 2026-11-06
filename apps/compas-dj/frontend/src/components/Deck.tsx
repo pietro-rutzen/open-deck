@@ -9,7 +9,7 @@ import {
   useState,
   type DragEvent,
 } from 'react';
-import type { DeckController, DeckState } from '../hooks/useDeck';
+import { recallLoopEnd, type DeckController, type DeckState } from '../hooks/useDeck';
 import {
   formatKey,
   loadTrack,
@@ -136,6 +136,32 @@ function fmt(frame: number, rate: number): string {
     .toString()
     .padStart(2, '0')}`;
 }
+
+// Key this control by physical deck so A/C and B/D keep separate preferences.
+const DeckClock = memo(function DeckClock({ deck, elapsed, remaining }: {
+  deck: number; elapsed: string; remaining: string;
+}) {
+  const storageKey = `opendeck.deck.${deck}.remaining-first`;
+  const [remainingFirst, setRemainingFirst] = useState(() => {
+    try { return localStorage.getItem(storageKey) === '1'; } catch { return false; }
+  });
+  const toggle = () => {
+    setRemainingFirst(!remainingFirst);
+    try { localStorage.setItem(storageKey, remainingFirst ? '0' : '1'); } catch { /* Session only. */ }
+  };
+  return (
+    <button type="button" className="tile deck-clock" onClick={toggle}
+      aria-label="Show remaining time first" aria-pressed={remainingFirst}
+      aria-description={`Elapsed ${elapsed}, remaining ${remaining.slice(1)}`}
+      title="Switch between elapsed-first and remaining-first track time">
+      <span className="overline">{remainingFirst ? 'REMAIN' : 'ELAPSED'}</span>
+      <span className="mono tile-val small">
+        {remainingFirst ? remaining : elapsed}{' '}
+        <span className="muted">/ {remainingFirst ? elapsed : remaining}</span>
+      </span>
+    </button>
+  );
+});
 
 export function Deck({
   ctrl,
@@ -587,13 +613,7 @@ export function Deck({
             );
           })()}
         </div>
-        <div className="tile">
-          <span className="overline">TIME</span>
-          <span className="mono tile-val small">
-            {fmt(frame, rate)}{' '}
-            <span className="muted">/ -{fmt(audibleLeft, rate)}</span>
-          </span>
-        </div>
+        <DeckClock key={ctrl.deck} deck={ctrl.deck} elapsed={fmt(frame, rate)} remaining={'-' + fmt(audibleLeft, rate)} />
         {nextCue && (
           <div className="tile" style={{ color: CUE_COLORS[nextCue.slot] }}>
             <span className="overline" style={{ color: 'inherit' }}>CUE {nextCue.slot + 1} IN</span>
@@ -836,11 +856,11 @@ export function Deck({
                 </button>
                 <button
                   className="chip"
-                  onClick={actions.clearLoop}
-                  disabled={!state.loop.active}
-                  title="Exit loop"
+                  onClick={actions.toggleLoop}
+                  disabled={!meta || (!state.loop.active && recallLoopEnd(state.loop, frames) === null)}
+                  title={state.loop.active ? 'Exit and keep this loop' : 'Return to the last loop at its start'}
                 >
-                  ✕
+                  {state.loop.active ? 'EXIT' : 'RELOOP'}
                 </button>
               </div>
               <div
