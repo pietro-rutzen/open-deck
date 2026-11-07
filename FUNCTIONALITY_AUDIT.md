@@ -11,7 +11,7 @@ Address inventory below covers every control entry in that mapping, including sh
 
 ## Important remaining gaps
 
-Not implemented: Release FX, stem pads, and Smart CFX/Smart Fader. Release FX is a rekordbox host effect. The manual does not give a DSP formula, so it stays an open product choice and is not implemented. Pad FX uses Open Deck's echo, flanger, reverb, and bit-crusher. Pads 1–4 keep the panel parameters. Pads 5–8, the shifted layer, and Pad FX2 are presets of those same inserts, documented in the pad-mode matrix. That assignment is not a rekordbox preset, and it has no physical test. Keyboard mode plays a selected hot cue at the manual's default semitones. It is not a stem mode. SHIFT+PLAY censor, SHIFT+LOOP IN/OUT boundary adjust via jog, SHIFT beat-jump size ×16, tempo-range cycling (SHIFT+SYNC), deck SHIFT buttons, the cue-point LED, track-loaded LEDs and beat-loop shift-layer LEDs are implemented below; every one of them still needs a physical FLX4 test (NOT RUN). Beat FX drives OpenDeck's per-deck echo/flanger/reverb/crusher inserts, not rekordbox's Beat FX DSP or master-channel FX position. Sampler mode has four banks of 16 slots. Deck 1 plays slots 1–8 of the active bank and deck 2 plays slots 9–16. The bank is software state; the MIDI list has no bank message. SHIFT+pad stops a playing slot and, when the slot is idle, loads the browser-selected track through the existing decode path. A missing selection or a failed decode leaves the slot. An empty unshifted pad does nothing. That load replaces an idle slot. It is not a separate eject, and it does not copy rekordbox's refusal to load into an occupied slot. Hot cues follow OpenDeck set/seek semantics rather than rekordbox hold-to-preview. The second cue/play indicator address `90/91 47` stays dark because the same bytes are listed for both indicators. Unsupported controls must not be called working.
+Not implemented: stem pads and Smart CFX/Smart Fader. Release FX is a short decaying echo tail on the existing echo insert. The manual does not specify the rekordbox algorithm, so the tail length and the pad it is assigned to are Open Deck choices. Pad FX uses Open Deck's echo, flanger, reverb, and bit-crusher. Pads 1–4 keep the panel parameters. Pads 5–8, the shifted layer, and Pad FX2 are presets of those same inserts, documented in the pad-mode matrix. That assignment is not a rekordbox preset, and it has no physical test. Keyboard mode plays a selected hot cue at the manual's default semitones. It is not a stem mode. SHIFT+PLAY censor, SHIFT+LOOP IN/OUT boundary adjust via jog, SHIFT beat-jump size ×16, tempo-range cycling (SHIFT+SYNC), deck SHIFT buttons, the cue-point LED, track-loaded LEDs and beat-loop shift-layer LEDs are implemented below; every one of them still needs a physical FLX4 test (NOT RUN). Beat FX drives OpenDeck's per-deck echo/flanger/reverb/crusher inserts, not rekordbox's Beat FX DSP or master-channel FX position. Sampler mode has four banks of 16 slots. Deck 1 plays slots 1–8 of the active bank and deck 2 plays slots 9–16. The bank is software state; the MIDI list has no bank message. SHIFT+pad stops a playing slot and, when the slot is idle, loads the browser-selected track through the existing decode path. A missing selection or a failed decode leaves the slot. An empty unshifted pad does nothing. That load replaces an idle slot. It is not a separate eject, and it does not copy rekordbox's refusal to load into an occupied slot. Hot cues follow OpenDeck set/seek semantics rather than rekordbox hold-to-preview. The second cue/play indicator address `90/91 47` stays dark because the same bytes are listed for both indicators. Unsupported controls must not be called working.
 
 Hot cue, beat loop, loop in/out, beat jump, quantize, sync, sampler trigger/stop, key shift, Beat FX, Pad FX, and keyboard are applied on the controller thread at the press. Engine command acknowledgements are still absent. Physical timing against a reference player is NOT RUN.
 
@@ -26,7 +26,7 @@ Mode buttons are Note On channel `90` (deck 1) and `91` (deck 2). Press is `7F`,
 | Hot Cue | `1B` | `00`–`07`, SHIFT deletes the same notes | Existing set/seek and delete. An empty pad stores the playhead heard at the press. A filled pad seeks there, quantized to the grid when quantize is on. This is not rekordbox hold-to-preview. |
 | Keyboard | SHIFT+Hot Cue `69` | `40`–`47`, SHIFT `40`–`47` | See Keyboard below. Entering, leaving, or pressing `69` again clears the selection and restores a pitch a pad was holding. |
 | Pad FX1 | `1E` | `10`–`17`, SHIFT `10`–`17` | Slots 0–7, and SHIFT slots 8–15. Leaving this mode releases that deck's held inserts. |
-| Pad FX2 | SHIFT+Pad FX1 `6B` | `50`–`57`, SHIFT `50`–`57` | Slots 16–23, and SHIFT slots 24–31. Leaving this mode releases that deck's held inserts. |
+| Pad FX2 | SHIFT+Pad FX1 `6B` | `50`–`57`, SHIFT `50`–`57` | Slots 16–23, and SHIFT slots 24–30. SHIFT pad 8 is Release FX. Leaving this mode releases that deck's held inserts. |
 | Beat Jump | `20` | `20`–`27` | −1, +1, −2, +2, −4, +4, −8, +8 beats, times the deck scale. Matches the manual's default sizes. |
 | Beat Loop | SHIFT+Beat Jump `6D` | `60`–`67` | 1/4, 1/2, 1, 2, 4, 8, 16, 32 beats. The loop stays after release. The same pad cancels it. |
 | Sampler | `22` | `30`–`37`, SHIFT stops or loads the same notes | Four banks of 16. See Sampler below. |
@@ -40,9 +40,9 @@ Deck 2 uses the same note numbers on `91`, `99`, and `9A`.
 
 ### Pad FX presets
 
-The manual's Effect A–AF letters are host assignments, not a fixed DSP list. Open Deck uses the four existing inserts: echo, flanger, reverb, and bit-crusher. There is no Release FX. Holding a pad turns its insert on. Releasing the pad that owns the insert turns it off, unless Beat FX had latched it, in which case the latch stays and the saved panel parameters return.
+The manual's Effect A–AF letters are host assignments, not a fixed DSP list. Open Deck uses the four existing inserts: echo, flanger, reverb, and bit-crusher. Holding a pad turns its insert on. Releasing the pad that owns the insert turns it off, unless Beat FX had latched it, in which case the latch stays and the saved panel parameters return.
 
-Pads 1–4 keep the panel parameters and hold the insert only while the pad is down. Release clears it. If that insert is already on, those four pads do not take ownership, so releasing them does not clear a Beat FX latch. Pads 5–8 and every shifted and Pad FX2 pad are presets. The first hold of an effect saves the panel parameters. A later preset of the same effect keeps that saved copy. Releasing a pad that does not own the insert does nothing. The last preset of an effect wins. `fx.next` still moves only latched effects.
+Pads 1–4 keep the panel parameters and hold the insert only while the pad is down. Release clears it. If that insert is already on, those four pads do not take ownership, so releasing them does not clear a Beat FX latch. Pads 5–8 and the other shifted and Pad FX2 pads are presets. Pad FX2 + SHIFT pad 8 is the Release FX pad. The first hold of an effect saves the panel parameters. A later preset of the same effect keeps that saved copy. Releasing a pad that does not own the insert does nothing. The last preset of an effect wins. `fx.next` still moves only latched effects.
 
 Echo time is the preset's beat count times the deck's beat length (the default beat is 0.5 s, so 1 beat is 0.5 s). Echo feedback is `0.15 + depth × 0.7`. Echo mix is `depth × 0.5` while the insert is on. Flanger uses the same beat clock. Depth, size, mix, crush, and downsample stay inside 0–1.
 
@@ -52,9 +52,18 @@ Echo time is the preset's beat count times the deck's beat length (the default b
 | 4–7 | Pad FX1 pads 5–8 | `14`–`17` | Echo 1 beat / depth 0.75; flanger 1 / 0.8; reverb size 0.9 mix 0.55; crusher crush 0.85 down 0.6 |
 | 8–15 | Pad FX1 + SHIFT | shift `10`–`17` | Echo 0.25 / 0.4; flanger 8 / 0.45; reverb 0.35 / 0.25; crusher 0.25 / 0.15; echo 2 / 0.65; flanger 2 / 0.7; reverb 0.75 / 0.7; crusher 0.7 / 0.85 |
 | 16–23 | Pad FX2 | `50`–`57` | Echo 4 / 0.55; flanger 0.5 / 0.5; reverb 0.5 / 0.45; crusher 0.6 / 0.4; echo 1/8 / 0.8; flanger 16 / 0.35; reverb 1.0 / 0.4; crusher 0.95 / 0.2 |
-| 24–31 | Pad FX2 + SHIFT | shift `50`–`57` | Echo 0.5 / 0.9; flanger 0.25 / 0.9; reverb 0.2 / 0.8; crusher 0.4 / 0.95; echo 8 / 0.35; flanger 6 / 0.55; reverb 0.85 / 0.2; crusher 0.15 / 0.5 |
+| 24–30 | Pad FX2 + SHIFT pads 1–7 | shift `50`–`56` | Echo 0.5 / 0.9; flanger 0.25 / 0.9; reverb 0.2 / 0.8; crusher 0.4 / 0.95; echo 8 / 0.35; flanger 6 / 0.55; reverb 0.85 / 0.2 |
+| 31 | Pad FX2 + SHIFT pad 8 | shift `57` | Release FX. See below. |
 
 Controls are `deck.0.pad_fx.0`–`31` and `deck.1.pad_fx.0`–`31`.
+
+### Release FX
+
+The manual says a Release FX is assigned to a pad in advance. Pressing that pad while another Pad FX is held turns the held effect off and adds the Release FX. SHIFT+Beat FX ON/OFF turns Beat FX off and applies Release FX. The rekordbox algorithm is not specified. Open Deck uses the existing echo insert: 0.18 s delay, feedback 0.42, mix 0.55. Live input is captured for 0.18 s, then the input gate closes and the line decays. The tail hard-stops at 0.90 s, or earlier once the gated line is silent. It does not keep recording, and it does not start playback.
+
+The assigned pad is Pad FX2 + SHIFT pad 8 (`deck.N.pad_fx.31`). Pressing it with no pad held does nothing. Pressing it while a pad is held restores that pad's saved parameters, keeps a Beat FX latch, and starts the tail. When the tail ends, a latched echo returns with its panel parameters and a clear delay line. Note Off and velocity 0–63 do not start or cancel it. A repeat press restarts the same bounded tail. Releasing the original pad afterwards does not turn its insert back on.
+
+SHIFT+Beat FX ON/OFF (`fx.off_all`) clears Beat FX latches and pad holds, keeps the knob positions, and starts the tail only on decks that had an insert on. The tail ends with echo off. A second press ends a tail that is still running. A press while SHIFT is merely released does nothing. Decks with nothing on are bypassed and stay silent. Physical test pending.
 
 ### Keyboard
 
@@ -84,7 +93,7 @@ The lit pad is the last unshifted pad pressed. A transpose makes matching the pi
 
 ### Still absent
 
-Smart CFX, Smart Fader, Release FX, and stem pads. The manual says a Release FX is assigned to a pad in advance, and pressing it while another Pad FX is held turns that effect off and adds the Release FX. SHIFT+Beat FX ON/OFF does the same for Beat FX. The algorithm is a rekordbox host effect, not a DSP formula, so it is not implemented. A mode button is lit only where the behavior above exists.
+Smart CFX, Smart Fader, and stem pads. Release FX is the short echo tail above, not a separate rekordbox effect. A mode button is lit only where the behavior above exists.
 
 ## Changed behavior (T019)
 
@@ -96,7 +105,7 @@ Smart CFX, Smart Fader, Release FX, and stem pads. The manual says a Release FX 
 - BEAT SYNC long press sets the deck as sync leader; SHIFT+RELOOP/EXIT is reloop-and-stop.
 - Key shift pads use the manual's keyboard scale (+4, +5, +6, +7, ±0, +1, +2, +3). SHIFT pads 7 and 8 move that scale and the sounding pitch by one semitone, clamped to ±12. SHIFT pads 1–6 do not change pitch. The lit pad is the last unshifted pad.
 - Sampler pads play four banks of 16 slots. Deck 1 is slots 1–8 of the active bank and deck 2 is slots 9–16. A second press restarts a one-shot. SHIFT stops a playing slot and loads the selected browser track when the slot is idle. Pads light when a slot is loaded. Sampler and key-shift pad-mode buttons light their mode LED. Physical test pending.
-- Beat FX: FX SELECT cycles echo → flanger → reverb → crusher (SHIFT reverses, an active effect carries over), BEAT ◀/▶ steps echo/flanger beat length, CH SELECT picks deck 1 or 2, LEVEL/DEPTH sets the selected effect amount, ON/OFF toggles it with LED feedback, SHIFT+ON/OFF turns every insert off. The status bar shows the current Beat FX selection.
+- Beat FX: FX SELECT cycles echo → flanger → reverb → crusher (SHIFT reverses, an active effect carries over), BEAT ◀/▶ steps echo/flanger beat length, CH SELECT picks deck 1 or 2, LEVEL/DEPTH sets the selected effect amount, ON/OFF toggles it with LED feedback, SHIFT+ON/OFF turns Beat FX off and plays the short echo Release FX on decks that were on. A second press ends that tail. The status bar shows the current Beat FX selection.
 - BROWSE press toggles browsing between the track list and the sources tree (Local Library and folders); SHIFT+BROWSE rotate zooms the waveform.
 - SHIFT+PLAY censors: the deck plays backward while the button is held, then returns to the position playback would have reached. A paused deck returns to the same point and stays paused.
 - SHIFT+LOOP IN or SHIFT+LOOP OUT, held, turns the jog wheel into a loop-boundary trim (about 10 ms of audio per platter count). The wheel does not scratch while that trim is held.
@@ -213,8 +222,8 @@ Smart CFX, Smart Fader, Release FX, and stem pads. The manual says a Release FX 
 | BEAT FX LEVEL/DEPTH - rotate (MSB) - Adjust FX Level (mix) and BEAT FX Depth (meta) in the selected slot | `B4 02` | fx.level | Mapped to OpenDeck per-deck inserts, not rekordbox Beat FX DSP; physical test pending |
 | BEAT FX ON/OFF - press - Toggle FX in the selected Slot (when on CHAN1/1+2) | `94 47` | fx.toggle.0 | Mapped to OpenDeck per-deck inserts, not rekordbox Beat FX DSP; physical test pending |
 | BEAT FX ON/OFF - press - Toggle FX in the selected Slot (when on CHAN2) | `95 47` | fx.toggle.1 | Mapped to OpenDeck per-deck inserts, not rekordbox Beat FX DSP; physical test pending |
-| BEAT FX ON/OFF +SHIFT - press - Disable all enabled Beat FX Slots (when on CHAN1/1+2) | `94 43` | fx.off_all | Mapped to OpenDeck per-deck inserts, not rekordbox Beat FX DSP; physical test pending |
-| BEAT FX ON/OFF +SHIFT - press - Disable all enabled Beat FX Slots (when on CHAN12) | `95 43` | fx.off_all | Mapped to OpenDeck per-deck inserts, not rekordbox Beat FX DSP; physical test pending |
+| BEAT FX ON/OFF +SHIFT - press - Disable all enabled Beat FX Slots (when on CHAN1/1+2) | `94 43` | fx.off_all | Turns Beat FX off and starts the short echo tail on decks that were on. A second press ends the tail. Does not start playback. Physical test pending |
+| BEAT FX ON/OFF +SHIFT - press - Disable all enabled Beat FX Slots (when on CHAN12) | `95 43` | fx.off_all | Turns Beat FX off and starts the short echo tail on decks that were on. A second press ends the tail. Does not start playback. Physical test pending |
 | HOT CUE MODE (DECK1) - press - set hotcue mode | `90 1B` | Supported pad-mode LED | Implemented; physical test pending |
 | HOT CUE MODE (DECK2) - press - set hotcue mode | `91 1B` | Supported pad-mode LED | Implemented; physical test pending |
 | KEYBOARD MODE (DECK1) - press - set keyboard mode | `90 69` | Keyboard selection reset and held-pitch restore | Implemented offline; physical test pending |

@@ -203,6 +203,24 @@ pub enum AudioCommand {
         feedback: f32,
         mix: f32,
     },
+    /// Play the echo line out as a short tail. Live input is captured only for `capture_sec`,
+    /// then the line decays and stops. `restore_*` is what the insert returns to.
+    StartEchoRelease {
+        deck: usize,
+        time_sec: f32,
+        feedback: f32,
+        mix: f32,
+        capture_sec: f32,
+        tail_sec: f32,
+        restore_active: bool,
+        restore_time_sec: f32,
+        restore_feedback: f32,
+        restore_mix: f32,
+    },
+    /// End a release tail immediately and leave the echo insert off.
+    CancelEchoRelease {
+        deck: usize,
+    },
     /// Configure the per-deck reverb insert. Engaging it (false→true) clears the tail.
     SetDeckReverb {
         deck: usize,
@@ -942,6 +960,16 @@ struct DeckFrame {
     post_fader: (f32, f32),
 }
 
+/// One deck's in-flight Release FX echo. The counters are sample clocks, not allocations.
+struct EchoRelease {
+    capture_left: u32,
+    tail_left: u32,
+    restore_active: bool,
+    restore_time: f32,
+    restore_feedback: f32,
+    restore_mix: f32,
+}
+
 /// Per-deck audio state living on the audio thread.
 struct DeckPlayer {
     buffer: Option<Arc<DeckBuffer>>,
@@ -978,6 +1006,8 @@ struct DeckPlayer {
     /// Per-deck effects chain (post-EQ): echo → reverb → flanger → bitcrusher by default,
     /// reorderable and individually bypassable. Pre-allocated on construction.
     fx: FxChain,
+    /// Short echo tail that closes its input gate and then restores or bypasses the insert.
+    echo_release: Option<EchoRelease>,
     loop_active: bool,
     loop_in: f64,
     loop_out: f64,
@@ -1038,6 +1068,7 @@ impl DeckPlayer {
             xfader_assign: XfaderAssign::Thru,
             cue: false,
             fx: FxChain::default_deck(device_rate),
+            echo_release: None,
             loop_active: false,
             loop_in: 0.0,
             loop_out: 0.0,
@@ -1160,6 +1191,71 @@ impl DeckPlayer {
         }
     }
 
+    fn begin_echo_release(&mut self, release: EchoRelease, time_sec: f32, feedback: f32, mix: f32) {
+        let already = self.fx.is_enabled(FX_ECHO);
+        self.fx.set_param(FX_ECHO, 0, mix);
+        self.fx.set_param(FX_ECHO, 1, feedback);
+        self.fx.set_param(FX_ECHO, 2, time_sec / FX_DELAY_MAX_SECS);
+        if already {
+            self.fx.set_enabled_keep(FX_ECHO, true);
+        } else {
+            self.fx.set_enabled(FX_ECHO, true);
+        }
+        self.fx.set_input_gain(FX_ECHO, 1.0);
+        self.echo_release = Some(release);
+    }
+
+    fn cancel_echo_release(&mut self) {
+        if let Some(release) = self.echo_release.as_mut() {
+            release.restore_active = false;
+        }
+        self.finish_echo_release();
+    }
+
+    fn finish_echo_release(&mut self) {
+        let Some(release) = self.echo_release.take() else {
+            return;
+        };
+        self.fx.set_param(FX_ECHO, 0, release.restore_mix);
+        self.fx.set_param(FX_ECHO, 1, release.restore_feedback);
+        self.fx
+            .set_param(FX_ECHO, 2, release.restore_time / FX_DELAY_MAX_SECS);
+        self.fx.clear_slot(FX_ECHO);
+        self.fx.set_enabled_keep(FX_ECHO, release.restore_active);
+    }
+
+    fn pump_silent_release(&mut self) {
+        if self.echo_release.is_none() {
+            return;
+        }
+        let _ = self.fx.process(0.0, 0.0);
+        self.pump_echo_release();
+    }
+
+    fn pump_echo_release(&mut self) {
+        let (capture_done, timed_out) = {
+            let Some(release) = self.echo_release.as_mut() else {
+                return;
+            };
+            if release.capture_left > 0 {
+                release.capture_left -= 1;
+            }
+            release.tail_left = release.tail_left.saturating_sub(1);
+            (release.capture_left == 0, release.tail_left == 0)
+        };
+        if capture_done {
+            self.fx.set_input_gain(FX_ECHO, 0.0);
+        }
+        if timed_out || (capture_done && self.fx.release_is_silent(FX_ECHO)) {
+            self.finish_echo_release();
+        }
+    }
+
+    fn reset_effects(&mut self) {
+        self.echo_release = None;
+        self.fx.reset();
+    }
+
     /// Pull and process one stereo frame. RT-SAFE.
     #[inline]
     fn next_channels(&mut self) -> DeckFrame {
@@ -1167,16 +1263,19 @@ impl DeckPlayer {
         self.fader.advance(); // advance gain smoother even when paused (click-free unpause)
 
         let Some(buf) = self.buffer.as_ref() else {
+            self.pump_silent_release();
             return DeckFrame::default();
         };
         let frames = buf.frames();
         if frames == 0 {
+            self.pump_silent_release();
             return DeckFrame::default();
         }
 
         // Scratching and censor override the transport: both produce audio whether or
         // not the deck was already playing.
         if !self.playing && !self.scratching && !self.censoring {
+            self.pump_silent_release();
             return DeckFrame::default();
         }
         self.skip_silence();
@@ -1234,6 +1333,7 @@ impl DeckPlayer {
         let (l, r) = self.tone.process(l, r);
         // Per-deck FX chain (echo → reverb → flanger → bitcrusher by default), post-EQ.
         let (l, r) = self.fx.process(l, r);
+        self.pump_echo_release();
         // Fader stage: the channel fader / deck gain (post-FX).
         DeckFrame {
             pre_fader: (l, r),
@@ -1944,10 +2044,51 @@ impl Mixer {
                     mix,
                 } => {
                     if let Some(d) = self.decks.get_mut(deck) {
+                        d.echo_release = None;
+                        d.fx.set_input_gain(FX_ECHO, 1.0);
                         d.fx.set_param(FX_ECHO, 0, mix);
                         d.fx.set_param(FX_ECHO, 1, feedback);
                         d.fx.set_param(FX_ECHO, 2, time_sec / FX_DELAY_MAX_SECS);
                         d.fx.set_enabled(FX_ECHO, active); // clears the line on the engage edge
+                    }
+                }
+                AudioCommand::StartEchoRelease {
+                    deck,
+                    time_sec,
+                    feedback,
+                    mix,
+                    capture_sec,
+                    tail_sec,
+                    restore_active,
+                    restore_time_sec,
+                    restore_feedback,
+                    restore_mix,
+                } => {
+                    let rate = self.device_rate.max(1.0);
+                    if let Some(d) = self.decks.get_mut(deck) {
+                        let time_sec = time_sec.clamp(0.02, 0.5);
+                        let feedback = feedback.clamp(0.0, 0.75);
+                        let mix = mix.clamp(0.0, 1.0);
+                        let capture_sec = capture_sec.clamp(0.0, 0.25);
+                        let tail_sec = tail_sec.clamp(capture_sec, 1.25);
+                        d.begin_echo_release(
+                            EchoRelease {
+                                capture_left: (capture_sec * rate) as u32,
+                                tail_left: (tail_sec * rate).ceil().max(1.0) as u32,
+                                restore_active,
+                                restore_time: restore_time_sec.clamp(0.0, FX_DELAY_MAX_SECS),
+                                restore_feedback: restore_feedback.clamp(0.0, 0.95),
+                                restore_mix: restore_mix.clamp(0.0, 1.0),
+                            },
+                            time_sec,
+                            feedback,
+                            mix,
+                        );
+                    }
+                }
+                AudioCommand::CancelEchoRelease { deck } => {
+                    if let Some(d) = self.decks.get_mut(deck) {
+                        d.cancel_echo_release();
                     }
                 }
                 AudioCommand::SetDeckReverb {
@@ -2000,6 +2141,8 @@ impl Mixer {
                         d.fx.set_param(FX_REVERB, 0, rev_mix);
                         d.fx.set_enabled(FX_REVERB, rev_mix > 0.001);
 
+                        d.echo_release = None;
+                        d.fx.set_input_gain(FX_ECHO, 1.0);
                         let echo_mix = meta_map(value, LinkType::LinkedRight);
                         d.fx.set_param(FX_ECHO, 0, echo_mix);
                         d.fx.set_enabled(FX_ECHO, echo_mix > 0.001);
@@ -2126,7 +2269,7 @@ impl Mixer {
                         d.scratch_gain = 0.0;
                         d.keylock.set_active(false);
                         d.keylock.set_pitch_semitones(0.0);
-                        d.fx.reset();
+                        d.reset_effects();
                         d.clear_track_loop();
                         d.cue_point = 0.0;
                         d.cue_previewing = false;
@@ -2394,7 +2537,7 @@ impl Mixer {
                         d.scratch_gain = 0.0;
                         d.keylock.set_active(false);
                         d.keylock.set_pitch_semitones(0.0);
-                        d.fx.reset();
+                        d.reset_effects();
                         d.playhead = 0.0;
                         d.clear_track_loop();
                         d.cue_previewing = false;
@@ -2910,6 +3053,124 @@ mod tests {
             "wrapped to loop_in + overshoot: {}",
             d.playhead
         );
+    }
+
+    #[test]
+    fn echo_release_decays_blocks_later_input_and_does_not_start_playback() {
+        let mut samples = vec![0.0f32; 2 * 48_000];
+        for frame in 0..200 {
+            samples[frame * 2] = 1.0;
+            samples[frame * 2 + 1] = 1.0;
+        }
+        for frame in 1_500..1_800 {
+            samples[frame * 2] = 1.0;
+            samples[frame * 2 + 1] = 1.0;
+        }
+        let buffer = Arc::new(DeckBuffer::new(samples, 48_000));
+
+        let mut paused = DeckPlayer::new(48_000.0);
+        paused.buffer = Some(Arc::clone(&buffer));
+        paused.base_ratio = 1.0;
+        paused.begin_echo_release(
+            EchoRelease {
+                capture_left: 1_000,
+                tail_left: 24_000,
+                restore_active: true,
+                restore_time: 0.25,
+                restore_feedback: 0.4,
+                restore_mix: 0.0,
+            },
+            0.05,
+            0.4,
+            1.0,
+        );
+        for _ in 0..48_000 {
+            let frame = paused.next_channels();
+            assert_eq!(frame.pre_fader, (0.0, 0.0));
+            assert!(!paused.playing);
+            if paused.echo_release.is_none() {
+                break;
+            }
+        }
+        assert!(paused.echo_release.is_none(), "paused tail stayed armed");
+        assert!(paused.fx.is_enabled(FX_ECHO), "latched echo should return");
+        assert!(!paused.playing);
+
+        let mut playing = DeckPlayer::new(48_000.0);
+        playing.buffer = Some(buffer);
+        playing.base_ratio = 1.0;
+        playing.playing = true;
+        playing.begin_echo_release(
+            EchoRelease {
+                capture_left: 250,
+                tail_left: 48_000,
+                restore_active: false,
+                restore_time: 0.25,
+                restore_feedback: 0.4,
+                restore_mix: 0.0,
+            },
+            0.01,
+            0.7,
+            1.0,
+        );
+        let mut early = 0.0f32;
+        let mut late = 0.0f32;
+        for step in 0..2_400 {
+            let level = playing.next_channels().pre_fader.0.abs();
+            if (480..800).contains(&step) {
+                early = early.max(level);
+            }
+            if (1_980..2_300).contains(&step) {
+                late = late.max(level);
+            }
+        }
+        assert!(playing.playing);
+        assert!(
+            playing.echo_release.is_some(),
+            "tail ended before the gate check"
+        );
+        assert!(early > 0.4, "opening echo missing, peak {early}");
+        assert!(
+            late < 0.55,
+            "later live input entered the tail: early {early} late {late}"
+        );
+        for _ in 0..96_000 {
+            playing.next_channels();
+            if playing.echo_release.is_none() {
+                break;
+            }
+        }
+        assert!(playing.echo_release.is_none(), "playing tail stayed armed");
+        assert!(!playing.fx.is_enabled(FX_ECHO));
+        assert!(playing.playing);
+
+        let (mut commands, mut mixer) = mixer_with_commands();
+        mixer.decks[1].buffer = paused.buffer.clone();
+        mixer.decks[1].base_ratio = 1.0;
+        commands
+            .push(AudioCommand::StartEchoRelease {
+                deck: 1,
+                time_sec: 0.18,
+                feedback: 0.42,
+                mix: 0.55,
+                capture_sec: 0.05,
+                tail_sec: 0.4,
+                restore_active: false,
+                restore_time_sec: 0.25,
+                restore_feedback: 0.4,
+                restore_mix: 0.0,
+            })
+            .unwrap();
+        mixer.drain_commands();
+        assert!(!mixer.decks[0].fx.is_enabled(FX_ECHO));
+        assert!(mixer.decks[1].fx.is_enabled(FX_ECHO));
+        assert!(!mixer.decks[0].playing && !mixer.decks[1].playing);
+        for _ in 0..48_000 {
+            mixer.next_buses();
+        }
+        assert!(!mixer.decks[1].fx.is_enabled(FX_ECHO));
+        assert!(mixer.decks[1].echo_release.is_none());
+        assert!(!mixer.decks[0].playing && !mixer.decks[1].playing);
     }
 
     fn ramp_deck() -> DeckPlayer {

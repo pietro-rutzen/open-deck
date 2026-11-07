@@ -170,6 +170,9 @@ pub(crate) struct EffectsSnapshot {
     /// Which preset currently owns each insert, plus the panel parameters to restore.
     #[serde(skip)]
     pad_hold: [[Option<PadHold>; 4]; NUM_DECKS],
+    /// A short echo tail is running on this deck. The audio thread ends it.
+    #[serde(skip)]
+    echo_release: [bool; NUM_DECKS],
 }
 impl Default for EffectsSnapshot {
     fn default() -> Self {
@@ -181,7 +184,37 @@ impl Default for EffectsSnapshot {
             latched: [0; NUM_DECKS],
             pad_owned: [0; NUM_DECKS],
             pad_hold: [[None; 4]; NUM_DECKS],
+            echo_release: [false; NUM_DECKS],
         }
+    }
+}
+
+const RELEASE_FX_SLOT: usize = 31;
+const RELEASE_ECHO_TIME_SEC: f32 = 0.18;
+const RELEASE_ECHO_FEEDBACK: f32 = 0.42;
+const RELEASE_ECHO_MIX: f32 = 0.55;
+const RELEASE_ECHO_CAPTURE_SEC: f32 = 0.18;
+const RELEASE_ECHO_TAIL_SEC: f32 = 0.90;
+
+fn start_echo_release(deck: usize, effects: &DeckEffects, restore_active: bool) -> EngineMsg {
+    let restore_time_sec = (effects.beat_sec * effects.echo.beats) as f32;
+    let restore_feedback = (0.15 + effects.echo.depth * 0.7) as f32;
+    let restore_mix = if restore_active {
+        (effects.echo.depth * 0.5) as f32
+    } else {
+        0.0
+    };
+    EngineMsg::StartEchoRelease {
+        deck,
+        time_sec: RELEASE_ECHO_TIME_SEC,
+        feedback: RELEASE_ECHO_FEEDBACK,
+        mix: RELEASE_ECHO_MIX,
+        capture_sec: RELEASE_ECHO_CAPTURE_SEC,
+        tail_sec: RELEASE_ECHO_TAIL_SEC,
+        restore_active,
+        restore_time_sec,
+        restore_feedback,
+        restore_mix,
     }
 }
 
@@ -197,10 +230,24 @@ const PAD_FX: [Effect; 4] = [
 #[derive(Clone, Copy, Debug)]
 enum PadFxSound {
     Panel(Effect),
-    Echo { beats: f64, depth: f64 },
-    Flanger { beats: f64, depth: f64 },
-    Reverb { size: f64, mix: f64 },
-    Crusher { crush: f64, down: f64 },
+    Echo {
+        beats: f64,
+        depth: f64,
+    },
+    Flanger {
+        beats: f64,
+        depth: f64,
+    },
+    Reverb {
+        size: f64,
+        mix: f64,
+    },
+    Crusher {
+        crush: f64,
+        down: f64,
+    },
+    /// Pad FX2 + SHIFT pad 8. Not an insert preset.
+    Release,
 }
 
 impl PadFxSound {
@@ -211,6 +258,7 @@ impl PadFxSound {
             Self::Flanger { .. } => Effect::Flanger,
             Self::Reverb { .. } => Effect::Reverb,
             Self::Crusher { .. } => Effect::Crusher,
+            Self::Release => Effect::Echo,
         }
     }
 }
@@ -329,10 +377,7 @@ fn pad_fx_sound(slot: usize) -> Option<PadFxSound> {
             size: 0.85,
             mix: 0.2,
         },
-        31 => PadFxSound::Crusher {
-            crush: 0.15,
-            down: 0.5,
-        },
+        RELEASE_FX_SLOT => PadFxSound::Release,
         _ => return None,
     })
 }
@@ -383,6 +428,7 @@ fn apply_pad_sound(deck: &mut DeckEffects, sound: PadFxSound) {
             deck.crusher.down = down;
             deck.crusher.active = true;
         }
+        PadFxSound::Release => {}
     }
 }
 
@@ -494,6 +540,7 @@ impl NativeEffects {
         next.latched[deck] = 0;
         next.pad_owned[deck] = 0;
         next.pad_hold[deck] = [None; 4];
+        next.echo_release[deck] = false;
         let d = &mut next.decks[deck];
         for effect in PAD_FX {
             d.set_active(effect, false);
@@ -518,6 +565,7 @@ impl NativeEffects {
         state.latched = [0; NUM_DECKS];
         state.pad_owned = [0; NUM_DECKS];
         state.pad_hold = [[None; 4]; NUM_DECKS];
+        state.echo_release = [false; NUM_DECKS];
         for d in &mut state.decks {
             for effect in PAD_FX {
                 d.set_active(effect, false);
@@ -617,6 +665,9 @@ impl NativeEffects {
             let on = audible(latched, owned, e);
             d.set_active(e, on);
             send(d.command(deck, e))?;
+        }
+        if effect == Some(Effect::Echo) {
+            next.echo_release[deck] = false;
         }
         next.latched[deck] = latched;
         next.revision = state.revision.wrapping_add(1);
@@ -754,16 +805,33 @@ impl NativeEffects {
                     }
                 }
                 "fx.off_all" => {
-                    next.latched = [0; NUM_DECKS];
-                    next.pad_owned = [0; NUM_DECKS];
                     for deck in 0..NUM_DECKS {
+                        let was_on = next.pad_owned[deck] != 0
+                            || PAD_FX.iter().any(|effect| next.decks[deck].active(*effect));
+                        let tailing = next.echo_release[deck];
+                        next.latched[deck] = 0;
+                        next.pad_owned[deck] = 0;
+                        next.pad_hold[deck] = [None; 4];
                         for effect in PAD_FX {
-                            if let Some(hold) = next.pad_hold[deck][effect.index()].take() {
-                                restore_saved(&mut next.decks[deck], hold.saved, false);
-                            }
                             next.decks[deck].set_active(effect, false);
-                            let command = next.decks[deck].command(deck, effect);
-                            send(command)?;
+                        }
+                        if tailing && !was_on {
+                            next.echo_release[deck] = false;
+                            send(EngineMsg::CancelEchoRelease { deck })?;
+                            for effect in [Effect::Flanger, Effect::Reverb, Effect::Crusher] {
+                                send(next.decks[deck].command(deck, effect))?;
+                            }
+                        } else if was_on {
+                            next.echo_release[deck] = true;
+                            for effect in [Effect::Flanger, Effect::Reverb, Effect::Crusher] {
+                                send(next.decks[deck].command(deck, effect))?;
+                            }
+                            send(start_echo_release(deck, &next.decks[deck], false))?;
+                        } else {
+                            next.echo_release[deck] = false;
+                            for effect in PAD_FX {
+                                send(next.decks[deck].command(deck, effect))?;
+                            }
                         }
                     }
                 }
@@ -789,9 +857,37 @@ impl NativeEffects {
             return Err("Invalid pad FX".into());
         };
         let mut state = self.0.lock().map_err(|e| e.to_string())?;
+        let pressed = value >= 0.5;
+        if matches!(sound, PadFxSound::Release) {
+            if !pressed {
+                return Ok(Some(state.clone()));
+            }
+            let held = state.pad_owned[deck] != 0;
+            let tailing = state.echo_release[deck];
+            if !held && !tailing {
+                return Ok(Some(state.clone()));
+            }
+            let mut next = state.clone();
+            for effect in PAD_FX {
+                let Some(hold) = next.pad_hold[deck][effect.index()].take() else {
+                    continue;
+                };
+                let latched = next.latched[deck] & effect_bit(effect) != 0;
+                restore_saved(&mut next.decks[deck], hold.saved, latched);
+                if effect != Effect::Echo {
+                    send(next.decks[deck].command(deck, effect))?;
+                }
+            }
+            next.pad_owned[deck] = 0;
+            let restore_active = next.decks[deck].echo.active;
+            send(start_echo_release(deck, &next.decks[deck], restore_active))?;
+            next.echo_release[deck] = true;
+            next.revision = state.revision.wrapping_add(1);
+            *state = next;
+            return Ok(Some(state.clone()));
+        }
         let effect = sound.effect();
         let effect_index = effect.index();
-        let pressed = value >= 0.5;
         let current = state.pad_hold[deck][effect_index];
         if pressed {
             if current.is_some_and(|hold| hold.preset == slot as u8) {
@@ -824,6 +920,9 @@ impl NativeEffects {
             }
         }
         next.pad_owned[deck] = hold_bits(&next.pad_hold[deck]);
+        if effect == Effect::Echo {
+            next.echo_release[deck] = false;
+        }
         send(next.decks[deck].command(deck, effect))?;
         next.revision = state.revision.wrapping_add(1);
         *state = next;
@@ -1261,7 +1360,12 @@ mod tests {
     #[test]
     fn every_pad_fx_slot_engages_its_documented_preset_and_releases() {
         assert!(pad_fx_sound(32).is_none());
-        for slot in 0..32 {
+        assert_eq!(RELEASE_FX_SLOT, 31);
+        assert!(matches!(
+            pad_fx_sound(RELEASE_FX_SLOT),
+            Some(PadFxSound::Release)
+        ));
+        for slot in 0..RELEASE_FX_SLOT {
             let sound = pad_fx_sound(slot).expect("documented slot");
             let state = NativeEffects::default();
             let control = format!("deck.1.pad_fx.{slot}");
@@ -1287,10 +1391,221 @@ mod tests {
                     assert_eq!(held.decks[1].crusher.crush, crush);
                     assert_eq!(held.decks[1].crusher.down, down);
                 }
+                PadFxSound::Release => panic!("release pad is outside the preset loop"),
             }
             state.handle(&control, 0.0, |_| Ok(())).unwrap();
             assert!(!state.snapshot().unwrap().decks[1].active(sound.effect()));
         }
+    }
+
+    #[test]
+    fn release_fx_tails_the_held_pad_and_shift_beat_fx_can_cancel_it() {
+        let state = NativeEffects::default();
+        let mut ignored = Vec::new();
+        state
+            .handle("deck.0.pad_fx.31", 1.0, |message| {
+                ignored.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(ignored.is_empty());
+        assert!(!state.snapshot().unwrap().echo_release[0]);
+
+        let mut held = Vec::new();
+        state
+            .handle("deck.0.pad_fx.1", 1.0, |message| {
+                held.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            held[0],
+            EngineMsg::DeckFlanger { active: true, .. }
+        ));
+        state.handle("fx.toggle.0", 1.0, |_| Ok(())).unwrap();
+        assert!(state.snapshot().unwrap().decks[0].echo.active);
+
+        let mut released = Vec::new();
+        state
+            .handle("deck.0.pad_fx.31", 1.0, |message| {
+                released.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(released
+            .iter()
+            .all(|message| !matches!(message, EngineMsg::DeckPlaying { .. })));
+        assert!(matches!(
+            released[0],
+            EngineMsg::DeckFlanger { active: false, .. }
+        ));
+        assert!(matches!(
+            released.last(),
+            Some(EngineMsg::StartEchoRelease {
+                deck: 0,
+                time_sec,
+                feedback,
+                mix,
+                capture_sec,
+                tail_sec,
+                restore_active: true,
+                ..
+            }) if (*time_sec - 0.18).abs() < 1e-6
+                && (*feedback - 0.42).abs() < 1e-6
+                && (*mix - 0.55).abs() < 1e-6
+                && (*capture_sec - 0.18).abs() < 1e-6
+                && (*tail_sec - 0.90).abs() < 1e-6
+        ));
+        let snapshot = state.snapshot().unwrap();
+        assert!(snapshot.echo_release[0]);
+        assert!(!snapshot.echo_release[1]);
+        assert!(snapshot.decks[0].echo.active);
+        assert!(!snapshot.decks[0].flanger.active);
+        assert_eq!(snapshot.decks[0].flanger.beats, 4.0);
+        assert!(!snapshot.decks[1].echo.active);
+        assert_eq!(snapshot.pad_owned[0], 0);
+
+        let mut note_off = Vec::new();
+        for release_value in [0.0, 63.0 / 127.0] {
+            state
+                .handle("deck.0.pad_fx.31", release_value, |message| {
+                    note_off.push(message);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(note_off.is_empty());
+        state
+            .handle("deck.0.pad_fx.1", 0.0, |message| {
+                note_off.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            note_off.is_empty(),
+            "original pad release must not stick an insert"
+        );
+
+        let mut repeated = Vec::new();
+        state
+            .handle("deck.0.pad_fx.31", 1.0, |message| {
+                repeated.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(repeated.len(), 1);
+        assert!(matches!(
+            repeated[0],
+            EngineMsg::StartEchoRelease {
+                deck: 0,
+                restore_active: true,
+                ..
+            }
+        ));
+
+        let mut shift_release = Vec::new();
+        state
+            .handle("fx.off_all", 0.0, |message| {
+                shift_release.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(shift_release.is_empty());
+        assert!(state.snapshot().unwrap().echo_release[0]);
+        state
+            .handle("fx.off_all", 1.0, |message| {
+                shift_release.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(shift_release
+            .iter()
+            .all(|message| !matches!(message, EngineMsg::DeckPlaying { .. })));
+        assert!(shift_release.iter().any(|message| matches!(
+            message,
+            EngineMsg::StartEchoRelease {
+                deck: 0,
+                restore_active: false,
+                ..
+            }
+        )));
+        assert!(!shift_release
+            .iter()
+            .any(|message| matches!(message, EngineMsg::StartEchoRelease { deck: 1, .. })));
+        let cleared = state.snapshot().unwrap();
+        assert!(cleared.echo_release[0]);
+        assert!(!cleared.decks[0].echo.active);
+        assert!((cleared.decks[0].echo.beats - 0.5).abs() < 1e-9);
+
+        let mut cancel = Vec::new();
+        state
+            .handle("fx.off_all", 1.0, |message| {
+                cancel.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(cancel
+            .iter()
+            .any(|message| matches!(message, EngineMsg::CancelEchoRelease { deck: 0 })));
+        assert!(!state.snapshot().unwrap().echo_release[0]);
+        let mut idle = Vec::new();
+        state
+            .handle("fx.off_all", 1.0, |message| {
+                idle.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(idle.len(), NUM_DECKS * 4);
+        assert!(idle.iter().all(|message| !matches!(
+            message,
+            EngineMsg::StartEchoRelease { .. }
+                | EngineMsg::CancelEchoRelease { .. }
+                | EngineMsg::DeckPlaying { .. }
+        )));
+    }
+
+    #[test]
+    fn shift_beat_fx_release_is_isolated_and_a_second_press_cancels_the_tail() {
+        let state = NativeEffects::default();
+        state.handle("fx.toggle.1", 1.0, |_| Ok(())).unwrap();
+        let mut first = Vec::new();
+        state
+            .handle("fx.off_all", 1.0, |message| {
+                first.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(first
+            .iter()
+            .all(|message| !matches!(message, EngineMsg::DeckPlaying { .. })));
+        assert!(first.iter().any(|message| matches!(
+            message,
+            EngineMsg::StartEchoRelease {
+                deck: 1,
+                restore_active: false,
+                ..
+            }
+        )));
+        assert!(!first
+            .iter()
+            .any(|message| matches!(message, EngineMsg::StartEchoRelease { deck: 0, .. })));
+        let snapshot = state.snapshot().unwrap();
+        assert!(snapshot.echo_release[1]);
+        assert!(!snapshot.echo_release[0]);
+        assert!(!snapshot.decks[1].echo.active);
+        assert!((snapshot.decks[1].echo.depth - 0.5).abs() < 1e-9);
+        let mut second = Vec::new();
+        state
+            .handle("fx.off_all", 1.0, |message| {
+                second.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(second
+            .iter()
+            .any(|message| matches!(message, EngineMsg::CancelEchoRelease { deck: 1 })));
+        assert!(!state.snapshot().unwrap().echo_release[1]);
+        assert!(!state.snapshot().unwrap().decks[0].echo.active);
     }
 
     #[test]

@@ -23,6 +23,12 @@ pub trait Effect: Send {
     fn param_count(&self) -> usize;
     /// Stable identifier for the effect kind (for UI / persistence).
     fn name(&self) -> &'static str;
+    /// Scale the live signal written into an effect that can hold a tail. Ignored by default.
+    fn set_input_gain(&mut self, _gain: f32) {}
+    /// True when a gated tail has fallen silent. False for effects that do not hold one.
+    fn release_is_silent(&self) -> bool {
+        false
+    }
 }
 
 /// Max echo time the delay effect maps `time` to (matches the deck's pre-allocated line).
@@ -50,6 +56,12 @@ impl Effect for Delay {
     }
     fn name(&self) -> &'static str {
         "echo"
+    }
+    fn set_input_gain(&mut self, gain: f32) {
+        Delay::set_input_gain(self, gain);
+    }
+    fn release_is_silent(&self) -> bool {
+        Delay::release_is_silent(self)
     }
 }
 
@@ -194,6 +206,33 @@ impl FxChain {
             s.enabled = false;
             s.effect.clear();
         }
+    }
+
+    /// Engage a slot without wiping a tail that is already in its buffer. RT-SAFE.
+    pub fn set_enabled_keep(&mut self, slot: usize, enabled: bool) {
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.enabled = enabled;
+        }
+    }
+
+    /// Zero one slot's buffer. A single bounded clear, not a per-sample call. RT-SAFE.
+    pub fn clear_slot(&mut self, slot: usize) {
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.effect.clear();
+        }
+    }
+
+    /// Close or open the live input of a slot that can decay on its own. RT-SAFE.
+    pub fn set_input_gain(&mut self, slot: usize, gain: f32) {
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.effect.set_input_gain(gain);
+        }
+    }
+
+    pub fn release_is_silent(&self, slot: usize) -> bool {
+        self.slots
+            .get(slot)
+            .is_some_and(|s| s.effect.release_is_silent())
     }
 
     /// Set a normalized parameter on a slot's effect. RT-SAFE.

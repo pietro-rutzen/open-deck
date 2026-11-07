@@ -147,6 +147,21 @@ enum EngineMsg {
         feedback: f32,
         mix: f32,
     },
+    StartEchoRelease {
+        deck: usize,
+        time_sec: f32,
+        feedback: f32,
+        mix: f32,
+        capture_sec: f32,
+        tail_sec: f32,
+        restore_active: bool,
+        restore_time_sec: f32,
+        restore_feedback: f32,
+        restore_mix: f32,
+    },
+    CancelEchoRelease {
+        deck: usize,
+    },
     DeckReverb {
         deck: usize,
         active: bool,
@@ -691,6 +706,32 @@ fn spawn_engine() -> EngineHandle {
                         feedback,
                         mix,
                     },
+                    EngineMsg::StartEchoRelease {
+                        deck,
+                        time_sec,
+                        feedback,
+                        mix,
+                        capture_sec,
+                        tail_sec,
+                        restore_active,
+                        restore_time_sec,
+                        restore_feedback,
+                        restore_mix,
+                    } => AudioCommand::StartEchoRelease {
+                        deck,
+                        time_sec,
+                        feedback,
+                        mix,
+                        capture_sec,
+                        tail_sec,
+                        restore_active,
+                        restore_time_sec,
+                        restore_feedback,
+                        restore_mix,
+                    },
+                    EngineMsg::CancelEchoRelease { deck } => {
+                        AudioCommand::CancelEchoRelease { deck }
+                    }
                     EngineMsg::DeckReverb {
                         deck,
                         active,

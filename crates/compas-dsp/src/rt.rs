@@ -401,6 +401,10 @@ pub struct Delay {
     glide_coeff: f32,
     feedback: f32,
     mix: f32,
+    /// 1 feeds the live input. 0 keeps the line decaying on feedback alone.
+    input_gain: f32,
+    /// Consecutive gated writes that were already silent.
+    silent_run: u32,
 }
 
 impl Delay {
@@ -421,6 +425,8 @@ impl Delay {
             glide_coeff,
             feedback: 0.4,
             mix: 0.0,
+            input_gain: 1.0,
+            silent_run: 0,
         }
     }
 
@@ -444,6 +450,21 @@ impl Delay {
         self.mix = mix.clamp(0.0, 1.0);
     }
 
+    /// How much of the live input enters the delay line. `0` leaves the existing audio to decay.
+    #[inline]
+    pub fn set_input_gain(&mut self, gain: f32) {
+        self.input_gain = gain.clamp(0.0, 1.0);
+        if self.input_gain > 0.0 {
+            self.silent_run = 0;
+        }
+    }
+
+    /// True once a gated line has written silence for about 20 ms.
+    #[inline]
+    pub fn release_is_silent(&self) -> bool {
+        self.input_gain == 0.0 && self.silent_run > (self.sample_rate * 0.02) as u32
+    }
+
     /// Zero the delay line — call when (re)engaging the effect so audio from a previous
     /// on-period doesn't burst back. A bounded memset; intended for occasional control
     /// events, not per-sample use.
@@ -452,6 +473,8 @@ impl Delay {
         self.right.iter_mut().for_each(|s| *s = 0.0);
         self.cur_samples = self.target_samples;
         self.write = 0;
+        self.input_gain = 1.0;
+        self.silent_run = 0;
     }
 
     /// Process one stereo frame, returning the wet/dry mix. RT-SAFE.
@@ -475,8 +498,15 @@ impl Delay {
         let wet_r = self.right[i0] + (self.right[i1] - self.right[i0]) * frac;
 
         // Feed input + feedback back into the line at the write head.
-        self.left[self.write] = in_l + wet_l * self.feedback;
-        self.right[self.write] = in_r + wet_r * self.feedback;
+        let written_l = in_l * self.input_gain + wet_l * self.feedback;
+        let written_r = in_r * self.input_gain + wet_r * self.feedback;
+        self.left[self.write] = written_l;
+        self.right[self.write] = written_r;
+        if self.input_gain == 0.0 && written_l.abs() < 1.0e-4 && written_r.abs() < 1.0e-4 {
+            self.silent_run = self.silent_run.saturating_add(1);
+        } else if self.input_gain == 0.0 {
+            self.silent_run = 0;
+        }
         self.write = if self.write + 1 == self.capacity {
             0
         } else {
@@ -1423,6 +1453,44 @@ mod tests {
             second > 0.1 && second < first,
             "second echo {second} should be a decayed {first}"
         );
+    }
+
+    #[test]
+    fn delay_release_gate_blocks_new_input_and_the_tail_ends() {
+        let sr = 48_000.0;
+        let mut delay = Delay::new(sr, 1.0);
+        delay.set_time_sec(0.01);
+        delay.set_feedback(0.5);
+        delay.set_mix(1.0);
+        delay.clear();
+        delay.process(1.0, 1.0);
+        for _ in 0..480 {
+            delay.process(0.0, 0.0);
+        }
+        delay.set_input_gain(0.0);
+        let mut early = 0.0f32;
+        let mut late = 0.0f32;
+        for step in 0..4_800 {
+            let level = delay.process(1.0, 1.0).0.abs();
+            if step < 480 {
+                early = early.max(level);
+            } else if step >= 2_400 {
+                late = late.max(level);
+            }
+        }
+        assert!(early > 0.2, "expected a decaying echo, peak {early}");
+        assert!(early < 0.95, "gated live input entered the line at {early}");
+        assert!(
+            late < early * 0.5,
+            "tail did not decay: early {early} late {late}"
+        );
+        let mut steps = 0;
+        while !delay.release_is_silent() && steps < 48_000 {
+            delay.process(1.0, 1.0);
+            steps += 1;
+        }
+        assert!(delay.release_is_silent(), "tail did not go silent");
+        assert!(delay.process(1.0, 1.0).0.abs() < 1.0e-3);
     }
 
     #[test]
