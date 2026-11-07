@@ -13,13 +13,44 @@ export interface TrackVisuals {
 }
 type VisualState = { status: "loading" | "ready" | "unavailable"; data?: TrackVisuals };
 type Listener = (state: VisualState) => void;
-type Job = { path: string; listeners: Set<Listener>; started: boolean; priority: number };
-// Shared by row thumbnails and the inspector: bounded decoded-result cache and one worker (matching the backend visual-analysis guard).
+type Job = {
+  path: string;
+  listeners: Set<Listener>;
+  started: boolean;
+  priority: number;
+  order: number;
+  attempts: number;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+// Shared by row thumbnails and the inspector. One decode runs at a time, matching
+// the backend guard. A busy rejection stays pending and retries; it is not remembered.
+export const VISUAL_ATTEMPT_LIMIT = 4;
+const VISUAL_RETRY_BASE_MS = 40;
+const VISUAL_RETRY_CAP_MS = 800;
 const cache = new Map<string, VisualState>();
 const jobs = new Map<string, Job>();
 let active = 0;
+let nextOrder = 0;
 let cacheBytes = 0;
 const CACHE_BYTE_LIMIT = 12 * 1024 * 1024;
+
+export function visualRetryDelayMs(completedAttempts: number): number {
+  const exponent = Math.min(8, Math.max(0, completedAttempts - 1));
+  return Math.min(VISUAL_RETRY_CAP_MS, VISUAL_RETRY_BASE_MS * 2 ** exponent);
+}
+
+function visualFailureText(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
+    return error.message;
+  }
+  return "";
+}
+
+function isBusyVisualError(error: unknown): boolean {
+  return visualFailureText(error).includes("Track visuals are busy");
+}
 function stateBytes(state: VisualState): number {
   const d = state.data;
   return d ? (d.artwork_data_url?.length ?? 0) * 2 + d.peaks.length * 8 + (d.band_peaks?.length ?? 0) * 24 + 8192 : 256;
@@ -39,24 +70,58 @@ function remember(path: string, state: VisualState) {
     if (cache.size === 0) cacheBytes = 0;
   }
 }
+function publish(job: Job, state: VisualState, rememberResult: boolean) {
+  if (rememberResult) remember(job.path, state);
+  for (const notify of job.listeners) notify(state);
+  if (job.timer != null) {
+    clearTimeout(job.timer);
+    job.timer = null;
+  }
+  jobs.delete(job.path);
+}
+
+function releaseWorker(job: Job) {
+  job.started = false;
+  active = Math.max(0, active - 1);
+}
+
 function pump() {
-  for (const job of [...jobs.values()].sort((a, b) => b.priority - a.priority)) {
+  const ordered = [...jobs.values()].sort(
+    (left, right) => right.priority - left.priority || left.attempts - right.attempts || left.order - right.order,
+  );
+  for (const job of ordered) {
     if (active >= 1) return;
-    if (job.started || !job.listeners.size) continue;
+    if (job.started || job.timer != null || !job.listeners.size) continue;
     job.started = true;
-    active++;
+    job.attempts += 1;
+    active += 1;
     invoke<TrackVisuals>("track_visuals", { path: job.path })
-      .then((data): VisualState => ({ status: "ready", data }))
-      .catch((): VisualState => ({ status: "unavailable" }))
-      .then((state) => {
-        remember(job.path, state);
-        for (const notify of job.listeners) notify(state);
-      })
-      .finally(() => {
-        jobs.delete(job.path);
-        active--;
-        pump();
-      });
+      .then(
+        (data) => {
+          releaseWorker(job);
+          publish(job, { status: "ready", data }, true);
+          pump();
+        },
+        (error: unknown) => {
+          releaseWorker(job);
+          const retry = isBusyVisualError(error) && job.attempts < VISUAL_ATTEMPT_LIMIT && job.listeners.size > 0;
+          if (!retry) {
+            publish(job, { status: "unavailable" }, !isBusyVisualError(error));
+            pump();
+            return;
+          }
+          for (const notify of job.listeners) notify({ status: "loading" });
+          job.timer = setTimeout(() => {
+            job.timer = null;
+            if (!job.listeners.size) {
+              jobs.delete(job.path);
+              return;
+            }
+            pump();
+          }, visualRetryDelayMs(job.attempts));
+          pump();
+        },
+      );
   }
 }
 function subscribe(path: string, listener: Listener, priority = 0) {
@@ -72,7 +137,8 @@ function subscribe(path: string, listener: Listener, priority = 0) {
   }
   let job = jobs.get(path);
   if (!job) {
-    job = { path, listeners: new Set(), started: false, priority };
+    job = { path, listeners: new Set(), started: false, priority, order: nextOrder, attempts: 0, timer: null };
+    nextOrder += 1;
     jobs.set(path, job);
   }
   job.priority = Math.max(job.priority, priority);
@@ -80,7 +146,12 @@ function subscribe(path: string, listener: Listener, priority = 0) {
   pump();
   return () => {
     job.listeners.delete(listener);
-    if (!job.started && !job.listeners.size) jobs.delete(path);
+    if (job.listeners.size) return;
+    if (job.timer != null) {
+      clearTimeout(job.timer);
+      job.timer = null;
+    }
+    if (!job.started) jobs.delete(path);
   };
 }
 export function useTrackVisuals(path: string | null, enabled = true, includeArtwork = true, priority = includeArtwork ? 1 : 0): VisualState {
