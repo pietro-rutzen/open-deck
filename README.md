@@ -29,7 +29,7 @@ The bundled profile includes play, cue, sync, tempo, trim, three-band EQ, filter
 
 Jog wheels and channel faders are implemented. They are not unsupported. This repository also does not contain an independent physical sign-off for them. Headphones can use channels 3/4 on the same device as the master, or a separate output. The owner confirmed headphone cue on the FLX4 during setup. Clock recovery and every failure path are not fully qualified.
 
-Not implemented on the controller: keyboard mode, stem pads, Pad FX, Smart CFX, and Smart Fader. The written control list, including checks that are still open, is [docs/testing/FLX4_FUNCTIONALITY_AUDIT.md](docs/testing/FLX4_FUNCTIONALITY_AUDIT.md).
+Pad FX1 pads 1–4 hold this app's echo, flanger, reverb, and bit-crusher on that deck while the pad is down, and release them when the pad comes up or the deck leaves Pad FX1. That is not a rekordbox Pad FX preset. Pads 5–8, the shifted Pad FX layer, and every Pad FX2 pad are not mapped. Keyboard mode, stem pads, Smart CFX, and Smart Fader are not implemented. None of the pad-FX behavior has a physical FLX4 test. The written control list, including checks that are still open, is [docs/testing/FLX4_FUNCTIONALITY_AUDIT.md](docs/testing/FLX4_FUNCTIONALITY_AUDIT.md).
 
 ## Run it on this Mac
 

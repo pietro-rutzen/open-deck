@@ -11,7 +11,7 @@ Address inventory below covers every control entry in that mapping, including sh
 
 ## Important remaining gaps
 
-Not implemented: Pad FX 1/2, keyboard mode and stems, Smart CFX/Smart Fader. SHIFT+PLAY censor, SHIFT+LOOP IN/OUT boundary adjust via jog, SHIFT beat-jump size ×16, tempo-range cycling (SHIFT+SYNC), deck SHIFT buttons, the cue-point LED, track-loaded LEDs and beat-loop shift-layer LEDs are implemented below; every one of them still needs a physical FLX4 test (NOT RUN). Beat FX drives OpenDeck's per-deck echo/flanger/reverb/crusher inserts, not rekordbox's Beat FX DSP or master-channel FX position. Sampler pads share OpenDeck's 8 sampler slots across both decks and do not load or eject tracks. Hot cues follow OpenDeck set/seek semantics rather than rekordbox hold-to-preview. The second cue/play indicator address `90/91 47` stays dark because the same bytes are listed for both indicators. Unsupported controls must not be called working.
+Not implemented: Pad FX1 pads 5–8, the shifted Pad FX layer, Pad FX2 pads, keyboard mode and stems, Smart CFX/Smart Fader. Pad FX1 pads 1–4 hold Open Deck's echo, flanger, reverb, and bit-crusher while pressed. That assignment is not a rekordbox preset, and it has no physical test. SHIFT+PLAY censor, SHIFT+LOOP IN/OUT boundary adjust via jog, SHIFT beat-jump size ×16, tempo-range cycling (SHIFT+SYNC), deck SHIFT buttons, the cue-point LED, track-loaded LEDs and beat-loop shift-layer LEDs are implemented below; every one of them still needs a physical FLX4 test (NOT RUN). Beat FX drives OpenDeck's per-deck echo/flanger/reverb/crusher inserts, not rekordbox's Beat FX DSP or master-channel FX position. Sampler pads share OpenDeck's 8 sampler slots across both decks and do not load or eject tracks. Hot cues follow OpenDeck set/seek semantics rather than rekordbox hold-to-preview. The second cue/play indicator address `90/91 47` stays dark because the same bytes are listed for both indicators. Unsupported controls must not be called working.
 
 Hot cue, beat loop, loop in/out, beat jump, quantize, sync, and sampler trigger/stop are applied on the controller thread at the press. Key shift and Beat FX still execute through frontend state. Engine command acknowledgements are still absent. Physical timing against a reference player is NOT RUN.
 
@@ -148,10 +148,13 @@ Hot cue, beat loop, loop in/out, beat jump, quantize, sync, and sampler trigger/
 | HOT CUE MODE (DECK2) - press - set hotcue mode | `91 1B` | Supported pad-mode LED | Implemented; physical test pending |
 | KEYBOARD MODE (DECK1) - press - set keyboard mode | `90 69` | — | Not implemented |
 | KEYBOARD MODE (DECK2) - press - set keyboard mode | `91 69` | — | Not implemented |
-| PAD FX1 MODE (DECK1) - press - set pad fx1 mode | `90 1E` | — | Not implemented |
-| PAD FX1 MODE (DECK2) - press - set pad fx1 mode | `91 1E` | — | Not implemented |
-| PAD FX2 MODE (DECK1) - press - set pad fx2 mode | `90 6B` | — | Not implemented |
-| PAD FX2 MODE (DECK2) - press - set pad fx2 mode | `91 6B` | — | Not implemented |
+| PAD FX1 MODE (DECK1) - press - set pad fx1 mode | `90 1E` | Pad-mode latch; leaving it releases held Pad FX1 inserts | Implemented offline; physical test pending |
+| PAD FX1 MODE (DECK2) - press - set pad fx1 mode | `91 1E` | Pad-mode latch; leaving it releases held Pad FX1 inserts | Implemented offline; physical test pending |
+| PAD FX2 MODE (DECK1) - press - set pad fx2 mode | `90 6B` | Pad-mode latch only | Mode button only. Its pads are not mapped. Physical test pending |
+| PAD FX2 MODE (DECK2) - press - set pad fx2 mode | `91 6B` | Pad-mode latch only | Mode button only. Its pads are not mapped. Physical test pending |
+| PAD 1–4 (DECK1) PAD FX1 - hold - Open Deck echo, flanger, reverb, bit-crusher | `97 10`–`97 13` | deck.0.pad_fx.0–3 | Hold enables, release disables. Not a rekordbox preset. Physical test pending |
+| PAD 1–4 (DECK2) PAD FX1 - hold - Open Deck echo, flanger, reverb, bit-crusher | `99 10`–`99 13` | deck.1.pad_fx.0–3 | Hold enables, release disables. Not a rekordbox preset. Physical test pending |
+| PAD 5–8 and SHIFT PAD FX1, and all PAD FX2 pads | `97/99 14`–`17`, `98/9A 10`–`17`, `97/99 50`–`57` | — | Not mapped |
 | BEAT JUMP MODE (DECK1) - press - set beat jump mode | `90 20` | Supported pad-mode LED | Implemented; physical test pending |
 | BEAT JUMP MODE (DECK2) - press - set beat jump mode | `91 20` | Supported pad-mode LED | Implemented; physical test pending |
 | BEAT LOOP MODE (DECK1) - press - set beat loop mode | `90 6D` | Supported pad-mode LED | Implemented; physical test pending |

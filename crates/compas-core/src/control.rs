@@ -380,6 +380,14 @@ impl Registry {
                     Unit::Boolean,
                 ));
             }
+            for pad in 0..4 {
+                r.add(ControlSpec::new(
+                    p(&format!("pad_fx.{pad}")),
+                    Behavior::Toggle,
+                    "Pad FX",
+                    Unit::Boolean,
+                ));
+            }
             for pad in 0..8 {
                 for action in ["hotcue", "clear_hotcue", "beatloop", "beatjump"] {
                     r.add(ControlSpec::new(

@@ -153,6 +153,12 @@ pub(crate) struct EffectsSnapshot {
     pub effect: Effect,
     pub deck: usize,
     pub decks: [DeckEffects; NUM_DECKS],
+    /// Beat FX and the effect panel. Separate from a pad that is physically held.
+    #[serde(skip)]
+    latched: [u8; NUM_DECKS],
+    /// Inserts a Pad FX pad turned on and must turn off on release or mode exit.
+    #[serde(skip)]
+    pad_owned: [u8; NUM_DECKS],
 }
 impl Default for EffectsSnapshot {
     fn default() -> Self {
@@ -161,8 +167,34 @@ impl Default for EffectsSnapshot {
             effect: Effect::Echo,
             deck: 0,
             decks: [DeckEffects::default(); NUM_DECKS],
+            latched: [0; NUM_DECKS],
+            pad_owned: [0; NUM_DECKS],
         }
     }
+}
+
+const PAD_FX: [Effect; 4] = [
+    Effect::Echo,
+    Effect::Flanger,
+    Effect::Reverb,
+    Effect::Crusher,
+];
+
+fn effect_bit(effect: Effect) -> u8 {
+    1 << effect.index()
+}
+
+fn set_latch(latched: &mut u8, effect: Effect, on: bool) {
+    let bit = effect_bit(effect);
+    if on {
+        *latched |= bit;
+    } else {
+        *latched &= !bit;
+    }
+}
+
+fn audible(latched: u8, owned: u8, effect: Effect) -> bool {
+    (latched | owned) & effect_bit(effect) != 0
 }
 /// Typed UI update. Update one effect only; never replace an entire deck using a stale UI snapshot.
 #[derive(Clone, Copy, Deserialize)]
@@ -222,13 +254,10 @@ impl NativeEffects {
         }
         let mut state = self.0.lock().map_err(|e| e.to_string())?;
         let mut next = state.clone();
+        next.latched[deck] = 0;
+        next.pad_owned[deck] = 0;
         let d = &mut next.decks[deck];
-        for effect in [
-            Effect::Echo,
-            Effect::Flanger,
-            Effect::Reverb,
-            Effect::Crusher,
-        ] {
+        for effect in PAD_FX {
             d.set_active(effect, false);
             send(d.command(deck, effect))?;
         }
@@ -246,13 +275,10 @@ impl NativeEffects {
     /// replacing the engine and resetting this memory; no engine commands are sent here.
     pub(crate) fn reset_all(&self) -> Result<EffectsSnapshot, String> {
         let mut state = self.0.lock().map_err(|e| e.to_string())?;
+        state.latched = [0; NUM_DECKS];
+        state.pad_owned = [0; NUM_DECKS];
         for d in &mut state.decks {
-            for effect in [
-                Effect::Echo,
-                Effect::Flanger,
-                Effect::Reverb,
-                Effect::Crusher,
-            ] {
+            for effect in PAD_FX {
                 d.set_active(effect, false);
             }
             d.pitch_shift = 0.0;
@@ -274,6 +300,8 @@ impl NativeEffects {
         }
         let mut state = self.0.lock().map_err(|e| e.to_string())?;
         let mut next = state.clone();
+        let mut latched = next.latched[deck];
+        let owned = next.pad_owned[deck];
         let d = &mut next.decks[deck];
         let effect = match update {
             EffectUpdate::Echo {
@@ -339,8 +367,13 @@ impl NativeEffects {
             }
         };
         if let Some(e) = effect {
+            let requested = d.active(e);
+            set_latch(&mut latched, e, requested);
+            let on = audible(latched, owned, e);
+            d.set_active(e, on);
             send(d.command(deck, e))?;
         }
+        next.latched[deck] = latched;
         next.revision = state.revision.wrapping_add(1);
         *state = next;
         Ok(state.clone())
@@ -361,6 +394,9 @@ impl NativeEffects {
                 .map(|p| (deck, true, p))
                 .or_else(|| name.strip_prefix("key_shift.").map(|p| (deck, false, p)))
         });
+        if let Some((deck, slot)) = pad_fx_target(control) {
+            return self.hold_pad_fx(deck, slot, value, send);
+        }
         if !control.starts_with("fx.") && pitch.is_none() {
             return Ok(None);
         }
@@ -404,9 +440,15 @@ impl NativeEffects {
                 .ok_or("Invalid FX deck")?;
             next.deck = deck;
             if operation == "toggle" {
+                let effect = next.effect;
+                let mut latched = next.latched[deck];
+                let was_latched = latched & effect_bit(effect) != 0;
+                set_latch(&mut latched, effect, !was_latched);
+                next.latched[deck] = latched;
+                let on = audible(latched, next.pad_owned[deck], effect);
                 let d = &mut next.decks[deck];
-                d.set_active(next.effect, !d.active(next.effect));
-                send(d.command(deck, next.effect))?;
+                d.set_active(effect, on);
+                send(d.command(deck, effect))?;
             }
         } else {
             match control {
@@ -424,13 +466,21 @@ impl NativeEffects {
                 "fx.next" | "fx.prev" => {
                     let old = next.effect;
                     next.effect = old.cycle(if control == "fx.next" { 1 } else { -1 });
-                    for (deck, d) in next.decks.iter_mut().enumerate() {
-                        if d.active(old) {
-                            d.set_active(old, false);
-                            send(d.command(deck, old))?;
-                            if !d.active(next.effect) {
-                                d.set_active(next.effect, true);
-                                send(d.command(deck, next.effect))?;
+                    for deck in 0..NUM_DECKS {
+                        if next.latched[deck] & effect_bit(old) == 0 {
+                            continue;
+                        }
+                        let mut latched = next.latched[deck];
+                        set_latch(&mut latched, old, false);
+                        set_latch(&mut latched, next.effect, true);
+                        next.latched[deck] = latched;
+                        let owned = next.pad_owned[deck];
+                        let d = &mut next.decks[deck];
+                        for effect in [old, next.effect] {
+                            let on = audible(latched, owned, effect);
+                            if d.active(effect) != on {
+                                d.set_active(effect, on);
+                                send(d.command(deck, effect))?;
                             }
                         }
                     }
@@ -456,13 +506,10 @@ impl NativeEffects {
                     }
                 }
                 "fx.off_all" => {
+                    next.latched = [0; NUM_DECKS];
+                    next.pad_owned = [0; NUM_DECKS];
                     for (deck, d) in next.decks.iter_mut().enumerate() {
-                        for e in [
-                            Effect::Echo,
-                            Effect::Flanger,
-                            Effect::Reverb,
-                            Effect::Crusher,
-                        ] {
+                        for e in PAD_FX {
                             // Macro/legacy controls may have enabled slots outside this state.
                             // Panic-off must bypass every slot, even when already marked off.
                             d.set_active(e, false);
@@ -477,6 +524,75 @@ impl NativeEffects {
         *state = next;
         Ok(Some(state.clone()))
     }
+
+    fn hold_pad_fx(
+        &self,
+        deck: usize,
+        slot: usize,
+        value: f64,
+        mut send: impl FnMut(EngineMsg) -> Result<(), String>,
+    ) -> Result<Option<EffectsSnapshot>, String> {
+        if deck >= NUM_DECKS || slot >= PAD_FX.len() || !value.is_finite() {
+            return Err("Invalid pad FX".into());
+        }
+        let mut state = self.0.lock().map_err(|e| e.to_string())?;
+        let effect = PAD_FX[slot];
+        let bit = effect_bit(effect);
+        let pressed = value >= 0.5;
+        let mut next = state.clone();
+        if pressed {
+            if next.pad_owned[deck] & bit != 0 || next.decks[deck].active(effect) {
+                return Ok(Some(state.clone()));
+            }
+            next.pad_owned[deck] |= bit;
+            next.decks[deck].set_active(effect, true);
+        } else {
+            if next.pad_owned[deck] & bit == 0 {
+                return Ok(Some(state.clone()));
+            }
+            next.pad_owned[deck] &= !bit;
+            let on = next.latched[deck] & bit != 0;
+            next.decks[deck].set_active(effect, on);
+        }
+        send(next.decks[deck].command(deck, effect))?;
+        next.revision = state.revision.wrapping_add(1);
+        *state = next;
+        Ok(Some(state.clone()))
+    }
+
+    /// Drop every pad-owned insert on one deck. A Beat FX latch stays on.
+    pub(crate) fn release_pad_fx(
+        &self,
+        deck: usize,
+        mut send: impl FnMut(EngineMsg) -> Result<(), String>,
+    ) -> Result<Option<EffectsSnapshot>, String> {
+        if deck >= NUM_DECKS {
+            return Err("Invalid pad FX deck".into());
+        }
+        let mut state = self.0.lock().map_err(|e| e.to_string())?;
+        if state.pad_owned[deck] == 0 {
+            return Ok(None);
+        }
+        let mut next = state.clone();
+        next.pad_owned[deck] = 0;
+        for effect in PAD_FX {
+            let on = audible(next.latched[deck], 0, effect);
+            let d = &mut next.decks[deck];
+            if d.active(effect) != on {
+                d.set_active(effect, on);
+                send(d.command(deck, effect))?;
+            }
+        }
+        next.revision = state.revision.wrapping_add(1);
+        *state = next;
+        Ok(Some(state.clone()))
+    }
+}
+
+fn pad_fx_target(control: &str) -> Option<(usize, usize)> {
+    let (deck, name) = control.strip_prefix("deck.")?.split_once('.')?;
+    let slot = name.strip_prefix("pad_fx.")?;
+    Some((deck.parse().ok()?, slot.parse().ok()?))
 }
 
 #[cfg(test)]
@@ -723,6 +839,76 @@ mod tests {
         assert!(!state.snapshot().unwrap().decks[0].echo.active);
         assert!(state
             .handle("deck.0.play", 1.0, |_| panic!("unowned"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pad_fx_hold_follows_the_pad_deck_and_releases_without_clearing_a_latch() {
+        let state = NativeEffects::default();
+        let mut sent = Vec::new();
+        state
+            .handle("deck.0.pad_fx.0", 1.0, |message| {
+                sent.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            sent[0],
+            EngineMsg::DeckEcho {
+                deck: 0,
+                active: true,
+                time_sec,
+                feedback,
+                mix
+            } if (time_sec - 0.25).abs() < 1e-6
+                && (feedback - 0.5).abs() < 1e-6
+                && (mix - 0.25).abs() < 1e-6
+        ));
+        state.handle("deck.1.pad_fx.2", 1.0, |_| Ok(())).unwrap();
+        let held = state.snapshot().unwrap();
+        assert!(held.decks[0].echo.active);
+        assert!(!held.decks[1].echo.active);
+        assert!(held.decks[1].reverb.active);
+        assert!(!held.decks[0].reverb.active);
+        state.handle("deck.0.pad_fx.0", 0.0, |_| Ok(())).unwrap();
+        assert!(!state.snapshot().unwrap().decks[0].echo.active);
+        assert!(state.snapshot().unwrap().decks[1].reverb.active);
+
+        state.handle("fx.toggle.0", 1.0, |_| Ok(())).unwrap();
+        state.handle("deck.0.pad_fx.0", 1.0, |_| Ok(())).unwrap();
+        state.handle("deck.0.pad_fx.0", 0.0, |_| Ok(())).unwrap();
+        assert!(state.snapshot().unwrap().decks[0].echo.active);
+
+        state.handle("deck.0.pad_fx.1", 1.0, |_| Ok(())).unwrap();
+        state.handle("deck.0.pad_fx.3", 1.0, |_| Ok(())).unwrap();
+        let released = state.release_pad_fx(0, |_| Ok(())).unwrap().unwrap();
+        assert!(released.decks[0].echo.active);
+        assert!(!released.decks[0].flanger.active);
+        assert!(!released.decks[0].crusher.active);
+        assert!(released.decks[1].reverb.active);
+        state.release_pad_fx(1, |_| Ok(())).unwrap();
+        assert!(!state.snapshot().unwrap().decks[1].reverb.active);
+    }
+
+    #[test]
+    fn pad_fx_hold_does_not_follow_beat_fx_select_and_a_failed_send_does_not_stick() {
+        let state = NativeEffects::default();
+        state.handle("deck.0.pad_fx.0", 1.0, |_| Ok(())).unwrap();
+        let selected = state.handle("fx.next", 1.0, |_| Ok(())).unwrap().unwrap();
+        assert_eq!(selected.effect, Effect::Flanger);
+        assert!(selected.decks[0].echo.active);
+        assert!(!selected.decks[0].flanger.active);
+        assert!(state.handle("deck.0.pad_fx.4", 1.0, |_| Ok(())).is_err());
+        assert!(state.handle("deck.4.pad_fx.0", 1.0, |_| Ok(())).is_err());
+        let before = state.snapshot().unwrap().revision;
+        assert!(state
+            .handle("deck.1.pad_fx.0", 1.0, |_| Err("offline".into()))
+            .is_err());
+        assert_eq!(state.snapshot().unwrap().revision, before);
+        assert!(!state.snapshot().unwrap().decks[1].echo.active);
+        assert!(state
+            .release_pad_fx(1, |_| panic!("nothing held"))
             .unwrap()
             .is_none());
     }

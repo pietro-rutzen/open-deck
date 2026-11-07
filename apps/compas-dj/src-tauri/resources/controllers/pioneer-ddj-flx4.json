@@ -889,6 +889,70 @@
       "control": "deck.1.beatjump.7"
     },
     {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 16
+      },
+      "control": "deck.0.pad_fx.0"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 17
+      },
+      "control": "deck.0.pad_fx.1"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 18
+      },
+      "control": "deck.0.pad_fx.2"
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 19
+      },
+      "control": "deck.0.pad_fx.3"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 16
+      },
+      "control": "deck.1.pad_fx.0"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 17
+      },
+      "control": "deck.1.pad_fx.1"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 18
+      },
+      "control": "deck.1.pad_fx.2"
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 19
+      },
+      "control": "deck.1.pad_fx.3"
+    },
+    {
       "channel": 0,
       "input": {
         "kind": "note",

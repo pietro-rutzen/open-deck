@@ -303,8 +303,10 @@ const FLX4_TEMPO_RANGE_NOTE: u8 = 0x60;
 const FLX4_TRACK_LOADED_NOTES: [u8; 2] = [0x26, 0x27];
 /// Hardware tempo-fader spans. ±8% is the control-bus default, so it stays first until SHIFT+SYNC.
 const FLX4_TEMPO_RANGES: [f64; 5] = [8.0, 6.0, 10.0, 16.0, 100.0];
-/// Hot cue, beat jump, sampler, beat loop and key shift pad-mode buttons.
-const FLX4_PAD_MODE_NOTES: [u8; 5] = [0x1B, 0x20, 0x22, 0x6D, 0x6F];
+/// Pad-mode buttons from the AlphaTheta DDJ-FLX4 MIDI message list J1, section 5.
+/// `0x20` is beat jump. Pad FX1 is `0x1E` and Pad FX2 is `0x6B`.
+const FLX4_PAD_MODE_NOTES: [u8; 7] = [0x1B, 0x1E, 0x20, 0x22, 0x6B, 0x6D, 0x6F];
+const FLX4_PAD_FX1_NOTE: u8 = 0x1E;
 const FLX4_BROWSE_CC: u8 = 0x40;
 const FLX4_ZOOM_CC: u8 = 0x64;
 const FLX4_BROWSE_PRESS_NOTES: [u8; 2] = [0x41, 0x42];
@@ -781,6 +783,8 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 if flx4_port {
                     clear_flx4_deck_lights(&mut out, &mut fb_last, &mut pad_mode);
                 }
+                release_held_pad_fx(&app, 0);
+                release_held_pad_fx(&app, 1);
                 pad_mode = [None, None];
                 flx4_port = name.as_ref().is_some_and(|n| n.contains("DDJ-FLX4"));
                 meter_last = [255; 2];
@@ -816,6 +820,8 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 if flx4_profile && flx4_port {
                     clear_flx4_deck_lights(&mut out, &mut fb_last, &mut pad_mode);
                 }
+                release_held_pad_fx(&app, 0);
+                release_held_pad_fx(&app, 1);
                 pad_mode = [None, None];
                 flx4_profile = profile.id == "pioneer-ddj-flx4";
                 meter_last = [255; 2];
@@ -844,6 +850,8 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 if flx4_profile && flx4_port {
                     clear_flx4_deck_lights(&mut out, &mut fb_last, &mut pad_mode);
                 }
+                release_held_pad_fx(&app, 0);
+                release_held_pad_fx(&app, 1);
                 pad_mode = [None, None];
                 flx4_profile = false;
                 router.tempo_range = [FLX4_TEMPO_RANGES[0], FLX4_TEMPO_RANGES[0]];
@@ -935,9 +943,12 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                         }
                         if matches!(status, 0x90 | 0x91) && FLX4_PAD_MODE_NOTES.contains(&d1) {
                             if raw_d2 > 0 {
-                                if let Some(leds) =
-                                    flx4_pad_mode_press(&mut pad_mode, usize::from(status & 15), d1)
-                                {
+                                let deck = usize::from(status & 15);
+                                let previous = pad_mode.get(deck).copied().flatten();
+                                if let Some(leds) = flx4_pad_mode_press(&mut pad_mode, deck, d1) {
+                                    if leaving_pad_fx1(previous, leds.lit) {
+                                        release_held_pad_fx(&app, deck);
+                                    }
                                     if let Some(previous) = leds.clear {
                                         send_feedback(
                                             &mut out,
@@ -1132,6 +1143,24 @@ fn clear_flx4_meters(out: &mut Option<MidiOutputConnection>) {
 struct PadModeLeds {
     clear: Option<u8>,
     lit: u8,
+}
+
+fn leaving_pad_fx1(previous: Option<u8>, next: u8) -> bool {
+    previous == Some(FLX4_PAD_FX1_NOTE) && next != FLX4_PAD_FX1_NOTE
+}
+
+fn release_held_pad_fx(app: &AppHandle, deck: usize) {
+    let engine = app.state::<crate::EngineHandle>();
+    match app
+        .state::<crate::native_effects::NativeEffects>()
+        .release_pad_fx(deck, |message| engine.send(message))
+    {
+        Ok(Some(snapshot)) => {
+            let _ = app.emit("effects:update", snapshot);
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!("Pad FX release failed: {error}"),
+    }
 }
 
 /// One pad-mode button per deck stays lit. Returns the previous note to extinguish, if it changed.
@@ -1411,13 +1440,85 @@ mod tests {
         let first = flx4_pad_mode_press(&mut active, 0, 0x1B).expect("hot cue mode");
         assert_eq!(first.clear, None);
         assert_eq!(first.lit, 0x1B);
-        let second = flx4_pad_mode_press(&mut active, 0, 0x20).expect("pad fx mode");
+        let second = flx4_pad_mode_press(&mut active, 0, 0x20).expect("beat jump mode");
         assert_eq!(second.clear, Some(0x1B));
         assert_eq!(second.lit, 0x20);
         assert_eq!(active[0], Some(0x20));
         assert_eq!(active[1], None);
         assert!(flx4_pad_mode_press(&mut active, 0, 0x01).is_none());
         assert!(flx4_pad_mode_press(&mut active, 2, 0x1B).is_none());
+    }
+
+    #[test]
+    fn beat_jump_mode_is_note_0x20_and_pad_fx_uses_other_notes() {
+        let modes = [
+            (0x1Bu8, "hot cue"),
+            (0x1E, "pad fx1"),
+            (0x20, "beat jump"),
+            (0x22, "sampler"),
+            (0x6B, "pad fx2"),
+            (0x6D, "beat loop"),
+            (0x6F, "key shift"),
+        ];
+        let mut active = [None, None];
+        for (note, _label) in modes {
+            let leds = flx4_pad_mode_press(&mut active, 1, note).expect("mode note");
+            assert_eq!(leds.lit, note);
+            assert_eq!(active[1], Some(note));
+            assert_eq!(active[0], None);
+        }
+        assert!(flx4_pad_mode_press(&mut active, 1, 0x69).is_none());
+        assert_eq!(active[1], Some(0x6F));
+        assert!(leaving_pad_fx1(Some(0x1E), 0x20));
+        assert!(leaving_pad_fx1(Some(0x1E), 0x6B));
+        assert!(!leaving_pad_fx1(Some(0x1E), 0x1E));
+        assert!(!leaving_pad_fx1(Some(0x20), 0x1B));
+        assert!(!leaving_pad_fx1(None, 0x1E));
+    }
+
+    #[test]
+    fn bundled_flx4_pad_fx1_holds_the_first_four_pads_only() {
+        let profile: ControllerProfile = serde_json::from_str(include_str!(
+            "../resources/controllers/pioneer-ddj-flx4.json"
+        ))
+        .unwrap();
+        let mapping = profile.mapping();
+        let mapped = [
+            (7u8, 16u8, "deck.0.pad_fx.0"),
+            (7, 17, "deck.0.pad_fx.1"),
+            (7, 18, "deck.0.pad_fx.2"),
+            (7, 19, "deck.0.pad_fx.3"),
+            (9, 16, "deck.1.pad_fx.0"),
+            (9, 17, "deck.1.pad_fx.1"),
+            (9, 18, "deck.1.pad_fx.2"),
+            (9, 19, "deck.1.pad_fx.3"),
+            (7, 32, "deck.0.beatjump.0"),
+            (9, 32, "deck.1.beatjump.0"),
+        ];
+        for (channel, note, control) in mapped {
+            let binding = mapping
+                .bindings
+                .iter()
+                .find(|binding| {
+                    binding.channel == channel
+                        && matches!(binding.input, InputKind::Note { note: found } if found == note)
+                })
+                .unwrap_or_else(|| panic!("missing {channel}:{note}"));
+            assert_eq!(binding.control.as_str(), control);
+        }
+        for note in [0x14u8, 0x17, 0x50, 0x57, 0x10] {
+            assert!(
+                mapping.bindings.iter().all(|binding| {
+                    !(binding.channel == 8
+                        && matches!(binding.input, InputKind::Note { note: found } if found == note))
+                }),
+                "shift-layer pad {note} must stay unmapped"
+            );
+        }
+        assert!(mapping
+            .bindings
+            .iter()
+            .all(|binding| binding.control.as_str() != "deck.0.pad_fx.4"));
     }
     #[test]
     fn bundled_flx4_every_binding_resolves_and_addresses_are_unique() {
