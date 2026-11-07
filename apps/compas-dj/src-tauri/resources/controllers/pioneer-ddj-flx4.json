@@ -1300,7 +1300,7 @@
         "kind": "note",
         "note": 48
       },
-      "control": "sampler.0.trigger",
+      "control": "sampler.8.trigger",
       "soft_takeover": false
     },
     {
@@ -1309,7 +1309,7 @@
         "kind": "note",
         "note": 48
       },
-      "control": "sampler.0.stop",
+      "control": "sampler.8.stop",
       "soft_takeover": false
     },
     {
@@ -1336,7 +1336,7 @@
         "kind": "note",
         "note": 49
       },
-      "control": "sampler.1.trigger",
+      "control": "sampler.9.trigger",
       "soft_takeover": false
     },
     {
@@ -1345,7 +1345,7 @@
         "kind": "note",
         "note": 49
       },
-      "control": "sampler.1.stop",
+      "control": "sampler.9.stop",
       "soft_takeover": false
     },
     {
@@ -1372,7 +1372,7 @@
         "kind": "note",
         "note": 50
       },
-      "control": "sampler.2.trigger",
+      "control": "sampler.10.trigger",
       "soft_takeover": false
     },
     {
@@ -1381,7 +1381,7 @@
         "kind": "note",
         "note": 50
       },
-      "control": "sampler.2.stop",
+      "control": "sampler.10.stop",
       "soft_takeover": false
     },
     {
@@ -1408,7 +1408,7 @@
         "kind": "note",
         "note": 51
       },
-      "control": "sampler.3.trigger",
+      "control": "sampler.11.trigger",
       "soft_takeover": false
     },
     {
@@ -1417,7 +1417,7 @@
         "kind": "note",
         "note": 51
       },
-      "control": "sampler.3.stop",
+      "control": "sampler.11.stop",
       "soft_takeover": false
     },
     {
@@ -1444,7 +1444,7 @@
         "kind": "note",
         "note": 52
       },
-      "control": "sampler.4.trigger",
+      "control": "sampler.12.trigger",
       "soft_takeover": false
     },
     {
@@ -1453,7 +1453,7 @@
         "kind": "note",
         "note": 52
       },
-      "control": "sampler.4.stop",
+      "control": "sampler.12.stop",
       "soft_takeover": false
     },
     {
@@ -1480,7 +1480,7 @@
         "kind": "note",
         "note": 53
       },
-      "control": "sampler.5.trigger",
+      "control": "sampler.13.trigger",
       "soft_takeover": false
     },
     {
@@ -1489,7 +1489,7 @@
         "kind": "note",
         "note": 53
       },
-      "control": "sampler.5.stop",
+      "control": "sampler.13.stop",
       "soft_takeover": false
     },
     {
@@ -1516,7 +1516,7 @@
         "kind": "note",
         "note": 54
       },
-      "control": "sampler.6.trigger",
+      "control": "sampler.14.trigger",
       "soft_takeover": false
     },
     {
@@ -1525,7 +1525,7 @@
         "kind": "note",
         "note": 54
       },
-      "control": "sampler.6.stop",
+      "control": "sampler.14.stop",
       "soft_takeover": false
     },
     {
@@ -1552,7 +1552,7 @@
         "kind": "note",
         "note": 55
       },
-      "control": "sampler.7.trigger",
+      "control": "sampler.15.trigger",
       "soft_takeover": false
     },
     {
@@ -1561,7 +1561,7 @@
         "kind": "note",
         "note": 55
       },
-      "control": "sampler.7.stop",
+      "control": "sampler.15.stop",
       "soft_takeover": false
     },
     {

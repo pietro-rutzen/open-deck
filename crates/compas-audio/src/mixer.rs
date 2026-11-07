@@ -510,6 +510,8 @@ pub struct DeckTelemetry {
     /// Measured output (DAC) latency in seconds, so the UI can offset the visual play-head to match
     /// what's actually being heard.
     output_latency_bits: AtomicU64,
+    /// Bits of sampler slots with a live voice. The callback writes it only when activity changes.
+    sampler_playing: AtomicU64,
 }
 
 impl DeckTelemetry {
@@ -537,7 +539,12 @@ impl DeckTelemetry {
             tempo_bits: std::array::from_fn(|_| AtomicU64::new(1.0_f64.to_bits())),
             at_cue: std::array::from_fn(|_| AtomicBool::new(false)),
             output_latency_bits: AtomicU64::new(0),
+            sampler_playing: AtomicU64::new(0),
         }
+    }
+
+    pub fn sampler_playing(&self) -> u64 {
+        self.sampler_playing.load(Ordering::Relaxed)
     }
 
     pub fn request_scope(&self, deck: usize) {
@@ -2354,16 +2361,22 @@ impl Mixer {
                     } else {
                         self.retire(Some(buffer));
                     }
+                    self.publish_sampler_playing();
                 }
                 AudioCommand::ClearSample { slot } => {
                     if let Some(old) = self.sampler.set_slot(slot, None) {
                         self.retire(Some(old));
                     }
+                    self.publish_sampler_playing();
                 }
                 AudioCommand::TriggerSample { slot, velocity } => {
-                    self.sampler.trigger(slot, velocity)
+                    self.sampler.trigger(slot, velocity);
+                    self.publish_sampler_playing();
                 }
-                AudioCommand::StopSample { slot } => self.sampler.stop(slot),
+                AudioCommand::StopSample { slot } => {
+                    self.sampler.stop(slot);
+                    self.publish_sampler_playing();
+                }
                 AudioCommand::SetSampleLoop { slot, looping } => {
                     self.sampler.set_loop(slot, looping)
                 }
@@ -2442,6 +2455,7 @@ impl Mixer {
         r += sy;
         // Sampler / performance pads share the master bus with the synth (stereo).
         let (sxl, sxr) = self.sampler.process();
+        self.publish_sampler_playing();
         l += sxl;
         r += sxr;
         // Aux/mic input shares the master bus too. Prime a little before draining and output
@@ -2523,6 +2537,14 @@ impl Mixer {
     #[inline]
     pub fn next_frame(&mut self) -> (f32, f32) {
         self.next_buses().master
+    }
+
+    fn publish_sampler_playing(&mut self) {
+        if self.sampler.take_activity() {
+            self.telemetry
+                .sampler_playing
+                .store(self.sampler.playing_mask(), Ordering::Relaxed);
+        }
     }
 
     /// Publish per-deck position/state to shared telemetry. Call once per audio block.

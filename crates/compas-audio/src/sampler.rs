@@ -10,8 +10,18 @@ use std::sync::Arc;
 use compas_core::DeckBuffer;
 use compas_dsp::GainSmoother;
 
-/// Number of pads in the sampler bank.
-pub const NUM_PADS: usize = 8;
+/// Rekordbox-style sampler: four banks, sixteen slots each. Deck 1 plays the
+/// first eight of the active bank and deck 2 plays the second eight. Slots stay
+/// empty until a sample is installed, so the bank does not allocate PCM up front.
+pub const SAMPLER_BANKS: usize = 4;
+pub const SAMPLER_SLOTS_PER_BANK: usize = 16;
+pub const NUM_PADS: usize = SAMPLER_BANKS * SAMPLER_SLOTS_PER_BANK;
+
+/// Bank-local pad `0..16` plus the active bank. Deck 2 uses locals `8..16`.
+pub fn global_slot(bank: usize, local: usize) -> Option<usize> {
+    (bank < SAMPLER_BANKS && local < SAMPLER_SLOTS_PER_BANK)
+        .then_some(bank * SAMPLER_SLOTS_PER_BANK + local)
+}
 /// Simultaneous sample voices (retriggers/overlaps past this steal the oldest).
 const SAMPLER_VOICES: usize = 16;
 
@@ -46,6 +56,7 @@ pub struct Sampler {
     /// Per-pad loop mode: a looped pad toggles play/stop on trigger; a one-shot pad overlaps.
     looped: [bool; NUM_PADS],
     voices: [SampleVoice; SAMPLER_VOICES],
+    activity_dirty: bool,
     device_rate: f32,
     gain: GainSmoother,
     /// Round-robin cursor for voice stealing when all voices are busy.
@@ -58,6 +69,7 @@ impl Sampler {
             slots: std::array::from_fn(|_| None),
             looped: [false; NUM_PADS],
             voices: [SampleVoice::idle(); SAMPLER_VOICES],
+            activity_dirty: false,
             device_rate,
             gain: GainSmoother::new(0.9, device_rate, 10.0),
             next_voice: 0,
@@ -77,6 +89,7 @@ impl Sampler {
         for v in self.voices.iter_mut() {
             if v.active && v.slot == slot {
                 v.active = false;
+                self.activity_dirty = true;
             }
         }
         std::mem::replace(&mut self.slots[slot], buffer)
@@ -106,6 +119,7 @@ impl Sampler {
             for voice in self.voices.iter_mut() {
                 if voice.active && voice.slot == slot {
                     voice.active = false;
+                    self.activity_dirty = true;
                 }
             }
         }
@@ -117,6 +131,7 @@ impl Sampler {
                 .find(|v| v.active && v.slot == slot && v.looping)
             {
                 v.active = false;
+                self.activity_dirty = true;
                 return;
             }
         }
@@ -130,15 +145,35 @@ impl Sampler {
             looping,
             active: true,
         };
+        self.activity_dirty = true;
     }
 
     /// Stop all voices playing `slot` (e.g. a manual stop or pad cleared).
     pub fn stop(&mut self, slot: usize) {
         for v in self.voices.iter_mut() {
-            if v.slot == slot {
+            if v.slot == slot && v.active {
                 v.active = false;
+                self.activity_dirty = true;
             }
         }
+    }
+
+    /// True once since the last take. The audio thread publishes the mask only then.
+    pub fn take_activity(&mut self) -> bool {
+        let dirty = self.activity_dirty;
+        self.activity_dirty = false;
+        dirty
+    }
+
+    /// One bit per slot that has a live voice. Allocation-free.
+    pub fn playing_mask(&self) -> u64 {
+        let mut bits = 0u64;
+        for voice in &self.voices {
+            if voice.active && voice.slot < 64 {
+                bits |= 1u64 << voice.slot;
+            }
+        }
+        bits
     }
 
     /// Pick a free voice, else steal the next round-robin slot.
@@ -162,11 +197,13 @@ impl Sampler {
             }
             let Some(buf) = self.slots[v.slot].as_ref() else {
                 v.active = false;
+                self.activity_dirty = true;
                 continue;
             };
             let frames = buf.frames();
             if frames < 2 {
                 v.active = false;
+                self.activity_dirty = true;
                 continue;
             }
             if v.playhead >= (frames - 1) as f64 {
@@ -174,6 +211,7 @@ impl Sampler {
                     v.playhead = 0.0;
                 } else {
                     v.active = false;
+                    self.activity_dirty = true;
                     continue;
                 }
             }
@@ -277,5 +315,34 @@ mod tests {
             "set_slot returns the replaced buffer for reclaim"
         );
         assert_eq!(s.process().0, 0.0, "clearing the pad silences its voice");
+    }
+
+    #[test]
+    fn banks_keep_deck_slots_apart_and_a_finished_voice_clears_its_bit() {
+        assert_eq!(global_slot(0, 0), Some(0));
+        assert_eq!(global_slot(0, 8), Some(8));
+        assert_eq!(global_slot(1, 0), Some(16));
+        assert_eq!(global_slot(3, 15), Some(63));
+        assert_eq!(global_slot(4, 0), None);
+        assert_eq!(global_slot(0, 16), None);
+        let mut sampler = Sampler::new(48_000.0);
+        sampler.set_slot(8, Some(buf(0.5, 100)));
+        sampler.set_slot(63, Some(buf(0.25, 100)));
+        sampler.trigger(8, 127);
+        sampler.trigger(63, 127);
+        assert!(sampler.take_activity());
+        assert_eq!(sampler.playing_mask(), (1u64 << 8) | (1u64 << 63));
+        sampler.stop(8);
+        assert!(sampler.take_activity());
+        assert_eq!(sampler.playing_mask(), 1u64 << 63);
+        sampler.trigger(63, 64);
+        assert_eq!(
+            sampler
+                .voices
+                .iter()
+                .filter(|voice| voice.active && voice.slot == 63)
+                .count(),
+            1
+        );
     }
 }

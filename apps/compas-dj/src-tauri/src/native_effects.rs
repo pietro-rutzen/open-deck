@@ -60,6 +60,10 @@ pub(crate) struct DeckEffects {
     pub crusher: Crusher,
     pub pitch_shift: f64,
     pub beat_sec: f64,
+    /// Offset added to the key-shift pad scale. SHIFT pads 7 and 8 move it by one semitone.
+    pub key_transpose: i8,
+    /// Last key-shift pad pressed, so its LED stays on after the scale moves.
+    pub key_pad: Option<u8>,
 }
 impl Default for DeckEffects {
     fn default() -> Self {
@@ -86,9 +90,13 @@ impl Default for DeckEffects {
             },
             pitch_shift: 0.0,
             beat_sec: 0.5,
+            key_transpose: 0,
+            key_pad: None,
         }
     }
 }
+
+const KEY_SHIFT_SCALE: [i16; 8] = [4, 5, 6, 7, 0, 1, 2, 3];
 impl DeckEffects {
     fn active(&self, e: Effect) -> bool {
         match e {
@@ -492,6 +500,8 @@ impl NativeEffects {
             send(d.command(deck, effect))?;
         }
         d.pitch_shift = 0.0;
+        d.key_transpose = 0;
+        d.key_pad = None;
         send(EngineMsg::DeckPitchShift {
             deck,
             semitones: 0.0,
@@ -513,6 +523,8 @@ impl NativeEffects {
                 d.set_active(effect, false);
             }
             d.pitch_shift = 0.0;
+            d.key_transpose = 0;
+            d.key_pad = None;
         }
         state.revision = state.revision.wrapping_add(1);
         Ok(state.clone())
@@ -581,6 +593,8 @@ impl NativeEffects {
             }
             EffectUpdate::Pitch { semitones } => {
                 d.pitch_shift = bounded(semitones, -12.0, 12.0)?.round();
+                d.key_transpose = 0;
+                d.key_pad = None;
                 send(EngineMsg::DeckPitchShift {
                     deck,
                     semitones: d.pitch_shift,
@@ -644,17 +658,20 @@ impl NativeEffects {
                 .filter(|p| *p < 8)
                 .ok_or("Invalid key shift pad")?;
             let d = next.decks.get_mut(deck).ok_or("Invalid key shift deck")?;
-            let amount = if relative {
-                [1., 2., 3., 4., -1., -2., -3., -4.][pad]
+            if relative {
+                if pad < 6 {
+                    return Ok(Some(state.clone()));
+                }
+                let delta: i8 = if pad == 6 { 1 } else { -1 };
+                let transposed = d.key_transpose.saturating_add(delta).clamp(-12, 12);
+                let applied = transposed - d.key_transpose;
+                d.key_transpose = transposed;
+                d.pitch_shift = (d.pitch_shift + f64::from(applied)).clamp(-12.0, 12.0);
             } else {
-                [0., 1., 2., 3., -3., -2., -1., 0.][pad]
-            };
-            d.pitch_shift = (if relative {
-                d.pitch_shift + amount
-            } else {
-                amount
-            })
-            .clamp(-12.0, 12.0);
+                d.key_pad = Some(pad as u8);
+                d.pitch_shift = (f64::from(KEY_SHIFT_SCALE[pad]) + f64::from(d.key_transpose))
+                    .clamp(-12.0, 12.0);
+            }
             send(EngineMsg::DeckPitchShift {
                 deck,
                 semitones: d.pitch_shift,
@@ -830,6 +847,7 @@ impl NativeEffects {
         }
         let mut next = state.clone();
         next.decks[deck].pitch_shift = semitones;
+        next.decks[deck].key_pad = None;
         send(EngineMsg::DeckPitchShift { deck, semitones })?;
         next.revision = state.revision.wrapping_add(1);
         *state = next;
@@ -1058,17 +1076,42 @@ mod tests {
         assert_eq!(n, 0);
     }
     #[test]
-    fn key_shift_steps_accumulate_without_ui_and_clamp() {
+    fn key_shift_uses_the_manual_scale_and_shift_moves_it() {
         let state = NativeEffects::default();
+        state.handle("deck.1.key_shift.0", 1.0, |_| Ok(())).unwrap();
+        let selected = state.snapshot().unwrap();
+        assert_eq!(selected.decks[1].pitch_shift, 4.0);
+        assert_eq!(selected.decks[1].key_pad, Some(0));
         state.handle("deck.1.key_shift.4", 1.0, |_| Ok(())).unwrap();
-        assert_eq!(state.snapshot().unwrap().decks[1].pitch_shift, -3.0);
-        for _ in 0..8 {
+        assert_eq!(state.snapshot().unwrap().decks[1].pitch_shift, 0.0);
+        state
+            .handle("deck.1.key_shift_step.0", 1.0, |_| Ok(()))
+            .unwrap();
+        assert_eq!(state.snapshot().unwrap().decks[1].pitch_shift, 0.0);
+        state
+            .handle("deck.1.key_shift_step.6", 1.0, |_| Ok(()))
+            .unwrap();
+        let raised = state.snapshot().unwrap();
+        assert_eq!(raised.decks[1].key_transpose, 1);
+        assert_eq!(raised.decks[1].pitch_shift, 1.0);
+        assert_eq!(raised.decks[1].key_pad, Some(4));
+        state.handle("deck.1.key_shift.0", 1.0, |_| Ok(())).unwrap();
+        assert_eq!(state.snapshot().unwrap().decks[1].pitch_shift, 5.0);
+        for _ in 0..20 {
             state
-                .handle("deck.1.key_shift_step.3", 1.0, |_| Ok(()))
+                .handle("deck.1.key_shift_step.6", 1.0, |_| Ok(()))
                 .unwrap();
         }
-        assert_eq!(state.snapshot().unwrap().decks[1].pitch_shift, 12.0);
+        let capped = state.snapshot().unwrap();
+        assert_eq!(capped.decks[1].key_transpose, 12);
+        assert_eq!(capped.decks[1].pitch_shift, 12.0);
+        state
+            .handle("deck.1.key_shift_step.7", 1.0, |_| Ok(()))
+            .unwrap();
+        assert_eq!(state.snapshot().unwrap().decks[1].pitch_shift, 11.0);
         assert_eq!(state.snapshot().unwrap().decks[0].pitch_shift, 0.0);
+        state.handle("deck.1.key_shift.0", 0.0, |_| Ok(())).unwrap();
+        assert_eq!(state.snapshot().unwrap().decks[1].pitch_shift, 11.0);
     }
     #[test]
     fn beat_step_bounds_and_clock_updates_emit_only_active_synced_fx() {
@@ -1248,6 +1291,37 @@ mod tests {
             state.handle(&control, 0.0, |_| Ok(())).unwrap();
             assert!(!state.snapshot().unwrap().decks[1].active(sound.effect()));
         }
+    }
+
+    #[test]
+    fn pad_fx_hold_is_momentary_and_a_shift_layer_press_does_not_stick() {
+        let state = NativeEffects::default();
+        state.handle("deck.0.pad_fx.0", 1.0, |_| Ok(())).unwrap();
+        assert!(state.snapshot().unwrap().decks[0].echo.active);
+        state
+            .handle("deck.0.pad_fx.0", 63.0 / 127.0, |_| Ok(()))
+            .unwrap();
+        assert!(!state.snapshot().unwrap().decks[0].echo.active);
+        state
+            .handle("deck.0.pad_fx.0", 64.0 / 127.0, |_| Ok(()))
+            .unwrap();
+        state.handle("deck.0.pad_fx.0", 0.0, |_| Ok(())).unwrap();
+        assert!(!state.snapshot().unwrap().decks[0].echo.active);
+        state.handle("fx.toggle.0", 1.0, |_| Ok(())).unwrap();
+        state.handle("deck.0.pad_fx.0", 1.0, |_| Ok(())).unwrap();
+        state.handle("deck.0.pad_fx.0", 0.0, |_| Ok(())).unwrap();
+        assert!(state.snapshot().unwrap().decks[0].echo.active);
+        let latched = state.snapshot().unwrap().decks[0].echo;
+        state.handle("deck.0.pad_fx.4", 1.0, |_| Ok(())).unwrap();
+        state.handle("deck.0.pad_fx.8", 1.0, |_| Ok(())).unwrap();
+        assert!((state.snapshot().unwrap().decks[0].echo.beats - 0.25).abs() < 1e-9);
+        state.handle("deck.0.pad_fx.4", 0.0, |_| Ok(())).unwrap();
+        assert!((state.snapshot().unwrap().decks[0].echo.beats - 0.25).abs() < 1e-9);
+        state.handle("deck.0.pad_fx.8", 0.0, |_| Ok(())).unwrap();
+        let restored = state.snapshot().unwrap().decks[0].echo;
+        assert!(restored.active);
+        assert_eq!(restored.beats, latched.beats);
+        assert_eq!(restored.depth, latched.depth);
     }
 
     #[test]

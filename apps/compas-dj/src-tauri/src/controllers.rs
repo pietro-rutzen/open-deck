@@ -25,11 +25,18 @@ pub(crate) fn upgrade_flx4_profile(mut profile: ControllerProfile) -> Controller
             "../resources/controllers/pioneer-ddj-flx4.json"
         )) {
             for binding in bundled.bindings {
-                if !profile
+                if let Some(old) = profile
                     .bindings
-                    .iter()
-                    .any(|old| old.channel == binding.channel && old.input == binding.input)
+                    .iter_mut()
+                    .find(|old| old.channel == binding.channel && old.input == binding.input)
                 {
+                    if old.control.as_str().starts_with("sampler.")
+                        && binding.control.as_str().starts_with("sampler.")
+                        && old.control.as_str() != binding.control.as_str()
+                    {
+                        old.control = binding.control;
+                    }
+                } else {
                     profile.bindings.push(binding);
                 }
             }
@@ -429,6 +436,20 @@ impl Router {
             self.route_keyboard(deck, slot, shifted, update);
             return;
         }
+        if let Some(local) = sampler_local(&update.control) {
+            let bank = self
+                .app
+                .state::<crate::native_controls::SamplerBanks>()
+                .bank();
+            if let Some(global) = compas_audio::sampler_global_slot(bank, local) {
+                let action = if update.control.ends_with(".stop") {
+                    "stop"
+                } else {
+                    "trigger"
+                };
+                update.control = format!("sampler.{global}.{action}");
+            }
+        }
         if super::headphone::controller_update(&self.app, &update.control, update.value) {
             return;
         }
@@ -469,6 +490,7 @@ impl Router {
             &eq,
             &performance,
             captured,
+            self.telemetry.sampler_playing(),
         ) {
             let engine = self.app.state::<crate::EngineHandle>();
             let commanded = action.message.is_some() || !action.messages.is_empty();
@@ -496,6 +518,9 @@ impl Router {
                     &mut self.batch.mirror,
                     ControllerUpdateEvent::new(control, value),
                 );
+            }
+            if let Some((control, value)) = action.ui_event {
+                self.emit_now(ControllerUpdateEvent::new(control, value));
             }
             return;
         }
@@ -1242,6 +1267,15 @@ fn leaving_pad_fx(previous: Option<u8>, next: u8) -> bool {
     )
 }
 
+fn sampler_local(control: &str) -> Option<usize> {
+    let (slot, action) = control.strip_prefix("sampler.")?.split_once('.')?;
+    if action != "trigger" && action != "stop" {
+        return None;
+    }
+    let local = slot.parse::<usize>().ok()?;
+    (local < compas_audio::SAMPLER_SLOTS_PER_BANK).then_some(local)
+}
+
 fn keyboard_control(control: &str) -> Option<(usize, usize, bool)> {
     let rest = control.strip_prefix("deck.")?;
     let (deck, name) = rest.split_once('.')?;
@@ -1705,6 +1739,43 @@ mod tests {
         );
     }
     #[test]
+    fn saved_flx4_sampler_addresses_follow_the_deck_split() {
+        let bundled: ControllerProfile = serde_json::from_str(include_str!(
+            "../resources/controllers/pioneer-ddj-flx4.json"
+        ))
+        .unwrap();
+        let mut saved = bundled.clone();
+        let deck_two = saved
+            .bindings
+            .iter_mut()
+            .find(|binding| binding.channel == 9 && binding.input == InputKind::Note { note: 48 })
+            .expect("deck 2 sampler pad");
+        assert_eq!(deck_two.control.as_str(), "sampler.8.trigger");
+        deck_two.control = compas_core::ControlId::new("sampler.0.trigger");
+        let remapped = saved
+            .bindings
+            .iter_mut()
+            .find(|binding| binding.channel == 10 && binding.input == InputKind::Note { note: 48 })
+            .expect("deck 2 sampler stop");
+        remapped.control = compas_core::ControlId::new("deck.0.gain");
+        let upgraded = upgrade_flx4_profile(saved);
+        assert!(upgraded.bindings.iter().any(|binding| {
+            binding.channel == 9
+                && binding.input == InputKind::Note { note: 48 }
+                && binding.control.as_str() == "sampler.8.trigger"
+        }));
+        assert!(upgraded.bindings.iter().any(|binding| {
+            binding.channel == 10
+                && binding.input == InputKind::Note { note: 48 }
+                && binding.control.as_str() == "deck.0.gain"
+        }));
+        assert!(upgraded.bindings.iter().any(|binding| {
+            binding.channel == 7
+                && binding.input == InputKind::Note { note: 48 }
+                && binding.control.as_str() == "sampler.0.trigger"
+        }));
+    }
+    #[test]
     fn flx4_meter_encodes_silence_levels_and_clip() {
         for (input, expected) in [
             (0.0, 0),
@@ -1982,7 +2053,13 @@ mod tests {
         assert_eq!(normalize_note_release(0x90, 127), (0x90, 127));
         assert_eq!(normalize_note_release(0x91, 0), (0x91, 0));
         assert_eq!(normalize_note_release(0x87, 64), (0x97, 0));
+        assert_eq!(normalize_note_release(0x88, 0), (0x98, 0));
+        assert_eq!(normalize_note_release(0x89, 127), (0x99, 0));
         assert_eq!(normalize_note_release(0x9A, 0), (0x9A, 0));
+        assert_eq!(sampler_local("sampler.8.stop"), Some(8));
+        assert_eq!(sampler_local("sampler.gain"), None);
+        assert_eq!(compas_audio::sampler_global_slot(1, 8), Some(24));
+        assert_eq!(compas_audio::sampler_global_slot(0, 0), Some(0));
         assert!(keyboard_control("deck.0.keyboard.4").is_some());
         assert_eq!(
             keyboard_control("deck.1.keyboard_shift.7"),

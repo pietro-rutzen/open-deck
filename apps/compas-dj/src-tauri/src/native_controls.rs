@@ -3,7 +3,7 @@
 use crate::EngineMsg;
 use compas_audio::{DeckTelemetry, FilterMode, NUM_DECKS, NUM_SAMPLER_PADS};
 use serde::Serialize;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 const EQ_BANDS: usize = 3;
@@ -69,6 +69,8 @@ pub(crate) struct NativeAction {
     pub mirror_as: Option<String>,
     /// Deck pitch to commit through the effects snapshot after the other messages.
     pub pitch: Option<f64>,
+    /// A non-realtime UI event, such as loading the selected library row into a sampler slot.
+    pub ui_event: Option<(String, f64)>,
 }
 
 fn single(message: Option<EngineMsg>, mirror: bool) -> NativeAction {
@@ -81,6 +83,25 @@ fn single(message: Option<EngineMsg>, mirror: bool) -> NativeAction {
         extra_mirrors: Vec::new(),
         mirror_as: None,
         pitch: None,
+        ui_event: None,
+    }
+}
+
+/// Active sampler bank. Pads address sixteen locals; the bank selects which sixteen.
+#[derive(Default)]
+pub(crate) struct SamplerBanks {
+    bank: AtomicU8,
+}
+
+impl SamplerBanks {
+    pub(crate) fn bank(&self) -> usize {
+        usize::from(self.bank.load(Ordering::Relaxed)).min(compas_audio::SAMPLER_BANKS - 1)
+    }
+
+    pub(crate) fn set_bank(&self, bank: usize) -> usize {
+        let bank = bank.min(compas_audio::SAMPLER_BANKS - 1);
+        self.bank.store(bank as u8, Ordering::Relaxed);
+        bank
     }
 }
 
@@ -116,8 +137,8 @@ pub(crate) fn filter_settings(position: f64) -> FilterSettings {
 /// Same fixed velocity as an on-screen pad click. The control bus only reports press or release.
 const SAMPLE_VELOCITY: u8 = 110;
 
-/// Sampler trigger and stop. The sample is already in the engine, so the press only has to start it.
-fn sampler_action(control: &str, value: f64) -> Option<NativeAction> {
+/// Sampler trigger, and SHIFT stop-or-load. A release never starts playback or a decode.
+fn sampler_action(control: &str, value: f64, playing: u64) -> Option<NativeAction> {
     let (slot, action) = control.strip_prefix("sampler.")?.split_once('.')?;
     if action != "trigger" && action != "stop" {
         return None;
@@ -129,15 +150,21 @@ fn sampler_action(control: &str, value: f64) -> Option<NativeAction> {
     if !value.is_finite() || value < 0.5 {
         return Some(single(None, false));
     }
-    let message = if action == "trigger" {
-        EngineMsg::TriggerSample {
-            slot,
-            velocity: SAMPLE_VELOCITY,
-        }
-    } else {
-        EngineMsg::StopSample { slot }
-    };
-    Some(single(Some(message), false))
+    if action == "trigger" {
+        return Some(single(
+            Some(EngineMsg::TriggerSample {
+                slot,
+                velocity: SAMPLE_VELOCITY,
+            }),
+            false,
+        ));
+    }
+    if playing & (1u64 << slot) != 0 {
+        return Some(single(Some(EngineMsg::StopSample { slot }), false));
+    }
+    let mut action = single(None, false);
+    action.ui_event = Some((format!("sampler.load.{slot}"), 1.0));
+    Some(action)
 }
 
 fn deck_control(control: &str) -> Option<(usize, &str)> {
@@ -156,8 +183,9 @@ pub(crate) fn resolve(
     eq: &DeckEqState,
     performance: &PerformanceState,
     captured: Option<CapturedPosition>,
+    sampler_playing: u64,
 ) -> Option<NativeAction> {
-    if let Some(action) = sampler_action(control, value) {
+    if let Some(action) = sampler_action(control, value, sampler_playing) {
         return Some(action);
     }
     let (deck, name) = deck_control(control)?;
@@ -1090,6 +1118,7 @@ mod tests {
             eq,
             &PerformanceState::new(),
             None,
+            0,
         )
         .expect("native control")
     }
@@ -1114,6 +1143,7 @@ mod tests {
                     &eq,
                     &PerformanceState::new(),
                     None,
+                    0,
                 )
                 .is_none(),
                 "{control}"
@@ -1213,6 +1243,7 @@ mod tests {
             &eq,
             &performance,
             None,
+            0,
         )
         .expect("trigger");
         assert!(matches!(
@@ -1223,30 +1254,175 @@ mod tests {
             })
         ));
         assert!(!trigger.mirror);
-        let release = resolve(
-            "sampler.3.trigger",
+        for release_value in [0.0, 63.0 / 127.0, 0.49] {
+            let release = resolve(
+                "sampler.3.trigger",
+                release_value,
+                &telemetry,
+                &eq,
+                &performance,
+                None,
+                1u64 << 3,
+            )
+            .expect("release");
+            assert!(release.message.is_none());
+            assert!(release.ui_event.is_none());
+            let shift_release = resolve(
+                "sampler.3.stop",
+                release_value,
+                &telemetry,
+                &eq,
+                &performance,
+                None,
+                1u64 << 3,
+            )
+            .expect("shift release");
+            assert!(shift_release.message.is_none());
+            assert!(shift_release.ui_event.is_none());
+        }
+        assert!(matches!(
+            resolve(
+                "sampler.3.trigger",
+                64.0 / 127.0,
+                &telemetry,
+                &eq,
+                &performance,
+                None,
+                0,
+            )
+            .expect("midi 64")
+            .message,
+            Some(EngineMsg::TriggerSample { slot: 3, .. })
+        ));
+        let load = resolve(
+            "sampler.1.stop",
+            1.0,
+            &telemetry,
+            &eq,
+            &performance,
+            None,
+            0,
+        )
+        .expect("load");
+        assert!(load.message.is_none());
+        assert_eq!(
+            load.ui_event.as_ref().map(|(control, _)| control.as_str()),
+            Some("sampler.load.1")
+        );
+        let stop = resolve(
+            "sampler.1.stop",
+            1.0,
+            &telemetry,
+            &eq,
+            &performance,
+            None,
+            1u64 << 1,
+        )
+        .expect("stop");
+        assert!(matches!(
+            stop.message,
+            Some(EngineMsg::StopSample { slot: 1 })
+        ));
+        let shift_release = resolve(
+            "sampler.1.stop",
             0.0,
             &telemetry,
             &eq,
             &performance,
             None,
+            0,
         )
-        .expect("release");
-        assert!(release.message.is_none());
-        let stop =
-            resolve("sampler.1.stop", 1.0, &telemetry, &eq, &performance, None).expect("stop");
-        assert!(matches!(
-            stop.message,
-            Some(EngineMsg::StopSample { slot: 1 })
-        ));
-        assert!(resolve("sampler.gain", 0.5, &telemetry, &eq, &performance, None).is_none());
-        assert!(resolve(
+        .expect("shift release");
+        assert!(shift_release.message.is_none());
+        assert!(shift_release.ui_event.is_none());
+        assert!(resolve("sampler.gain", 0.5, &telemetry, &eq, &performance, None, 0).is_none());
+        let deck_two = resolve(
             "sampler.8.trigger",
             1.0,
             &telemetry,
             &eq,
             &performance,
-            None
+            None,
+            0,
+        )
+        .expect("deck 2 slot");
+        assert!(matches!(
+            deck_two.message,
+            Some(EngineMsg::TriggerSample { slot: 8, .. })
+        ));
+        assert!(resolve(
+            "sampler.64.trigger",
+            1.0,
+            &telemetry,
+            &eq,
+            &performance,
+            None,
+            0
+        )
+        .is_none());
+        let repeated = resolve(
+            "sampler.8.trigger",
+            1.0,
+            &telemetry,
+            &eq,
+            &performance,
+            None,
+            1u64 << 8,
+        )
+        .expect("repeat");
+        assert!(matches!(
+            repeated.message,
+            Some(EngineMsg::TriggerSample { slot: 8, .. })
+        ));
+        let bank_load = resolve(
+            "sampler.63.stop",
+            1.0,
+            &telemetry,
+            &eq,
+            &performance,
+            None,
+            0,
+        )
+        .expect("bank load");
+        assert_eq!(
+            bank_load
+                .ui_event
+                .as_ref()
+                .map(|(control, _)| control.as_str()),
+            Some("sampler.load.63")
+        );
+        assert!(matches!(
+            resolve(
+                "sampler.63.stop",
+                1.0,
+                &telemetry,
+                &eq,
+                &performance,
+                None,
+                1u64 << 63,
+            )
+            .expect("bank stop")
+            .message,
+            Some(EngineMsg::StopSample { slot: 63 })
+        ));
+        assert!(resolve(
+            "deck.0.pad_fx.0",
+            1.0,
+            &telemetry,
+            &eq,
+            &performance,
+            None,
+            0
+        )
+        .is_none());
+        assert!(resolve(
+            "deck.0.key_shift.0",
+            1.0,
+            &telemetry,
+            &eq,
+            &performance,
+            None,
+            0
         )
         .is_none());
     }

@@ -164,6 +164,7 @@ export interface DeckState {
   keylock: boolean;
   /** Key shift in semitones (± ), pitch-shifting the deck without changing tempo. */
   pitchShift: number;
+  keyPad: number | null;
   /** Manual beatgrid nudge (seconds) added to the analyzed first-beat anchor. */
   gridOffset: number;
   /** True while this deck is a continuous sync follower. */
@@ -225,6 +226,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
   const beatJumpScaleRef = useRef(1);
   const [keylock, setKeylockState] = useState(false);
   const [pitchShift, setPitchShiftState] = useState(0);
+  const [keyPad, setKeyPad] = useState<number | null>(null);
   const [gridOffset, setGridOffset] = useState(0);
   const [synced, setSyncedState] = useState(false);
   const [syncLive, setSyncLiveState] = useState(false);
@@ -299,6 +301,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
       reverbRef.current = next.reverb; setReverbState(next.reverb);
       crusherRef.current = next.crusher; setCrusherState(next.crusher);
       pitchShiftRef.current = next.pitch_shift; setPitchShiftState(next.pitch_shift);
+      setKeyPad(next.key_pad);
     };
     const subscription = onEffectsUpdate(reflect);
     subscription.then(() => effectsSnapshot()).then(reflect).catch(() => {});
@@ -1093,7 +1096,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
     };
   }, [deck, playing, tempo, meta, isLeader, syncLive, syncInternal, applyEcho, applyFlanger]);
 
-  const state: DeckState = useMemo(() => ({ meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, echo, reverb, flanger, crusher, error, loading, dsp }), [meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, echo, reverb, flanger, crusher, error, loading, dsp]);
+  const state: DeckState = useMemo(() => ({ meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, keyPad, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, echo, reverb, flanger, crusher, error, loading, dsp }), [meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, keyPad, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, echo, reverb, flanger, crusher, error, loading, dsp]);
   return useMemo(() => ({ state, actions, deck }), [state, actions, deck]);
 }
 

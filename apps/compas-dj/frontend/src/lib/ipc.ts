@@ -762,6 +762,8 @@ export interface LoadedSample {
 }
 /** Number of sampler pads (engine-defined). */
 export const samplerPadCount = () => invoke<number>("sampler_pad_count");
+export const samplerBank = () => invoke<number>("sampler_bank");
+export const setSamplerBank = (bank: number) => invoke<number>("set_sampler_bank", { bank });
 /** Decode an audio file into a pad; returns the pad index + display name. */
 export const loadSample = (slot: number, path: string) =>
   invoke<LoadedSample>("load_sample", { slot, path });
@@ -939,6 +941,8 @@ export interface NativeDeckEffects {
   reverb: { active: boolean; size: number; mix: number };
   crusher: { active: boolean; crush: number; down: number };
   pitch_shift: number; beat_sec: number;
+  key_transpose: number;
+  key_pad: number | null;
 }
 export interface EffectsSnapshot {
   revision: number; effect: 'echo' | 'flanger' | 'reverb' | 'crusher'; deck: number; decks: NativeDeckEffects[];

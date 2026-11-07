@@ -10,6 +10,9 @@ export function Sampler({ sampler, onClose }: { sampler: SamplerController; onCl
     <div className="sampler">
       <div className="sampler-bar">
         <span className="overline">SAMPLER</span>
+        <button className="chip" type="button" onClick={sampler.cycleBank}>
+          BANK {sampler.bank + 1}/4
+        </button>
         <Knob value={sampler.gain} min={0} max={1.5} size={30} label="LEVEL" onChange={sampler.setGain} />
         <span className="mono sampler-hint">click empty → load · press → fire · ⟳ loop · ✕ clear</span>
         <button className="chip sampler-close" onClick={onClose} title="Close">✕</button>

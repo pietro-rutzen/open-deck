@@ -3599,6 +3599,16 @@ fn sampler_pad_count() -> usize {
     compas_audio::NUM_SAMPLER_PADS
 }
 
+#[tauri::command]
+fn sampler_bank(banks: State<'_, native_controls::SamplerBanks>) -> usize {
+    banks.bank()
+}
+
+#[tauri::command]
+fn set_sampler_bank(banks: State<'_, native_controls::SamplerBanks>, bank: usize) -> usize {
+    banks.set_bank(bank)
+}
+
 /// List connected MIDI input port names (index = position in this list).
 static MIDI_DISCOVERY_RETRY_PENDING: AtomicBool = AtomicBool::new(false);
 static MIDI_DISCOVERY: std::sync::OnceLock<Mutex<Result<MidiInput, String>>> =
@@ -4009,6 +4019,7 @@ pub fn run() {
         .manage(native_effects::NativeEffects::default())
         .manage(deck_loads::DeckLoads::default())
         .manage(native_controls::PerformanceState::new())
+        .manage(native_controls::SamplerBanks::default())
         .manage(BoothState {
             stop: Mutex::new(None),
             latency: Arc::new(compas_audio::MonitorLatency::default()),
@@ -4202,6 +4213,8 @@ pub fn run() {
             set_sample_loop,
             set_sampler_gain,
             sampler_pad_count,
+            sampler_bank,
+            set_sampler_bank,
             midi_list_ports,
             midi_connect,
             controller_registry,

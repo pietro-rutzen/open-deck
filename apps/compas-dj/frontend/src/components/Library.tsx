@@ -216,9 +216,10 @@ export const Library = memo(
       keyNotation?: KeyNotation;
       focusTarget?: 'library' | 'crates' | null;
       focusSeq?: number;
+      onSamplerLoad?: (slot: number, path: string) => void;
     }
   >(function Library(
-    { loadedPaths, nextDecks, keyNotation = 'camelot', focusTarget = null, focusSeq = 0 },
+    { loadedPaths, nextDecks, keyNotation = 'camelot', focusTarget = null, focusSeq = 0, onSamplerLoad },
     ref,
   ) {
     const lib = useLibrary();
@@ -1125,6 +1126,13 @@ export const Library = memo(
         try {
           const path = controllerLoadPath(browseRowsRef.current, selectionKeyRef.current);
           void load(Number(target[1]), path);
+        } catch (error) { reportError(error); }
+      }
+      const sampleLoad = control.match(/^sampler\.load\.(\d+)$/);
+      if (sampleLoad && value > 0 && onSamplerLoad) {
+        try {
+          const path = controllerLoadPath(browseRowsRef.current, selectionKeyRef.current);
+          onSamplerLoad(Number(sampleLoad[1]), path);
         } catch (error) { reportError(error); }
       }
     };

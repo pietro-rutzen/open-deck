@@ -289,7 +289,7 @@ impl Registry {
             "Sampler",
             Unit::Ratio,
         ));
-        for pad in 0..8 {
+        for pad in 0..16 {
             r.add(ControlSpec::new(
                 ControlId(Cow::Owned(format!("sampler.{pad}.trigger"))),
                 Behavior::Toggle,
@@ -632,11 +632,12 @@ mod tests {
     fn registry_exposes_sampler_pad_targets() {
         let r = Registry::defaults(4);
         assert!(r.get_str("sampler.gain").is_some());
-        for pad in 0..8 {
+        for pad in 0..16 {
             assert!(
                 r.get_str(&format!("sampler.{pad}.trigger")).is_some(),
                 "sampler pad {pad} should be mappable"
             );
+            assert!(r.get_str(&format!("sampler.{pad}.stop")).is_some());
         }
     }
 

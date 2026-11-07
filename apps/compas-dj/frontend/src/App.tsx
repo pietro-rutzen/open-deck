@@ -30,9 +30,9 @@ const DECK_LETTERS = ["A", "B", "C", "D"];
 const BEAT_LOOP_PADS = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
 const BEAT_JUMP_PADS = [-1, 1, -2, 2, -4, 4, -8, 8];
 /** Pioneer key-shift pad layout: absolute semitones; pads 1 and 8 reset. */
-const KEY_SHIFT_PADS = [0, 1, 2, 3, -3, -2, -1, 0];
+const KEY_SHIFT_PADS = [4, 5, 6, 7, 0, 1, 2, 3];
 /** SHIFT + key-shift pads: relative semitone steps. */
-const KEY_SHIFT_STEP_PADS = [1, 2, 3, 4, -1, -2, -3, -4];
+const KEY_SHIFT_STEP_PADS = [0, 0, 0, 0, 0, 0, 1, -1];
 
 export function App() {
   useWindowFrame();
@@ -315,7 +315,7 @@ export function App() {
         else if (pad[1] === "beatloop") a.beatLoop(BEAT_LOOP_PADS[padIndex], u.heard_frame);
         else if (pad[1] === "beatjump") a.beatJump(BEAT_JUMP_PADS[padIndex], u.frame);
         else if (pad[1] === "key_shift") a.setPitchShift(KEY_SHIFT_PADS[padIndex]);
-        else a.shiftPitchBy(KEY_SHIFT_STEP_PADS[padIndex]);
+        else if (KEY_SHIFT_STEP_PADS[padIndex] !== 0) a.shiftPitchBy(KEY_SHIFT_STEP_PADS[padIndex]);
       }
       return;
     }
@@ -376,7 +376,7 @@ export function App() {
         ...s.hotCues.map((hotCue, i): [string, number] => [`${prefix}.hotcue.${i}`, hotCue == null ? 0 : 1]),
         ...BEAT_LOOP_PADS.map((beats, i): [string, number] => [`${prefix}.beatloop.${i}`, s.loop.active && s.loop.beats === beats ? 1 : 0]),
         ...BEAT_JUMP_PADS.map((_, i): [string, number] => [`${prefix}.beatjump.${i}`, s.meta ? 1 : 0]),
-        ...KEY_SHIFT_PADS.map((semitones, i): [string, number] => [`${prefix}.key_shift.${i}`, s.meta && s.pitchShift === semitones ? 1 : 0]),
+        ...KEY_SHIFT_PADS.map((_, i): [string, number] => [`${prefix}.key_shift.${i}`, s.meta && s.keyPad === i ? 1 : 0]),
         [`${prefix}.loop.in`, s.loop.active || s.loop.armed ? 1 : 0],
         [`${prefix}.loop.out`, s.loop.active ? 1 : 0],
         [`${prefix}.loop.toggle`, s.loop.active ? 1 : 0],
@@ -395,7 +395,10 @@ export function App() {
         [`fx.toggle.${d.deck}`, beatFx.isOn(d) ? 1 : 0],
       ];
     }),
-    ...sampler.pads.map((pad, i): [string, number] => [`sampler.${i}.trigger`, pad.name ? 1 : 0]),
+    ...Array.from({ length: 16 }, (_, local): [string, number] => [
+      `sampler.${local}.trigger`,
+      sampler.nameAt(sampler.bank * 16 + local) ? 1 : 0,
+    ]),
     ["mixer.crossfader", xfade],
     ["mixer.cue_mix", cue.mix],
     ["mixer.cue_volume", cue.volume],
@@ -543,7 +546,7 @@ export function App() {
                 />
               </div>
             </>
-          )} lower={<Library loadedPaths={loadedPaths} nextDecks={nextDecks} keyNotation={keyNotation} />} />
+          )} lower={<Library loadedPaths={loadedPaths} nextDecks={nextDecks} keyNotation={keyNotation} onSamplerLoad={(slot, path) => { void sampler.loadPath(slot, path); }} />} />
         </div>
       </div>
       <StatusBar
