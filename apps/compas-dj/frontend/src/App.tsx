@@ -13,6 +13,7 @@ import { Sampler } from "./components/Sampler";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ProfilePanel } from "./components/ProfilePanel";
 import { isNativeDeckControl, isNativePerformanceControl, useDeck, type DeckController } from "./hooks/useDeck";
+import { useControllerFeedback } from "./hooks/useControllerFeedback";
 import { BEAT_FX_LABELS, useBeatFx } from "./hooks/useBeatFx";
 import { useAutoMix } from "./hooks/useAutoMix";
 import { useCue } from "./hooks/useCue";
@@ -23,14 +24,11 @@ import { useMidi } from "./hooks/useMidi";
 import { useMidiMap } from "./hooks/useMidiMap";
 import { useSampler } from "./hooks/useSampler";
 import { controllerLearn, controllerSession, onControllerSession, controllerFeedback, engineStatus, inTauri, onAudioOutputReset, onControllerBatch, onControllerUpdate, performanceSetSyncPartner, pickRecordingPath, pitchClassOf, setCrossfader, setCrossfaderConfig, setDeckFxMacro, setMasterGain, startRecording, stopRecording, type ControllerUpdate, type EngineStatus, type KeyNotation } from "./lib/ipc";
+import { BEAT_JUMP_PADS, BEAT_LOOP_PADS, KEY_SHIFT_PADS } from "./lib/controllerFeedback";
 import { useWindowFrame } from "./lib/windowFrame";
 
 const DECK_COLORS = ["var(--deck-a)", "var(--deck-b)", "var(--deck-c)", "var(--deck-d)"];
 const DECK_LETTERS = ["A", "B", "C", "D"];
-const BEAT_LOOP_PADS = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
-const BEAT_JUMP_PADS = [-1, 1, -2, 2, -4, 4, -8, 8];
-/** Pioneer key-shift pad layout: absolute semitones; pads 1 and 8 reset. */
-const KEY_SHIFT_PADS = [4, 5, 6, 7, 0, 1, 2, 3];
 /** SHIFT + key-shift pads: relative semitone steps. */
 const KEY_SHIFT_STEP_PADS = [0, 0, 0, 0, 0, 0, 1, -1];
 
@@ -363,66 +361,21 @@ export function App() {
     };
   }, []);
 
-  // LED/motor feedback: push each mapped control's current value to the device so the hardware
-  // tracks software state (lit pads, LED rings, motor faders) — for UI changes, not just the
-  // controller's own moves. The engine no-ops without an active profile/output and dedups
-  // redundant resends. Tempo state is a ratio; the control bus speaks ±percent. (Master gain has
-  // no UI control, so it rides the controller-echo path only.)
-  const feedbackValues: [string, number][] = [
-    ...decks.flatMap((d): [string, number][] => {
-      const s = d.state;
-      const prefix = `deck.${d.deck}`;
-      return [
-        ...s.hotCues.map((hotCue, i): [string, number] => [`${prefix}.hotcue.${i}`, hotCue == null ? 0 : 1]),
-        ...BEAT_LOOP_PADS.map((beats, i): [string, number] => [`${prefix}.beatloop.${i}`, s.loop.active && s.loop.beats === beats ? 1 : 0]),
-        ...BEAT_JUMP_PADS.map((_, i): [string, number] => [`${prefix}.beatjump.${i}`, s.meta ? 1 : 0]),
-        ...KEY_SHIFT_PADS.map((_, i): [string, number] => [`${prefix}.key_shift.${i}`, s.meta && s.keyPad === i ? 1 : 0]),
-        [`${prefix}.loop.in`, s.loop.active || s.loop.armed ? 1 : 0],
-        [`${prefix}.loop.out`, s.loop.active ? 1 : 0],
-        [`${prefix}.loop.toggle`, s.loop.active ? 1 : 0],
-        [`${prefix}.gain`, s.gain],
-        [`${prefix}.trim`, s.trim],
-        [`${prefix}.volume`, s.volume],
-        [`${prefix}.headphone_cue`, cue.cued.has(d.deck) ? 1 : 0],
-        [`${prefix}.filter`, s.filter],
-        [`${prefix}.eq.low`, s.eq.low],
-        [`${prefix}.eq.mid`, s.eq.mid],
-        [`${prefix}.eq.high`, s.eq.hi],
-        [`${prefix}.tempo`, (s.tempo - 1) * 100],
-        [`${prefix}.play`, s.playing ? 1 : 0],
-        [`${prefix}.keylock`, s.keylock ? 1 : 0],
-        [`${prefix}.sync`, s.synced ? 1 : 0],
-        [`fx.toggle.${d.deck}`, beatFx.isOn(d) ? 1 : 0],
-      ];
-    }),
-    ...Array.from({ length: 16 }, (_, local): [string, number] => [
-      `sampler.${local}.trigger`,
-      sampler.nameAt(sampler.bank * 16 + local) ? 1 : 0,
-    ]),
-    ["mixer.crossfader", xfade],
-    ["mixer.cue_mix", cue.mix],
-    ["mixer.cue_volume", cue.volume],
-    ["sampler.gain", sampler.gain],
-  ];
-  // Only changed values cross IPC; the native side keeps the desired state for reconnects.
-  const sentFeedbackRef = useRef(new Map<string, number>());
-  const sendFeedback = useCallback((values: [string, number][], force: boolean) => {
+  const emitControllerFeedback = useCallback((control: string, value: number) => {
     if (!inTauri()) return;
-    values
-      .filter(([control, value]) => force || sentFeedbackRef.current.get(control) !== value)
-      .forEach(([control, value]) => {
-        sentFeedbackRef.current.set(control, value);
-        controllerFeedback(control, value).catch(() => {});
-      });
+    controllerFeedback(control, value).catch(() => {});
   }, []);
-  useEffect(() => {
-    sendFeedback(feedbackValues, false);
+  const { resend: pushFeedback } = useControllerFeedback({
+    decks,
+    beatFx,
+    cue,
+    sampler,
+    crossfader: xfade,
+    emit: emitControllerFeedback,
   });
-  const feedbackValuesRef = useRef(feedbackValues);
-  feedbackValuesRef.current = feedbackValues;
-  const pushFeedback = useCallback(() => sendFeedback(feedbackValuesRef.current, true), [sendFeedback]);
   // Native discovery may connect before React mounts. Reconcile both the initial
   // session and later reconnects so controller LEDs reflect current software state.
+  // Profile activation resends through the controller:resync event.
   const feedbackRef = useRef(pushFeedback);
   feedbackRef.current = pushFeedback;
   useEffect(() => {
@@ -436,12 +389,6 @@ export function App() {
     }).catch(() => {});
     return () => { live = false; un.then((stop) => stop()).catch(() => {}); };
   }, []);
-  // …and on demand when a profile is (re)activated, to sync the device to current state at connect.
-  useEffect(() => {
-    const onResync = () => pushFeedback();
-    window.addEventListener("controller:resync", onResync);
-    return () => window.removeEventListener("controller:resync", onResync);
-  }, [pushFeedback]);
 
   const slotLane = (d: DeckController) => ({
     state: d.state,
