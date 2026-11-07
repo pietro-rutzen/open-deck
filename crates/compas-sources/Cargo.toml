@@ -14,10 +14,11 @@ tracing = { workspace = true }
 
 [dependencies.symphonia]
 workspace = true
-# Permissive (MPL-2.0). Enable the formats/codecs we need; AAC/ALAC/MP4 coverage is
-# partial in symphonia — see ARCHITECTURE.md §"Decoding & licensing" for the FFmpeg
-# fallback decision. Patent note: MP3 patents have expired; AAC patents have not.
-features = ["mp3", "flac", "wav", "pcm", "ogg", "vorbis", "isomp4", "aac"]
+# Permissive (MPL-2.0). AIFF here is uncompressed PCM. AAC-LC in MPEG-4 ADTS
+# and in MPEG-4 (.m4a) is checked with generated fixtures. MPEG-2 ADTS, ALAC,
+# HE-AAC, and compressed AIFC stay unsupported. Patent note:
+# MP3 patents have expired; AAC patents have not.
+features = ["mp3", "flac", "wav", "pcm", "ogg", "vorbis", "isomp4", "aac", "aiff"]
 
 [lints]
 workspace = true

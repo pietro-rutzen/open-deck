@@ -19,7 +19,7 @@ A later session lost hardware LOAD while drag and drop still worked. The exact f
 - A library of local files, with folders and crates, and recording of the master mix to WAV.
 - Optional oscilloscope, stereo image, and spectrum on each deck. A live comparison against MiniMeters has not been run. Do not read the meters as matched to MiniMeters.
 
-The folder scanner accepts `mp3`, `flac`, `wav`, `m4a`, `aac`, `ogg`, `oga`, `aiff`, and `aif`. Decode uses Symphonia with MP3, FLAC, WAV/PCM, Ogg Vorbis, and partial ISO MP4/AAC. A listed extension is not a promise that every file of that type opens. Spotify mixing is not available. See [docs/SPOTIFY_FEASIBILITY.md](docs/SPOTIFY_FEASIBILITY.md).
+The folder scanner accepts `mp3`, `flac`, `wav`, `m4a`, `aac`, `ogg`, `oga`, `aiff`, and `aif`. Decode uses Symphonia. Generated fixtures confirm uncompressed PCM WAV, uncompressed PCM AIFF (`.aiff` and `.aif`), AAC-LC in MPEG-4 ADTS (`.aac` sync `0xFFF1`), and AAC-LC inside an MPEG-4 `.m4a`, each at the fixture's 44.1 kHz stereo layout. MP3, FLAC, and Ogg Vorbis stay enabled. MPEG-2 ADTS (sync `0xFFF9`, including the file macOS `afconvert` writes), ALAC, HE-AAC, USAC, and compressed AIFC are not covered. A listed extension is not a promise that every file of that type opens. Spotify mixing is not available. See [docs/SPOTIFY_FEASIBILITY.md](docs/SPOTIFY_FEASIBILITY.md).
 
 ## DDJ-FLX4
 
