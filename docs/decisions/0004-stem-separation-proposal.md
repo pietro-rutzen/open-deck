@@ -1,6 +1,6 @@
 # ADR-0004 — Stem separation: offline proposal, no implementation
 
-- Status: proposed
+- Status: proposed. An offline classical prototype was later approved; see ADR-0005. This proposal's model gate is unchanged.
 - Date: 2026-11-07
 - Author / accountable role: Architect
 - Decision authority / review evidence: Owner review required. This document does not accept a model, a runtime, or a product feature.
@@ -8,6 +8,8 @@
 - Supersedes / superseded by: none. It does not reverse the 2026-06-24 removal of the earlier Demucs / ONNX stem path recorded in `ROADMAP.md`.
 
 This is an engineering proposal, not legal advice and not a measurement report. Sources were read on 7 November 2026 (Europe/Helsinki). Licenses change; the linked texts are the authority.
+
+On 7 November 2026 at 11:29 Europe/Helsinki the owner approved an offline classical-DSP prototype with no model weights and no playback change. That work is ADR-0005. It does not lift the model gate below, and it does not make harmonic/percussive separation a product stem.
 
 ## Approval gate
 

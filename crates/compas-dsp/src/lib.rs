@@ -8,11 +8,15 @@
 //!   `RT-SAFE` doc-comment on each.
 //! * [`analysis`] — **offline** analysis (BPM, key). These allocate and run on a
 //!   worker thread, never on the audio thread.
+//! * [`hpss`] — **offline experiment**. Median-filter harmonic/percussive
+//!   separation. Not a vocal, drum, or bass stem, and not called from the
+//!   audio callback.
 
 #![forbid(unsafe_code)]
 
 pub mod analysis;
 pub mod fx;
+pub mod hpss;
 pub mod live;
 pub mod rt;
 
