@@ -510,6 +510,7 @@ button.src-row:hover { background: rgba(255, 255, 255, 0.04); }
 .tl-head { height: 30px; flex: none; border-bottom: 1px solid var(--border-hairline); }
 .tl-head span { font-size: 9px; font-weight: 600; letter-spacing: 0.12em; color: var(--text-tertiary); text-transform: uppercase; }
 .tl-body { min-height: 0; overflow: visible; }
+.tl-window-pad { grid-column: 1 / -1; }
 
 /* Clean, unobtrusive scrollbars for scroll regions (WebView2 / Chromium). Thin, translucent
    thumb on a transparent track; brightens on hover. */

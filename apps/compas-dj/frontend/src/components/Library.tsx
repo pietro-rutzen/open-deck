@@ -3,6 +3,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useImperativeHandle,
   useMemo,
   useRef,
@@ -10,6 +11,7 @@ import {
   type DragEvent,
   type MouseEvent,
 } from 'react';
+import { flushSync } from 'react-dom';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import type { PhysicalPosition } from '@tauri-apps/api/dpi';
 import { ask } from '@tauri-apps/plugin-dialog';
@@ -50,6 +52,13 @@ import {
 } from '../lib/librarySort';
 import { withTrackNumbers } from '../lib/libraryRows';
 import { libraryPropsEqual } from '../lib/librarySurface';
+import {
+  LIBRARY_HEADER_HEIGHT,
+  LIBRARY_ROW_HEIGHT,
+  libraryMountedRanges,
+  scrollTopForLibraryRow,
+  visibleLibraryRowWindow,
+} from '../lib/libraryWindow';
 import {
   ascendFolder,
   childFolders,
@@ -1045,6 +1054,68 @@ export const Library = memo(
     const sourceIndexRef = useRef(0);
     const browseRowsRef = useRef(browseRows);
     browseRowsRef.current = browseRows;
+    const sheetRef = useRef<HTMLDivElement>(null);
+    const rowMetricsRef = useRef({
+      rowHeight: LIBRARY_ROW_HEIGHT,
+      headerHeight: LIBRARY_HEADER_HEIGHT,
+    });
+    const [rowWindow, setRowWindow] = useState(() =>
+      visibleLibraryRowWindow(
+        24,
+        0,
+        LIBRARY_ROW_HEIGHT * 12,
+        LIBRARY_ROW_HEIGHT,
+        LIBRARY_HEADER_HEIGHT,
+      ),
+    );
+    const syncRowWindow = () => {
+      const sheet = sheetRef.current;
+      const { rowHeight, headerHeight } = rowMetricsRef.current;
+      const count = browseRowsRef.current.length;
+      const viewport = sheet && sheet.clientHeight > 0 ? sheet.clientHeight : rowHeight * 12;
+      const next = visibleLibraryRowWindow(
+        count,
+        sheet?.scrollTop ?? 0,
+        viewport,
+        rowHeight,
+        headerHeight,
+      );
+      setRowWindow((current) =>
+        current.start === next.start &&
+        current.end === next.end &&
+        current.topHeight === next.topHeight &&
+        current.bottomHeight === next.bottomHeight &&
+        current.rowHeight === next.rowHeight
+          ? current
+          : next,
+      );
+    };
+    useLayoutEffect(() => {
+      const sheet = sheetRef.current;
+      const measuredRow = sheet?.querySelector<HTMLElement>('.tl-row')?.offsetHeight ?? 0;
+      const measuredHead = sheet?.querySelector<HTMLElement>('.tl-head')?.offsetHeight ?? 0;
+      if (measuredRow >= 20 && Math.abs(measuredRow - rowMetricsRef.current.rowHeight) >= 1) {
+        rowMetricsRef.current = { ...rowMetricsRef.current, rowHeight: measuredRow };
+      }
+      if (measuredHead >= 16 && Math.abs(measuredHead - rowMetricsRef.current.headerHeight) >= 1) {
+        rowMetricsRef.current = { ...rowMetricsRef.current, headerHeight: measuredHead };
+      }
+      syncRowWindow();
+    });
+    useEffect(() => {
+      const sheet = sheetRef.current;
+      if (!sheet) return;
+      const onScroll = () => syncRowWindow();
+      sheet.addEventListener('scroll', onScroll, { passive: true });
+      const observer = typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(() => syncRowWindow());
+      observer?.observe(sheet);
+      return () => {
+        sheet.removeEventListener('scroll', onScroll);
+        observer?.disconnect();
+      };
+    }, []);
     useEffect(() => {
       if (folderPath)
         sourceIndexRef.current =
@@ -1055,15 +1126,28 @@ export const Library = memo(
           );
       else sourceIndexRef.current = 0;
     }, [folderPath, folders]);
-    const revealRow = (key: string) =>
-      requestAnimationFrame(() => {
-        if (selectionKeyRef.current !== key) return;
-        const row = rootRef.current?.querySelector<HTMLElement>(
-          `[data-browse-key="${CSS.escape(key)}"]`,
+    const revealRow = (key: string) => {
+      const sheet = sheetRef.current;
+      const index = browseRowsRef.current.findIndex((row) => row.key === key);
+      if (sheet && index >= 0) {
+        const { rowHeight, headerHeight } = rowMetricsRef.current;
+        const viewport = sheet.clientHeight > 0 ? sheet.clientHeight : rowHeight * 12;
+        const nextTop = scrollTopForLibraryRow(
+          index,
+          sheet.scrollTop,
+          viewport,
+          rowHeight,
+          headerHeight,
         );
-        row?.focus();
-        row?.scrollIntoView({ block: 'nearest' });
-      });
+        if (nextTop !== sheet.scrollTop) sheet.scrollTop = nextTop;
+        flushSync(() => syncRowWindow());
+      }
+      if (selectionKeyRef.current !== key) return;
+      const row = sheet?.querySelector<HTMLElement>(
+        `[data-browse-key="${CSS.escape(key)}"]`,
+      );
+      row?.focus({ preventScroll: true });
+    };
     const selectBrowse = (index: number, focus = false) => {
       const row = browseRowsRef.current[index];
       if (!row) return;
@@ -1155,6 +1239,49 @@ export const Library = memo(
       });
       return () => { alive = false; stop?.(); };
     }, []);
+
+    const pinnedIndex = browseKey
+      ? browseRows.findIndex((row) => row.key === browseKey)
+      : browseRows.length > 0
+        ? 0
+        : -1;
+    const windowStart = browseRows.length === 0 ? 0 : Math.min(rowWindow.start, browseRows.length - 1);
+    const windowEnd = browseRows.length === 0
+      ? 0
+      : Math.min(browseRows.length, Math.max(rowWindow.end, windowStart + 1));
+    const mountedRanges = libraryMountedRanges(
+      windowStart,
+      windowEnd,
+      pinnedIndex,
+      browseRows.length,
+    );
+    const mountedEntries: Array<
+      | { kind: 'pad'; key: string; height: number }
+      | { kind: 'row'; row: (typeof browseRows)[number]; index: number }
+    > = [];
+    mountedRanges.forEach((range, rangeIndex) => {
+      const previousEnd = rangeIndex === 0 ? 0 : mountedRanges[rangeIndex - 1].end;
+      const gap = range.start - previousEnd;
+      if (gap > 0) {
+        mountedEntries.push({
+          kind: 'pad',
+          key: `pad-${range.start}`,
+          height: gap * rowWindow.rowHeight,
+        });
+      }
+      for (let index = range.start; index < range.end; index += 1) {
+        const row = browseRows[index];
+        if (row) mountedEntries.push({ kind: 'row', row, index });
+      }
+    });
+    const trailingRows = browseRows.length - (mountedRanges[mountedRanges.length - 1]?.end ?? 0);
+    if (trailingRows > 0) {
+      mountedEntries.push({
+        kind: 'pad',
+        key: 'pad-end',
+        height: trailingRows * rowWindow.rowHeight,
+      });
+    }
 
     return (
       <section className="library" ref={rootRef}>
@@ -1371,7 +1498,7 @@ export const Library = memo(
               </button>
             </div>
           )}
-          <div className="tl-sheet">
+          <div className="tl-sheet" ref={sheetRef}>
             <div
               className="tl-head tl-grid"
               aria-label="Sort tracks"
@@ -1425,7 +1552,18 @@ export const Library = memo(
                   </p>
                 </div>
               ) : (
-                browseRows.map((row, index) => {
+                mountedEntries.map((entry) => {
+                  if (entry.kind === 'pad') {
+                    return (
+                      <div
+                        key={entry.key}
+                        className="tl-window-pad"
+                        style={{ height: entry.height }}
+                        aria-hidden="true"
+                      />
+                    );
+                  }
+                  const { row, index } = entry;
                   const selectedRow =
                     row.key === browseKey;
                   const move = (next: number) =>
@@ -1437,9 +1575,11 @@ export const Library = memo(
                     return (
                       <div
                         key={row.key}
-                        className={`tl-row tl-row--folder ${selectedRow ? 'tl-row--selected' : ''}`}
+                        className={`tl-row tl-row--folder ${index % 2 === 1 ? 'tl-row--stripe' : ''} ${selectedRow ? 'tl-row--selected' : ''}`}
                         role="option"
                         aria-selected={selectedRow}
+                        aria-setsize={browseRows.length}
+                        aria-posinset={index + 1}
                         aria-label={
                           row.kind === 'up'
                             ? `Back to ${row.name}`
@@ -1510,7 +1650,7 @@ export const Library = memo(
                   return (
                     <div
                       key={row.key}
-                      className={`tl-row tl-grid ${!listening && t.play_count > 0 ? 'tl-row--played' : ''} ${selectedRow ? 'tl-row--selected' : ''} ${canReorder ? 'tl-row--reorder' : ''} ${dropKey === row.key ? 'tl-row--drop' : ''}`}
+                      className={`tl-row tl-grid ${index % 2 === 1 ? 'tl-row--stripe' : ''} ${!listening && t.play_count > 0 ? 'tl-row--played' : ''} ${selectedRow ? 'tl-row--selected' : ''} ${canReorder ? 'tl-row--reorder' : ''} ${dropKey === row.key ? 'tl-row--drop' : ''}`}
                       style={
                         loadedAs
                           ? { borderLeftColor: loadedAs.color }
@@ -1518,6 +1658,8 @@ export const Library = memo(
                       }
                       role="option"
                       aria-selected={selectedRow}
+                      aria-setsize={browseRows.length}
+                      aria-posinset={index + 1}
                       aria-label={`${t.title}, ${t.artist || 'Unknown artist'}${t.bpm != null && t.bpm > 0 ? `, ${t.bpm.toFixed(2)} BPM` : ''}${t.key_camelot ? `, ${formatKey(t.key_camelot, t.key_name, keyNotation)}` : ''}${loadedDecks.length ? `, loaded on deck ${loadedDecks.map((d) => d.letter).join(', ')}` : ''}`}
                       tabIndex={
                         selectedRow || (!selected && !browseKey && index === 0)
