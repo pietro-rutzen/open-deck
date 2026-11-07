@@ -48,6 +48,8 @@ import {
   type LibrarySort,
   type SortColumn,
 } from '../lib/librarySort';
+import { withTrackNumbers } from '../lib/libraryRows';
+import { libraryPropsEqual } from '../lib/librarySurface';
 import {
   ascendFolder,
   childFolders,
@@ -997,13 +999,16 @@ export const Library = memo(
           key: string;
         }
       | { kind: 'track'; track: DbTrack; key: string };
-    const browseRows = useMemo<BrowseRow[]>(() => {
-      if (!browsingFolder || !folderPath)
-        return folderTracks.map((track) => ({
-          kind: 'track',
-          track,
-          key: `track:${track.path}`,
-        }));
+    const browseRows = useMemo(() => {
+      if (!browsingFolder || !folderPath) {
+        return withTrackNumbers(
+          folderTracks.map((track) => ({
+            kind: 'track' as const,
+            track,
+            key: `track:${track.path}`,
+          })),
+        );
+      }
       const parent = ascendFolder(folderPath, folders);
       const up: BrowseRow = parent
         ? {
@@ -1013,7 +1018,7 @@ export const Library = memo(
             key: `up:${parent}`,
           }
         : { kind: 'up', path: null, name: 'All tracks', key: 'up:library' };
-      return [
+      return withTrackNumbers([
         up,
         ...folderEntries.map((entry) => ({
           kind: 'folder' as const,
@@ -1025,7 +1030,7 @@ export const Library = memo(
           track,
           key: `track:${track.path}`,
         })),
-      ];
+      ]);
     }, [browsingFolder, folderPath, folders, folderEntries, folderTracks]);
     const selected =
       folderTracks.find((track) => track.path === selectedPath) ?? null;
@@ -1501,10 +1506,7 @@ export const Library = memo(
                     (_, i) => loadedPaths[i] === t.path,
                   );
                   const loadedAs = loadedDecks[0];
-                  const trackNumber =
-                    browseRows
-                      .slice(0, index)
-                      .filter((item) => item.kind === 'track').length + 1;
+                  const trackNumber = row.trackNumber;
                   return (
                     <div
                       key={row.key}
@@ -1807,4 +1809,5 @@ export const Library = memo(
       </section>
     );
   }),
+  libraryPropsEqual,
 );

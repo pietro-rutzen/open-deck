@@ -452,11 +452,18 @@ export function App() {
     onResetGrid: d.actions.resetGrid,
   });
 
+  const loadSamplerFromLibrary = useCallback((slot: number, path: string) => {
+    void sampler.loadPath(slot, path);
+  }, [sampler.loadPath]);
   const quad = deckCount === 4;
-  const nextDecks = (quad ? [0, 1, 2, 3] : [leftSel, rightSel]).flatMap((index) => {
-    const letter = DECK_LETTERS[index];
-    return letter ? [{ index, letter }] : [];
-  });
+  const nextDecks = useMemo(
+    () =>
+      (quad ? [0, 1, 2, 3] : [leftSel, rightSel]).flatMap((index) => {
+        const letter = DECK_LETTERS[index];
+        return letter ? [{ index, letter }] : [];
+      }),
+    [quad, leftSel, rightSel],
+  );
   // In 4-deck mode each deck syncs to the other deck in its row (A↔B, C↔D; partner index = deck ^ 1).
   const fourDeckProps = (d: DeckController) => {
     const partner = decks[d.deck ^ 1];
@@ -546,7 +553,7 @@ export function App() {
                 />
               </div>
             </>
-          )} lower={<Library loadedPaths={loadedPaths} nextDecks={nextDecks} keyNotation={keyNotation} onSamplerLoad={(slot, path) => { void sampler.loadPath(slot, path); }} />} />
+          )} lower={<Library loadedPaths={loadedPaths} nextDecks={nextDecks} keyNotation={keyNotation} onSamplerLoad={loadSamplerFromLibrary} />} />
         </div>
       </div>
       <StatusBar
