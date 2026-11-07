@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { message, open, save } from "@tauri-apps/plugin-dialog";
+import { recordingDefaultFilename } from "./recordingFilename";
 
 /** True when running inside the Tauri webview (vs. a plain browser dev tab). */
 export function inTauri(): boolean {
@@ -809,9 +810,8 @@ export const stopRecording = () => invoke("stop_recording");
 
 /** Native save dialog for the recording target; returns the chosen path or null. */
 export async function pickRecordingPath(): Promise<string | null> {
-  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
   const selected = await save({
-    defaultPath: `compas-mix-${stamp}.wav`,
+    defaultPath: recordingDefaultFilename(new Date()),
     filters: [{ name: "WAV audio", extensions: ["wav"] }],
   });
   return typeof selected === "string" ? selected : null;
