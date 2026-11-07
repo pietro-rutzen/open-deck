@@ -92,8 +92,8 @@ impl Sampler {
         self.gain.set_target(gain.max(0.0));
     }
 
-    /// Trigger a pad. One-shot pads start a fresh (overlapping) voice each press; looped pads
-    /// toggle: the first press starts the loop, the next stops it. RT-SAFE.
+    /// Trigger a pad. A one-shot replaces any active voice of that slot so a second press
+    /// restarts at the beginning. A looped pad toggles. RT-SAFE.
     pub fn trigger(&mut self, slot: usize, velocity: u8) {
         let Some(buf) = self.slots.get(slot).and_then(|s| s.as_ref()) else {
             return;
@@ -102,6 +102,13 @@ impl Sampler {
             return;
         }
         let looping = self.looped.get(slot).copied().unwrap_or(false);
+        if !looping {
+            for voice in self.voices.iter_mut() {
+                if voice.active && voice.slot == slot {
+                    voice.active = false;
+                }
+            }
+        }
         if looping {
             // Toggle: if this loop is already playing, stop it instead of stacking another.
             if let Some(v) = self
@@ -223,6 +230,24 @@ mod tests {
         // After the 4-frame sample ends, the voice frees and output returns to silence.
         let (l, _r) = s.process();
         assert_eq!(l, 0.0);
+    }
+
+    #[test]
+    fn one_shot_retrigger_replaces_the_voice_instead_of_stacking() {
+        let mut sampler = Sampler::new(48_000.0);
+        sampler.set_slot(0, Some(buf(0.5, 100)));
+        sampler.trigger(0, 127);
+        sampler.trigger(0, 127);
+        let active = sampler.voices.iter().filter(|voice| voice.active).count();
+        assert_eq!(active, 1);
+        assert_eq!(
+            sampler
+                .voices
+                .iter()
+                .find(|voice| voice.active)
+                .map(|voice| voice.playhead),
+            Some(0.0)
+        );
     }
 
     #[test]

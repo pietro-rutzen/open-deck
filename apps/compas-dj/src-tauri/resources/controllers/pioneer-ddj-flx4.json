@@ -1716,6 +1716,798 @@
       },
       "control": "deck.1.beatjump.scale_up",
       "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 16
+      },
+      "control": "deck.0.pad_fx.8",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 80
+      },
+      "control": "deck.0.pad_fx.16",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 80
+      },
+      "control": "deck.0.pad_fx.24",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 64
+      },
+      "control": "deck.0.keyboard.0",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 64
+      },
+      "control": "deck.0.keyboard_shift.0",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 17
+      },
+      "control": "deck.0.pad_fx.9",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 81
+      },
+      "control": "deck.0.pad_fx.17",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 81
+      },
+      "control": "deck.0.pad_fx.25",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 65
+      },
+      "control": "deck.0.keyboard.1",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 65
+      },
+      "control": "deck.0.keyboard_shift.1",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 18
+      },
+      "control": "deck.0.pad_fx.10",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 82
+      },
+      "control": "deck.0.pad_fx.18",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 82
+      },
+      "control": "deck.0.pad_fx.26",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 66
+      },
+      "control": "deck.0.keyboard.2",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 66
+      },
+      "control": "deck.0.keyboard_shift.2",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 19
+      },
+      "control": "deck.0.pad_fx.11",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 83
+      },
+      "control": "deck.0.pad_fx.19",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 83
+      },
+      "control": "deck.0.pad_fx.27",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 67
+      },
+      "control": "deck.0.keyboard.3",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 67
+      },
+      "control": "deck.0.keyboard_shift.3",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 20
+      },
+      "control": "deck.0.pad_fx.4",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 20
+      },
+      "control": "deck.0.pad_fx.12",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 84
+      },
+      "control": "deck.0.pad_fx.20",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 84
+      },
+      "control": "deck.0.pad_fx.28",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 68
+      },
+      "control": "deck.0.keyboard.4",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 68
+      },
+      "control": "deck.0.keyboard_shift.4",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 21
+      },
+      "control": "deck.0.pad_fx.5",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 21
+      },
+      "control": "deck.0.pad_fx.13",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 85
+      },
+      "control": "deck.0.pad_fx.21",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 85
+      },
+      "control": "deck.0.pad_fx.29",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 69
+      },
+      "control": "deck.0.keyboard.5",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 69
+      },
+      "control": "deck.0.keyboard_shift.5",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 22
+      },
+      "control": "deck.0.pad_fx.6",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 22
+      },
+      "control": "deck.0.pad_fx.14",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 86
+      },
+      "control": "deck.0.pad_fx.22",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 86
+      },
+      "control": "deck.0.pad_fx.30",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 70
+      },
+      "control": "deck.0.keyboard.6",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 70
+      },
+      "control": "deck.0.keyboard_shift.6",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 23
+      },
+      "control": "deck.0.pad_fx.7",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 23
+      },
+      "control": "deck.0.pad_fx.15",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 87
+      },
+      "control": "deck.0.pad_fx.23",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 87
+      },
+      "control": "deck.0.pad_fx.31",
+      "soft_takeover": false
+    },
+    {
+      "channel": 7,
+      "input": {
+        "kind": "note",
+        "note": 71
+      },
+      "control": "deck.0.keyboard.7",
+      "soft_takeover": false
+    },
+    {
+      "channel": 8,
+      "input": {
+        "kind": "note",
+        "note": 71
+      },
+      "control": "deck.0.keyboard_shift.7",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 16
+      },
+      "control": "deck.1.pad_fx.8",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 80
+      },
+      "control": "deck.1.pad_fx.16",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 80
+      },
+      "control": "deck.1.pad_fx.24",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 64
+      },
+      "control": "deck.1.keyboard.0",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 64
+      },
+      "control": "deck.1.keyboard_shift.0",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 17
+      },
+      "control": "deck.1.pad_fx.9",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 81
+      },
+      "control": "deck.1.pad_fx.17",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 81
+      },
+      "control": "deck.1.pad_fx.25",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 65
+      },
+      "control": "deck.1.keyboard.1",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 65
+      },
+      "control": "deck.1.keyboard_shift.1",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 18
+      },
+      "control": "deck.1.pad_fx.10",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 82
+      },
+      "control": "deck.1.pad_fx.18",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 82
+      },
+      "control": "deck.1.pad_fx.26",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 66
+      },
+      "control": "deck.1.keyboard.2",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 66
+      },
+      "control": "deck.1.keyboard_shift.2",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 19
+      },
+      "control": "deck.1.pad_fx.11",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 83
+      },
+      "control": "deck.1.pad_fx.19",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 83
+      },
+      "control": "deck.1.pad_fx.27",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 67
+      },
+      "control": "deck.1.keyboard.3",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 67
+      },
+      "control": "deck.1.keyboard_shift.3",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 20
+      },
+      "control": "deck.1.pad_fx.4",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 20
+      },
+      "control": "deck.1.pad_fx.12",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 84
+      },
+      "control": "deck.1.pad_fx.20",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 84
+      },
+      "control": "deck.1.pad_fx.28",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 68
+      },
+      "control": "deck.1.keyboard.4",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 68
+      },
+      "control": "deck.1.keyboard_shift.4",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 21
+      },
+      "control": "deck.1.pad_fx.5",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 21
+      },
+      "control": "deck.1.pad_fx.13",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 85
+      },
+      "control": "deck.1.pad_fx.21",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 85
+      },
+      "control": "deck.1.pad_fx.29",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 69
+      },
+      "control": "deck.1.keyboard.5",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 69
+      },
+      "control": "deck.1.keyboard_shift.5",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 22
+      },
+      "control": "deck.1.pad_fx.6",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 22
+      },
+      "control": "deck.1.pad_fx.14",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 86
+      },
+      "control": "deck.1.pad_fx.22",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 86
+      },
+      "control": "deck.1.pad_fx.30",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 70
+      },
+      "control": "deck.1.keyboard.6",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 70
+      },
+      "control": "deck.1.keyboard_shift.6",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 23
+      },
+      "control": "deck.1.pad_fx.7",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 23
+      },
+      "control": "deck.1.pad_fx.15",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 87
+      },
+      "control": "deck.1.pad_fx.23",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 87
+      },
+      "control": "deck.1.pad_fx.31",
+      "soft_takeover": false
+    },
+    {
+      "channel": 9,
+      "input": {
+        "kind": "note",
+        "note": 71
+      },
+      "control": "deck.1.keyboard.7",
+      "soft_takeover": false
+    },
+    {
+      "channel": 10,
+      "input": {
+        "kind": "note",
+        "note": 71
+      },
+      "control": "deck.1.keyboard_shift.7",
+      "soft_takeover": false
     }
   ]
 }

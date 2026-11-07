@@ -380,7 +380,7 @@ impl Registry {
                     Unit::Boolean,
                 ));
             }
-            for pad in 0..4 {
+            for pad in 0..32 {
                 r.add(ControlSpec::new(
                     p(&format!("pad_fx.{pad}")),
                     Behavior::Toggle,
@@ -407,6 +407,18 @@ impl Registry {
                     p(&format!("key_shift_step.{pad}")),
                     Behavior::Toggle,
                     "Key shift step pad",
+                    Unit::Boolean,
+                ));
+                r.add(ControlSpec::new(
+                    p(&format!("keyboard.{pad}")),
+                    Behavior::Toggle,
+                    "Keyboard pad",
+                    Unit::Boolean,
+                ));
+                r.add(ControlSpec::new(
+                    p(&format!("keyboard_shift.{pad}")),
+                    Behavior::Toggle,
+                    "Keyboard shift pad",
                     Unit::Boolean,
                 ));
             }

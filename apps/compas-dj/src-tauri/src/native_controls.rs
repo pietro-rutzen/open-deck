@@ -65,6 +65,10 @@ pub(crate) struct NativeAction {
     pub performance: Option<PerformanceMirror>,
     /// Extra controls to mirror, such as the tempo fader after sync.
     pub extra_mirrors: Vec<(String, f64)>,
+    /// Mirror this control id instead of the incoming pad control.
+    pub mirror_as: Option<String>,
+    /// Deck pitch to commit through the effects snapshot after the other messages.
+    pub pitch: Option<f64>,
 }
 
 fn single(message: Option<EngineMsg>, mirror: bool) -> NativeAction {
@@ -75,6 +79,8 @@ fn single(message: Option<EngineMsg>, mirror: bool) -> NativeAction {
         mirror_value: None,
         performance: None,
         extra_mirrors: Vec::new(),
+        mirror_as: None,
+        pitch: None,
     }
 }
 
@@ -286,6 +292,11 @@ struct DeckSnapshot {
     bpm: f64,
     synced: bool,
     partner: Option<usize>,
+    keyboard_cue: Option<usize>,
+    keyboard_transpose: i8,
+    keyboard_restore: Option<f64>,
+    keyboard_held: u8,
+    keyboard_last: Option<u8>,
 }
 
 impl Default for DeckSnapshot {
@@ -306,6 +317,11 @@ impl Default for DeckSnapshot {
             bpm: 0.0,
             synced: false,
             partner: None,
+            keyboard_cue: None,
+            keyboard_transpose: 0,
+            keyboard_restore: None,
+            keyboard_held: 0,
+            keyboard_last: None,
         }
     }
 }
@@ -341,6 +357,34 @@ impl PerformanceState {
         }
         let frame = frame.filter(|frame| frame.is_finite());
         self.with_deck(deck, |snapshot| snapshot.hot_cues[slot] = frame);
+    }
+
+    /// Leave or re-enter keyboard mode. Returns the pitch to restore, when a pad was holding one.
+    pub(crate) fn reset_keyboard(&self, deck: usize) -> Option<f64> {
+        self.with_deck(deck, |snapshot| {
+            snapshot.keyboard_cue = None;
+            snapshot.keyboard_held = 0;
+            snapshot.keyboard_last = None;
+            snapshot.keyboard_restore.take()
+        })?
+    }
+
+    /// Hot-cue selection, then pitched playback from that cue. Shift deletes or transposes.
+    pub(crate) fn keyboard(
+        &self,
+        deck: usize,
+        slot: usize,
+        shifted: bool,
+        pressed: bool,
+        heard: Option<f64>,
+        current_pitch: f64,
+    ) -> Option<NativeAction> {
+        if slot >= HOT_CUES || !current_pitch.is_finite() {
+            return None;
+        }
+        self.with_deck(deck, |snapshot| {
+            keyboard_pad(deck, slot, shifted, pressed, heard, current_pitch, snapshot)
+        })
     }
 
     pub(crate) fn set_hot_cues(&self, deck: usize, frames: &[Option<f64>]) {
@@ -436,6 +480,11 @@ impl PerformanceState {
                 0.0
             };
             snapshot.bpm = if bpm.is_finite() { bpm.max(0.0) } else { 0.0 };
+            snapshot.keyboard_cue = None;
+            snapshot.keyboard_transpose = 0;
+            snapshot.keyboard_restore = None;
+            snapshot.keyboard_held = 0;
+            snapshot.keyboard_last = None;
         });
     }
 
@@ -574,6 +623,146 @@ fn apply_performance(
         "jump.forward" => beat_jump_action(deck, 4.0, frame?, performance),
         _ => None,
     }
+}
+
+const KEYBOARD_PITCHES: [i16; HOT_CUES] = [4, 5, 6, 7, 0, 1, 2, 3];
+
+fn keyboard_semitone(slot: usize, transpose: i8) -> f64 {
+    f64::from((KEYBOARD_PITCHES[slot] + i16::from(transpose)).clamp(-12, 12))
+}
+
+fn keyboard_pad(
+    deck: usize,
+    slot: usize,
+    shifted: bool,
+    pressed: bool,
+    heard: Option<f64>,
+    current_pitch: f64,
+    snapshot: &mut DeckSnapshot,
+) -> NativeAction {
+    if !pressed {
+        if shifted || snapshot.keyboard_held & (1 << slot) == 0 {
+            return single(None, false);
+        }
+        snapshot.keyboard_held &= !(1 << slot);
+        if snapshot.keyboard_last == Some(slot as u8) {
+            snapshot.keyboard_last = None;
+        }
+        if snapshot.keyboard_held == 0 {
+            let mut action = single(None, false);
+            action.pitch = snapshot.keyboard_restore.take();
+            return action;
+        }
+        return single(None, false);
+    }
+    if shifted {
+        return keyboard_shift(deck, slot, snapshot);
+    }
+    if snapshot.keyboard_cue.is_none() {
+        return keyboard_select(deck, slot, heard, snapshot);
+    }
+    keyboard_play(deck, slot, heard, current_pitch, snapshot)
+}
+
+fn keyboard_select(
+    deck: usize,
+    slot: usize,
+    heard: Option<f64>,
+    snapshot: &mut DeckSnapshot,
+) -> NativeAction {
+    if snapshot.hot_cues[slot].is_none() {
+        let Some(heard) = heard.filter(|frame| frame.is_finite()) else {
+            return single(None, false);
+        };
+        snapshot.hot_cues[slot] = Some(heard.max(0.0));
+    }
+    snapshot.keyboard_cue = Some(slot);
+    let mut action = single(None, true);
+    action.mirror_as = Some(format!("deck.{deck}.hotcue.{slot}"));
+    action.performance = Some(PerformanceMirror {
+        hot_cue_frame: snapshot.hot_cues[slot],
+        ..PerformanceMirror::default()
+    });
+    action
+}
+
+fn keyboard_play(
+    deck: usize,
+    slot: usize,
+    heard: Option<f64>,
+    current_pitch: f64,
+    snapshot: &mut DeckSnapshot,
+) -> NativeAction {
+    let Some(cue_slot) = snapshot.keyboard_cue else {
+        return keyboard_select(deck, slot, heard, snapshot);
+    };
+    let Some(stored) = snapshot.hot_cues[cue_slot] else {
+        snapshot.keyboard_cue = None;
+        return keyboard_select(deck, slot, heard, snapshot);
+    };
+    let bit = 1u8 << slot;
+    if snapshot.keyboard_held & bit != 0 {
+        return single(None, false);
+    }
+    if snapshot.keyboard_restore.is_none() {
+        snapshot.keyboard_restore = Some(current_pitch);
+    }
+    snapshot.keyboard_held |= bit;
+    snapshot.keyboard_last = Some(slot as u8);
+    let target = if snapshot.quantize {
+        snapped(stored, snapshot).max(0.0)
+    } else {
+        stored
+    };
+    let mut action = single(
+        Some(EngineMsg::DeckSeek {
+            deck,
+            frame: target,
+        }),
+        false,
+    );
+    action.messages.push(EngineMsg::DeckPlaying {
+        deck,
+        playing: true,
+    });
+    action.pitch = Some(keyboard_semitone(slot, snapshot.keyboard_transpose));
+    action
+}
+
+fn keyboard_shift(deck: usize, slot: usize, snapshot: &mut DeckSnapshot) -> NativeAction {
+    if slot < 6 {
+        let cleared = if let Some(selected) = snapshot.keyboard_cue.take() {
+            snapshot.hot_cues[selected] = None;
+            snapshot.keyboard_held = 0;
+            snapshot.keyboard_last = None;
+            selected
+        } else {
+            snapshot.hot_cues[slot] = None;
+            slot
+        };
+        let mut action = single(None, true);
+        action.mirror_as = Some(format!("deck.{deck}.clear_hotcue.{cleared}"));
+        action.pitch = snapshot.keyboard_restore.take();
+        return action;
+    }
+    let delta: i8 = if slot == 6 { 1 } else { -1 };
+    snapshot.keyboard_transpose = snapshot
+        .keyboard_transpose
+        .saturating_add(delta)
+        .clamp(-12, 12);
+    snapshot
+        .keyboard_last
+        .and_then(|last| {
+            (snapshot.keyboard_held & (1 << last) != 0).then(|| {
+                let mut action = single(None, false);
+                action.pitch = Some(keyboard_semitone(
+                    last as usize,
+                    snapshot.keyboard_transpose,
+                ));
+                action
+            })
+        })
+        .unwrap_or_else(|| single(None, false))
 }
 
 fn pad_slot(name: &str, action: &str) -> Option<usize> {
@@ -1098,6 +1287,109 @@ mod tests {
             Some(EngineMsg::DeckSeek { deck: 0, frame }) if frame == 10_000.0
         ));
         assert!(!jump.mirror);
+    }
+
+    #[test]
+    fn keyboard_selects_a_hot_cue_then_plays_it_at_the_pad_pitch() {
+        let performance = PerformanceState::new();
+        let select = performance
+            .keyboard(0, 2, false, true, Some(12_000.0), 0.0)
+            .expect("select");
+        assert_eq!(select.mirror_as.as_deref(), Some("deck.0.hotcue.2"));
+        assert_eq!(
+            select.performance.and_then(|mirror| mirror.hot_cue_frame),
+            Some(12_000.0)
+        );
+        assert!(select.pitch.is_none());
+        let play = performance
+            .keyboard(0, 0, false, true, None, 1.0)
+            .expect("play");
+        assert!(matches!(
+            play.message,
+            Some(EngineMsg::DeckSeek { deck: 0, frame }) if frame == 12_000.0
+        ));
+        assert!(matches!(
+            play.messages.first(),
+            Some(EngineMsg::DeckPlaying {
+                deck: 0,
+                playing: true
+            })
+        ));
+        assert_eq!(play.pitch, Some(4.0));
+        let again = performance
+            .keyboard(0, 0, false, true, None, 1.0)
+            .expect("repeat press");
+        assert!(again.message.is_none());
+        assert!(again.pitch.is_none());
+        let release = performance
+            .keyboard(0, 0, false, false, None, 1.0)
+            .expect("release");
+        assert_eq!(release.pitch, Some(1.0));
+        performance
+            .keyboard(0, 5, false, true, None, 1.0)
+            .expect("second pad");
+        let transposed = performance
+            .keyboard(0, 6, true, true, None, 1.0)
+            .expect("raise");
+        assert_eq!(transposed.pitch, Some(2.0));
+        let deleted = performance
+            .keyboard(0, 0, true, true, None, 1.0)
+            .expect("delete");
+        assert_eq!(deleted.mirror_as.as_deref(), Some("deck.0.clear_hotcue.2"));
+        assert_eq!(deleted.pitch, Some(1.0));
+        assert_eq!(performance.reset_keyboard(0), None);
+    }
+
+    #[test]
+    fn keyboard_holds_release_quantize_and_decks_stay_independent() {
+        let performance = PerformanceState::new();
+        performance.set_hot_cue(0, 1, Some(4_000.0));
+        let deleted = performance
+            .keyboard(0, 1, true, true, None, 0.0)
+            .expect("delete before selection");
+        assert_eq!(deleted.mirror_as.as_deref(), Some("deck.0.clear_hotcue.1"));
+        performance.install_track(0, 0.0, 48_000.0, 48_000.0, 120.0, 200_000);
+        performance.set_grid(0, 0.0, 48_000.0);
+        performance.set_quantize(0, true);
+        performance.set_hot_cue(0, 3, Some(1_000.0));
+        performance
+            .keyboard(0, 3, false, true, None, 0.0)
+            .expect("select");
+        let play = performance
+            .keyboard(0, 0, false, true, None, 0.0)
+            .expect("quantized play");
+        assert!(matches!(
+            play.message,
+            Some(EngineMsg::DeckSeek { frame, .. }) if frame == 0.0
+        ));
+        performance
+            .keyboard(0, 4, false, true, None, 0.0)
+            .expect("second hold");
+        let one_up = performance
+            .keyboard(0, 0, false, false, None, 0.0)
+            .expect("release one");
+        assert!(one_up.pitch.is_none());
+        let both_up = performance
+            .keyboard(0, 4, false, false, None, 0.0)
+            .expect("release last");
+        assert_eq!(both_up.pitch, Some(0.0));
+        performance
+            .keyboard(0, 0, false, true, None, 0.0)
+            .expect("hold for transpose");
+        let mut raised = None;
+        for _ in 0..13 {
+            raised = performance
+                .keyboard(0, 6, true, true, None, 0.0)
+                .expect("raise")
+                .pitch;
+        }
+        assert_eq!(raised, Some(12.0));
+        let other = performance
+            .keyboard(1, 0, false, true, Some(8.0), 3.0)
+            .expect("other deck selects");
+        assert_eq!(other.mirror_as.as_deref(), Some("deck.1.hotcue.0"));
+        assert_eq!(performance.reset_keyboard(0), Some(0.0));
+        assert_eq!(performance.reset_keyboard(1), None);
     }
 
     #[test]

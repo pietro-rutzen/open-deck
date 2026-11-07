@@ -305,8 +305,10 @@ const FLX4_TRACK_LOADED_NOTES: [u8; 2] = [0x26, 0x27];
 const FLX4_TEMPO_RANGES: [f64; 5] = [8.0, 6.0, 10.0, 16.0, 100.0];
 /// Pad-mode buttons from the AlphaTheta DDJ-FLX4 MIDI message list J1, section 5.
 /// `0x20` is beat jump. Pad FX1 is `0x1E` and Pad FX2 is `0x6B`.
-const FLX4_PAD_MODE_NOTES: [u8; 7] = [0x1B, 0x1E, 0x20, 0x22, 0x6B, 0x6D, 0x6F];
+const FLX4_PAD_MODE_NOTES: [u8; 8] = [0x1B, 0x1E, 0x20, 0x22, 0x69, 0x6B, 0x6D, 0x6F];
 const FLX4_PAD_FX1_NOTE: u8 = 0x1E;
+const FLX4_PAD_FX2_NOTE: u8 = 0x6B;
+const FLX4_KEYBOARD_NOTE: u8 = 0x69;
 const FLX4_BROWSE_CC: u8 = 0x40;
 const FLX4_ZOOM_CC: u8 = 0x64;
 const FLX4_BROWSE_PRESS_NOTES: [u8; 2] = [0x41, 0x42];
@@ -423,6 +425,10 @@ impl Router {
             self.probe();
             return;
         }
+        if let Some((deck, slot, shifted)) = keyboard_control(&update.control) {
+            self.route_keyboard(deck, slot, shifted, update);
+            return;
+        }
         if super::headphone::controller_update(&self.app, &update.control, update.value) {
             return;
         }
@@ -478,6 +484,9 @@ impl Router {
             if let Some(value) = action.mirror_value {
                 update.value = value;
             }
+            if let Some(control) = action.mirror_as {
+                update.control = control;
+            }
             update.performance = action.performance;
             if action.mirror {
                 upsert_latest(&mut self.batch.mirror, update);
@@ -497,6 +506,76 @@ impl Router {
             upsert_latest(&mut self.batch.updates, update);
         } else {
             self.emit_now(update);
+        }
+    }
+
+    fn route_keyboard(
+        &mut self,
+        deck: usize,
+        slot: usize,
+        shifted: bool,
+        mut update: ControllerUpdateEvent,
+    ) {
+        let heard = update.heard_frame.or_else(|| {
+            crate::native_controls::capture_position(&update.control, &self.telemetry)
+                .map(|position| position.heard_frame)
+        });
+        let effects = self.app.state::<crate::native_effects::NativeEffects>();
+        let Ok(snapshot) = effects.snapshot() else {
+            tracing::warn!("Keyboard pad could not read the effect state");
+            return;
+        };
+        let Some(deck_fx) = snapshot.decks.get(deck) else {
+            return;
+        };
+        let Some(action) = self
+            .app
+            .state::<crate::native_controls::PerformanceState>()
+            .keyboard(
+                deck,
+                slot,
+                shifted,
+                update.value >= 0.5,
+                heard,
+                deck_fx.pitch_shift,
+            )
+        else {
+            return;
+        };
+        let engine = self.app.state::<crate::EngineHandle>();
+        let commanded = action.message.is_some() || !action.messages.is_empty();
+        for message in action.message.into_iter().chain(action.messages) {
+            if let Err(error) = self.held.send(&engine.tx, message) {
+                tracing::warn!("Keyboard pad could not reach the engine: {error}");
+                return;
+            }
+        }
+        if let Some(semitones) = action.pitch {
+            self.apply_pitch(deck, semitones);
+        }
+        if let Some(control) = action.mirror_as {
+            update.control = control;
+        }
+        update.performance = action.performance;
+        if action.mirror {
+            upsert_latest(&mut self.batch.mirror, update);
+        }
+        if commanded {
+            self.probe();
+        }
+    }
+
+    fn apply_pitch(&self, deck: usize, semitones: f64) {
+        let engine = self.app.state::<crate::EngineHandle>();
+        match self
+            .app
+            .state::<crate::native_effects::NativeEffects>()
+            .set_pitch(deck, semitones, |message| engine.send(message))
+        {
+            Ok(snapshot) => {
+                let _ = self.app.emit("effects:update", snapshot);
+            }
+            Err(error) => tracing::warn!("Keyboard pitch failed: {error}"),
         }
     }
 
@@ -785,6 +864,8 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 }
                 release_held_pad_fx(&app, 0);
                 release_held_pad_fx(&app, 1);
+                release_keyboard(&app, 0);
+                release_keyboard(&app, 1);
                 pad_mode = [None, None];
                 flx4_port = name.as_ref().is_some_and(|n| n.contains("DDJ-FLX4"));
                 meter_last = [255; 2];
@@ -822,6 +903,8 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 }
                 release_held_pad_fx(&app, 0);
                 release_held_pad_fx(&app, 1);
+                release_keyboard(&app, 0);
+                release_keyboard(&app, 1);
                 pad_mode = [None, None];
                 flx4_profile = profile.id == "pioneer-ddj-flx4";
                 meter_last = [255; 2];
@@ -852,6 +935,8 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 }
                 release_held_pad_fx(&app, 0);
                 release_held_pad_fx(&app, 1);
+                release_keyboard(&app, 0);
+                release_keyboard(&app, 1);
                 pad_mode = [None, None];
                 flx4_profile = false;
                 router.tempo_range = [FLX4_TEMPO_RANGES[0], FLX4_TEMPO_RANGES[0]];
@@ -946,8 +1031,13 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                                 let deck = usize::from(status & 15);
                                 let previous = pad_mode.get(deck).copied().flatten();
                                 if let Some(leds) = flx4_pad_mode_press(&mut pad_mode, deck, d1) {
-                                    if leaving_pad_fx1(previous, leds.lit) {
+                                    if leaving_pad_fx(previous, leds.lit) {
                                         release_held_pad_fx(&app, deck);
+                                    }
+                                    if previous == Some(FLX4_KEYBOARD_NOTE)
+                                        || leds.lit == FLX4_KEYBOARD_NOTE
+                                    {
+                                        release_keyboard(&app, deck);
                                     }
                                     if let Some(previous) = leds.clear {
                                         send_feedback(
@@ -1145,8 +1235,43 @@ struct PadModeLeds {
     lit: u8,
 }
 
-fn leaving_pad_fx1(previous: Option<u8>, next: u8) -> bool {
-    previous == Some(FLX4_PAD_FX1_NOTE) && next != FLX4_PAD_FX1_NOTE
+fn leaving_pad_fx(previous: Option<u8>, next: u8) -> bool {
+    matches!(
+        previous,
+        Some(note) if (note == FLX4_PAD_FX1_NOTE || note == FLX4_PAD_FX2_NOTE) && note != next
+    )
+}
+
+fn keyboard_control(control: &str) -> Option<(usize, usize, bool)> {
+    let rest = control.strip_prefix("deck.")?;
+    let (deck, name) = rest.split_once('.')?;
+    let deck = deck.parse::<usize>().ok()?;
+    let (shifted, slot) = if let Some(slot) = name.strip_prefix("keyboard_shift.") {
+        (true, slot)
+    } else {
+        (false, name.strip_prefix("keyboard.")?)
+    };
+    let slot = slot.parse::<usize>().ok()?;
+    (slot < 8).then_some((deck, slot, shifted))
+}
+
+fn release_keyboard(app: &AppHandle, deck: usize) {
+    let Some(semitones) = app
+        .state::<crate::native_controls::PerformanceState>()
+        .reset_keyboard(deck)
+    else {
+        return;
+    };
+    let engine = app.state::<crate::EngineHandle>();
+    match app
+        .state::<crate::native_effects::NativeEffects>()
+        .set_pitch(deck, semitones, |message| engine.send(message))
+    {
+        Ok(snapshot) => {
+            let _ = app.emit("effects:update", snapshot);
+        }
+        Err(error) => tracing::warn!("Keyboard release failed: {error}"),
+    }
 }
 
 fn release_held_pad_fx(app: &AppHandle, deck: usize) {
@@ -1456,6 +1581,7 @@ mod tests {
             (0x1E, "pad fx1"),
             (0x20, "beat jump"),
             (0x22, "sampler"),
+            (0x69, "keyboard"),
             (0x6B, "pad fx2"),
             (0x6D, "beat loop"),
             (0x6F, "key shift"),
@@ -1467,58 +1593,82 @@ mod tests {
             assert_eq!(active[1], Some(note));
             assert_eq!(active[0], None);
         }
-        assert!(flx4_pad_mode_press(&mut active, 1, 0x69).is_none());
+        assert!(flx4_pad_mode_press(&mut active, 1, 0x01).is_none());
         assert_eq!(active[1], Some(0x6F));
-        assert!(leaving_pad_fx1(Some(0x1E), 0x20));
-        assert!(leaving_pad_fx1(Some(0x1E), 0x6B));
-        assert!(!leaving_pad_fx1(Some(0x1E), 0x1E));
-        assert!(!leaving_pad_fx1(Some(0x20), 0x1B));
-        assert!(!leaving_pad_fx1(None, 0x1E));
+        assert!(leaving_pad_fx(Some(0x1E), 0x69));
+        assert!(leaving_pad_fx(Some(0x1E), 0x6B));
+        assert!(leaving_pad_fx(Some(0x6B), 0x1B));
+        assert!(!leaving_pad_fx(Some(0x1E), 0x1E));
+        assert!(!leaving_pad_fx(Some(0x6B), 0x6B));
+        assert!(!leaving_pad_fx(Some(0x20), 0x1B));
+        assert!(!leaving_pad_fx(None, 0x1E));
     }
 
     #[test]
-    fn bundled_flx4_pad_fx1_holds_the_first_four_pads_only() {
+    fn bundled_flx4_pad_layers_follow_the_message_list() {
         let profile: ControllerProfile = serde_json::from_str(include_str!(
             "../resources/controllers/pioneer-ddj-flx4.json"
         ))
         .unwrap();
         let mapping = profile.mapping();
-        let mapped = [
-            (7u8, 16u8, "deck.0.pad_fx.0"),
-            (7, 17, "deck.0.pad_fx.1"),
-            (7, 18, "deck.0.pad_fx.2"),
-            (7, 19, "deck.0.pad_fx.3"),
-            (9, 16, "deck.1.pad_fx.0"),
-            (9, 17, "deck.1.pad_fx.1"),
-            (9, 18, "deck.1.pad_fx.2"),
-            (9, 19, "deck.1.pad_fx.3"),
-            (7, 32, "deck.0.beatjump.0"),
-            (9, 32, "deck.1.beatjump.0"),
-        ];
-        for (channel, note, control) in mapped {
-            let binding = mapping
-                .bindings
-                .iter()
-                .find(|binding| {
-                    binding.channel == channel
-                        && matches!(binding.input, InputKind::Note { note: found } if found == note)
-                })
-                .unwrap_or_else(|| panic!("missing {channel}:{note}"));
-            assert_eq!(binding.control.as_str(), control);
-        }
-        for note in [0x14u8, 0x17, 0x50, 0x57, 0x10] {
-            assert!(
-                mapping.bindings.iter().all(|binding| {
-                    !(binding.channel == 8
-                        && matches!(binding.input, InputKind::Note { note: found } if found == note))
-                }),
-                "shift-layer pad {note} must stay unmapped"
-            );
+        let registry = Registry::defaults(4);
+        for (deck, plain, shift) in [(0u8, 7u8, 8u8), (1, 9, 10)] {
+            for pad in 0..8u8 {
+                let rows = [
+                    (plain, 0x10 + pad, format!("deck.{deck}.pad_fx.{pad}")),
+                    (shift, 0x10 + pad, format!("deck.{deck}.pad_fx.{}", 8 + pad)),
+                    (
+                        plain,
+                        0x50 + pad,
+                        format!("deck.{deck}.pad_fx.{}", 16 + pad),
+                    ),
+                    (
+                        shift,
+                        0x50 + pad,
+                        format!("deck.{deck}.pad_fx.{}", 24 + pad),
+                    ),
+                    (plain, 0x40 + pad, format!("deck.{deck}.keyboard.{pad}")),
+                    (
+                        shift,
+                        0x40 + pad,
+                        format!("deck.{deck}.keyboard_shift.{pad}"),
+                    ),
+                ];
+                for (channel, note, control) in rows {
+                    let binding = mapping
+                        .find(channel, InputKind::Note { note })
+                        .unwrap_or_else(|| panic!("missing {channel:#x} {note:#x}"));
+                    assert_eq!(binding.control.as_str(), control);
+                    let pressed = mapping
+                        .resolve(
+                            &registry,
+                            channel,
+                            InputKind::Note { note },
+                            0x7F,
+                            0.0,
+                            TAKEOVER,
+                        )
+                        .expect("press");
+                    let released = mapping
+                        .resolve(
+                            &registry,
+                            channel,
+                            InputKind::Note { note },
+                            0,
+                            1.0,
+                            TAKEOVER,
+                        )
+                        .expect("zero velocity");
+                    assert_eq!(pressed.value, 1.0);
+                    assert_eq!(released.value, 0.0);
+                    let (status, velocity) = normalize_note_release(0x80 | channel, 64);
+                    assert_eq!((status, velocity), (0x90 | channel, 0));
+                }
+            }
         }
         assert!(mapping
-            .bindings
-            .iter()
-            .all(|binding| binding.control.as_str() != "deck.0.pad_fx.4"));
+            .find(7, InputKind::Note { note: 0x20 })
+            .is_some_and(|binding| binding.control.as_str() == "deck.0.beatjump.0"));
     }
     #[test]
     fn bundled_flx4_every_binding_resolves_and_addresses_are_unique() {
@@ -1831,6 +1981,13 @@ mod tests {
         }
         assert_eq!(normalize_note_release(0x90, 127), (0x90, 127));
         assert_eq!(normalize_note_release(0x91, 0), (0x91, 0));
-        assert_eq!(normalize_note_release(0xb0, 64), (0xb0, 64));
+        assert_eq!(normalize_note_release(0x87, 64), (0x97, 0));
+        assert_eq!(normalize_note_release(0x9A, 0), (0x9A, 0));
+        assert!(keyboard_control("deck.0.keyboard.4").is_some());
+        assert_eq!(
+            keyboard_control("deck.1.keyboard_shift.7"),
+            Some((1, 7, true))
+        );
+        assert!(keyboard_control("deck.0.key_shift.1").is_none());
     }
 }

@@ -159,6 +159,9 @@ pub(crate) struct EffectsSnapshot {
     /// Inserts a Pad FX pad turned on and must turn off on release or mode exit.
     #[serde(skip)]
     pad_owned: [u8; NUM_DECKS],
+    /// Which preset currently owns each insert, plus the panel parameters to restore.
+    #[serde(skip)]
+    pad_hold: [[Option<PadHold>; 4]; NUM_DECKS],
 }
 impl Default for EffectsSnapshot {
     fn default() -> Self {
@@ -169,6 +172,7 @@ impl Default for EffectsSnapshot {
             decks: [DeckEffects::default(); NUM_DECKS],
             latched: [0; NUM_DECKS],
             pad_owned: [0; NUM_DECKS],
+            pad_hold: [[None; 4]; NUM_DECKS],
         }
     }
 }
@@ -179,6 +183,231 @@ const PAD_FX: [Effect; 4] = [
     Effect::Reverb,
     Effect::Crusher,
 ];
+
+/// Open Deck parameter choices for the host-assigned Pad FX slots in the DDJ-FLX4 manual.
+/// Slots 0–3 keep the panel parameters. The rest are presets of the same four inserts.
+#[derive(Clone, Copy, Debug)]
+enum PadFxSound {
+    Panel(Effect),
+    Echo { beats: f64, depth: f64 },
+    Flanger { beats: f64, depth: f64 },
+    Reverb { size: f64, mix: f64 },
+    Crusher { crush: f64, down: f64 },
+}
+
+impl PadFxSound {
+    fn effect(self) -> Effect {
+        match self {
+            Self::Panel(effect) => effect,
+            Self::Echo { .. } => Effect::Echo,
+            Self::Flanger { .. } => Effect::Flanger,
+            Self::Reverb { .. } => Effect::Reverb,
+            Self::Crusher { .. } => Effect::Crusher,
+        }
+    }
+}
+
+fn pad_fx_sound(slot: usize) -> Option<PadFxSound> {
+    Some(match slot {
+        0 => PadFxSound::Panel(Effect::Echo),
+        1 => PadFxSound::Panel(Effect::Flanger),
+        2 => PadFxSound::Panel(Effect::Reverb),
+        3 => PadFxSound::Panel(Effect::Crusher),
+        4 => PadFxSound::Echo {
+            beats: 1.0,
+            depth: 0.75,
+        },
+        5 => PadFxSound::Flanger {
+            beats: 1.0,
+            depth: 0.8,
+        },
+        6 => PadFxSound::Reverb {
+            size: 0.9,
+            mix: 0.55,
+        },
+        7 => PadFxSound::Crusher {
+            crush: 0.85,
+            down: 0.6,
+        },
+        8 => PadFxSound::Echo {
+            beats: 0.25,
+            depth: 0.4,
+        },
+        9 => PadFxSound::Flanger {
+            beats: 8.0,
+            depth: 0.45,
+        },
+        10 => PadFxSound::Reverb {
+            size: 0.35,
+            mix: 0.25,
+        },
+        11 => PadFxSound::Crusher {
+            crush: 0.25,
+            down: 0.15,
+        },
+        12 => PadFxSound::Echo {
+            beats: 2.0,
+            depth: 0.65,
+        },
+        13 => PadFxSound::Flanger {
+            beats: 2.0,
+            depth: 0.7,
+        },
+        14 => PadFxSound::Reverb {
+            size: 0.75,
+            mix: 0.7,
+        },
+        15 => PadFxSound::Crusher {
+            crush: 0.7,
+            down: 0.85,
+        },
+        16 => PadFxSound::Echo {
+            beats: 4.0,
+            depth: 0.55,
+        },
+        17 => PadFxSound::Flanger {
+            beats: 0.5,
+            depth: 0.5,
+        },
+        18 => PadFxSound::Reverb {
+            size: 0.5,
+            mix: 0.45,
+        },
+        19 => PadFxSound::Crusher {
+            crush: 0.6,
+            down: 0.4,
+        },
+        20 => PadFxSound::Echo {
+            beats: 0.125,
+            depth: 0.8,
+        },
+        21 => PadFxSound::Flanger {
+            beats: 16.0,
+            depth: 0.35,
+        },
+        22 => PadFxSound::Reverb {
+            size: 1.0,
+            mix: 0.4,
+        },
+        23 => PadFxSound::Crusher {
+            crush: 0.95,
+            down: 0.2,
+        },
+        24 => PadFxSound::Echo {
+            beats: 0.5,
+            depth: 0.9,
+        },
+        25 => PadFxSound::Flanger {
+            beats: 0.25,
+            depth: 0.9,
+        },
+        26 => PadFxSound::Reverb {
+            size: 0.2,
+            mix: 0.8,
+        },
+        27 => PadFxSound::Crusher {
+            crush: 0.4,
+            down: 0.95,
+        },
+        28 => PadFxSound::Echo {
+            beats: 8.0,
+            depth: 0.35,
+        },
+        29 => PadFxSound::Flanger {
+            beats: 6.0,
+            depth: 0.55,
+        },
+        30 => PadFxSound::Reverb {
+            size: 0.85,
+            mix: 0.2,
+        },
+        31 => PadFxSound::Crusher {
+            crush: 0.15,
+            down: 0.5,
+        },
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SavedEffect {
+    Echo(Echo),
+    Flanger(Flanger),
+    Reverb(Reverb),
+    Crusher(Crusher),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PadHold {
+    preset: u8,
+    saved: SavedEffect,
+}
+
+fn saved_effect(deck: &DeckEffects, effect: Effect) -> SavedEffect {
+    match effect {
+        Effect::Echo => SavedEffect::Echo(deck.echo),
+        Effect::Flanger => SavedEffect::Flanger(deck.flanger),
+        Effect::Reverb => SavedEffect::Reverb(deck.reverb),
+        Effect::Crusher => SavedEffect::Crusher(deck.crusher),
+    }
+}
+
+fn apply_pad_sound(deck: &mut DeckEffects, sound: PadFxSound) {
+    match sound {
+        PadFxSound::Panel(effect) => deck.set_active(effect, true),
+        PadFxSound::Echo { beats, depth } => {
+            deck.echo.beats = beats;
+            deck.echo.depth = depth;
+            deck.echo.active = true;
+        }
+        PadFxSound::Flanger { beats, depth } => {
+            deck.flanger.beats = beats;
+            deck.flanger.depth = depth;
+            deck.flanger.active = true;
+        }
+        PadFxSound::Reverb { size, mix } => {
+            deck.reverb.size = size;
+            deck.reverb.mix = mix;
+            deck.reverb.active = true;
+        }
+        PadFxSound::Crusher { crush, down } => {
+            deck.crusher.crush = crush;
+            deck.crusher.down = down;
+            deck.crusher.active = true;
+        }
+    }
+}
+
+fn restore_saved(deck: &mut DeckEffects, saved: SavedEffect, active: bool) {
+    match saved {
+        SavedEffect::Echo(mut echo) => {
+            echo.active = active;
+            deck.echo = echo;
+        }
+        SavedEffect::Flanger(mut flanger) => {
+            flanger.active = active;
+            deck.flanger = flanger;
+        }
+        SavedEffect::Reverb(mut reverb) => {
+            reverb.active = active;
+            deck.reverb = reverb;
+        }
+        SavedEffect::Crusher(mut crusher) => {
+            crusher.active = active;
+            deck.crusher = crusher;
+        }
+    }
+}
+
+fn hold_bits(holds: &[Option<PadHold>; 4]) -> u8 {
+    holds.iter().enumerate().fold(0, |bits, (index, hold)| {
+        if hold.is_some() {
+            bits | (1 << index)
+        } else {
+            bits
+        }
+    })
+}
 
 fn effect_bit(effect: Effect) -> u8 {
     1 << effect.index()
@@ -256,6 +485,7 @@ impl NativeEffects {
         let mut next = state.clone();
         next.latched[deck] = 0;
         next.pad_owned[deck] = 0;
+        next.pad_hold[deck] = [None; 4];
         let d = &mut next.decks[deck];
         for effect in PAD_FX {
             d.set_active(effect, false);
@@ -277,6 +507,7 @@ impl NativeEffects {
         let mut state = self.0.lock().map_err(|e| e.to_string())?;
         state.latched = [0; NUM_DECKS];
         state.pad_owned = [0; NUM_DECKS];
+        state.pad_hold = [[None; 4]; NUM_DECKS];
         for d in &mut state.decks {
             for effect in PAD_FX {
                 d.set_active(effect, false);
@@ -508,12 +739,14 @@ impl NativeEffects {
                 "fx.off_all" => {
                     next.latched = [0; NUM_DECKS];
                     next.pad_owned = [0; NUM_DECKS];
-                    for (deck, d) in next.decks.iter_mut().enumerate() {
-                        for e in PAD_FX {
-                            // Macro/legacy controls may have enabled slots outside this state.
-                            // Panic-off must bypass every slot, even when already marked off.
-                            d.set_active(e, false);
-                            send(d.command(deck, e))?;
+                    for deck in 0..NUM_DECKS {
+                        for effect in PAD_FX {
+                            if let Some(hold) = next.pad_hold[deck][effect.index()].take() {
+                                restore_saved(&mut next.decks[deck], hold.saved, false);
+                            }
+                            next.decks[deck].set_active(effect, false);
+                            let command = next.decks[deck].command(deck, effect);
+                            send(command)?;
                         }
                     }
                 }
@@ -532,32 +765,75 @@ impl NativeEffects {
         value: f64,
         mut send: impl FnMut(EngineMsg) -> Result<(), String>,
     ) -> Result<Option<EffectsSnapshot>, String> {
-        if deck >= NUM_DECKS || slot >= PAD_FX.len() || !value.is_finite() {
+        let Some(sound) = (deck < NUM_DECKS && value.is_finite())
+            .then_some(())
+            .and_then(|()| pad_fx_sound(slot))
+        else {
             return Err("Invalid pad FX".into());
-        }
+        };
         let mut state = self.0.lock().map_err(|e| e.to_string())?;
-        let effect = PAD_FX[slot];
-        let bit = effect_bit(effect);
+        let effect = sound.effect();
+        let effect_index = effect.index();
         let pressed = value >= 0.5;
-        let mut next = state.clone();
+        let current = state.pad_hold[deck][effect_index];
         if pressed {
-            if next.pad_owned[deck] & bit != 0 || next.decks[deck].active(effect) {
+            if current.is_some_and(|hold| hold.preset == slot as u8) {
                 return Ok(Some(state.clone()));
             }
-            next.pad_owned[deck] |= bit;
-            next.decks[deck].set_active(effect, true);
-        } else {
-            if next.pad_owned[deck] & bit == 0 {
+            if matches!(sound, PadFxSound::Panel(_))
+                && current.is_none()
+                && state.decks[deck].active(effect)
+            {
                 return Ok(Some(state.clone()));
             }
-            next.pad_owned[deck] &= !bit;
-            let on = next.latched[deck] & bit != 0;
-            next.decks[deck].set_active(effect, on);
+        } else if current.is_none_or(|hold| hold.preset != slot as u8) {
+            return Ok(Some(state.clone()));
         }
+        let mut next = state.clone();
+        let latched = next.latched[deck] & effect_bit(effect) != 0;
+        if pressed {
+            let saved = current
+                .map(|hold| hold.saved)
+                .unwrap_or_else(|| saved_effect(&next.decks[deck], effect));
+            apply_pad_sound(&mut next.decks[deck], sound);
+            next.pad_hold[deck][effect_index] = Some(PadHold {
+                preset: slot as u8,
+                saved,
+            });
+        } else {
+            let hold = next.pad_hold[deck][effect_index].take();
+            if let Some(hold) = hold {
+                restore_saved(&mut next.decks[deck], hold.saved, latched);
+            }
+        }
+        next.pad_owned[deck] = hold_bits(&next.pad_hold[deck]);
         send(next.decks[deck].command(deck, effect))?;
         next.revision = state.revision.wrapping_add(1);
         *state = next;
         Ok(Some(state.clone()))
+    }
+
+    /// Set the deck pitch recorded for Beat FX / key shift and send it to the engine.
+    pub(crate) fn set_pitch(
+        &self,
+        deck: usize,
+        semitones: f64,
+        mut send: impl FnMut(EngineMsg) -> Result<(), String>,
+    ) -> Result<EffectsSnapshot, String> {
+        if deck >= NUM_DECKS || !semitones.is_finite() {
+            return Err("Invalid pitch".into());
+        }
+        let semitones = semitones.clamp(-12.0, 12.0);
+        let mut state = self.0.lock().map_err(|e| e.to_string())?;
+        if (state.decks[deck].pitch_shift - semitones).abs() < 1e-9 {
+            return Ok(state.clone());
+        }
+        let mut next = state.clone();
+        next.decks[deck].pitch_shift = semitones;
+        send(EngineMsg::DeckPitchShift { deck, semitones })?;
+        next.revision = state.revision.wrapping_add(1);
+        *state = next;
+        Ok(state.clone())
     }
 
     /// Drop every pad-owned insert on one deck. A Beat FX latch stays on.
@@ -574,15 +850,15 @@ impl NativeEffects {
             return Ok(None);
         }
         let mut next = state.clone();
-        next.pad_owned[deck] = 0;
         for effect in PAD_FX {
-            let on = audible(next.latched[deck], 0, effect);
-            let d = &mut next.decks[deck];
-            if d.active(effect) != on {
-                d.set_active(effect, on);
-                send(d.command(deck, effect))?;
-            }
+            let Some(hold) = next.pad_hold[deck][effect.index()].take() else {
+                continue;
+            };
+            let on = next.latched[deck] & effect_bit(effect) != 0;
+            restore_saved(&mut next.decks[deck], hold.saved, on);
+            send(next.decks[deck].command(deck, effect))?;
         }
+        next.pad_owned[deck] = 0;
         next.revision = state.revision.wrapping_add(1);
         *state = next;
         Ok(Some(state.clone()))
@@ -892,6 +1168,89 @@ mod tests {
     }
 
     #[test]
+    fn pad_fx_presets_replace_parameters_and_release_restores_a_latch() {
+        let state = NativeEffects::default();
+        state
+            .update(
+                0,
+                EffectUpdate::Echo {
+                    active: true,
+                    beats: 0.5,
+                    depth: 0.5,
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let mut sent = Vec::new();
+        state
+            .handle("deck.0.pad_fx.4", 1.0, |message| {
+                sent.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            sent[0],
+            EngineMsg::DeckEcho {
+                active: true,
+                time_sec,
+                feedback,
+                mix,
+                ..
+            } if (time_sec - 0.5).abs() < 1e-6
+                && (feedback - 0.675).abs() < 1e-6
+                && (mix - 0.375).abs() < 1e-6
+        ));
+        state.handle("deck.0.pad_fx.4", 1.0, |_| Ok(())).unwrap();
+        state.handle("deck.0.pad_fx.12", 1.0, |_| Ok(())).unwrap();
+        assert!((state.snapshot().unwrap().decks[0].echo.beats - 2.0).abs() < 1e-9);
+        state.handle("deck.0.pad_fx.4", 0.0, |_| Ok(())).unwrap();
+        assert!((state.snapshot().unwrap().decks[0].echo.beats - 2.0).abs() < 1e-9);
+        state.handle("deck.0.pad_fx.12", 0.0, |_| Ok(())).unwrap();
+        let restored = state.snapshot().unwrap();
+        assert!(restored.decks[0].echo.active);
+        assert!((restored.decks[0].echo.beats - 0.5).abs() < 1e-9);
+        assert!((restored.decks[0].echo.depth - 0.5).abs() < 1e-9);
+        state.handle("deck.0.pad_fx.0", 1.0, |_| Ok(())).unwrap();
+        state.handle("deck.0.pad_fx.0", 0.0, |_| Ok(())).unwrap();
+        assert!(state.snapshot().unwrap().decks[0].echo.active);
+    }
+
+    #[test]
+    fn every_pad_fx_slot_engages_its_documented_preset_and_releases() {
+        assert!(pad_fx_sound(32).is_none());
+        for slot in 0..32 {
+            let sound = pad_fx_sound(slot).expect("documented slot");
+            let state = NativeEffects::default();
+            let control = format!("deck.1.pad_fx.{slot}");
+            state.handle(&control, 1.0, |_| Ok(())).unwrap();
+            let held = state.snapshot().unwrap();
+            assert!(held.decks[1].active(sound.effect()));
+            assert!(!held.decks[0].echo.active);
+            match sound {
+                PadFxSound::Panel(_) => {}
+                PadFxSound::Echo { beats, depth } => {
+                    assert_eq!(held.decks[1].echo.beats, beats);
+                    assert_eq!(held.decks[1].echo.depth, depth);
+                }
+                PadFxSound::Flanger { beats, depth } => {
+                    assert_eq!(held.decks[1].flanger.beats, beats);
+                    assert_eq!(held.decks[1].flanger.depth, depth);
+                }
+                PadFxSound::Reverb { size, mix } => {
+                    assert_eq!(held.decks[1].reverb.size, size);
+                    assert_eq!(held.decks[1].reverb.mix, mix);
+                }
+                PadFxSound::Crusher { crush, down } => {
+                    assert_eq!(held.decks[1].crusher.crush, crush);
+                    assert_eq!(held.decks[1].crusher.down, down);
+                }
+            }
+            state.handle(&control, 0.0, |_| Ok(())).unwrap();
+            assert!(!state.snapshot().unwrap().decks[1].active(sound.effect()));
+        }
+    }
+
+    #[test]
     fn pad_fx_hold_does_not_follow_beat_fx_select_and_a_failed_send_does_not_stick() {
         let state = NativeEffects::default();
         state.handle("deck.0.pad_fx.0", 1.0, |_| Ok(())).unwrap();
@@ -899,7 +1258,7 @@ mod tests {
         assert_eq!(selected.effect, Effect::Flanger);
         assert!(selected.decks[0].echo.active);
         assert!(!selected.decks[0].flanger.active);
-        assert!(state.handle("deck.0.pad_fx.4", 1.0, |_| Ok(())).is_err());
+        assert!(state.handle("deck.0.pad_fx.32", 1.0, |_| Ok(())).is_err());
         assert!(state.handle("deck.4.pad_fx.0", 1.0, |_| Ok(())).is_err());
         let before = state.snapshot().unwrap().revision;
         assert!(state

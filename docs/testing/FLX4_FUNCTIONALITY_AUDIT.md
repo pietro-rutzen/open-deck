@@ -11,9 +11,78 @@ Address inventory below covers every control entry in that mapping, including sh
 
 ## Important remaining gaps
 
-Not implemented: Pad FX1 pads 5–8, the shifted Pad FX layer, Pad FX2 pads, keyboard mode and stems, Smart CFX/Smart Fader. Pad FX1 pads 1–4 hold Open Deck's echo, flanger, reverb, and bit-crusher while pressed. That assignment is not a rekordbox preset, and it has no physical test. SHIFT+PLAY censor, SHIFT+LOOP IN/OUT boundary adjust via jog, SHIFT beat-jump size ×16, tempo-range cycling (SHIFT+SYNC), deck SHIFT buttons, the cue-point LED, track-loaded LEDs and beat-loop shift-layer LEDs are implemented below; every one of them still needs a physical FLX4 test (NOT RUN). Beat FX drives OpenDeck's per-deck echo/flanger/reverb/crusher inserts, not rekordbox's Beat FX DSP or master-channel FX position. Sampler pads share OpenDeck's 8 sampler slots across both decks and do not load or eject tracks. Hot cues follow OpenDeck set/seek semantics rather than rekordbox hold-to-preview. The second cue/play indicator address `90/91 47` stays dark because the same bytes are listed for both indicators. Unsupported controls must not be called working.
+Not implemented: Release FX, stem pads, Smart CFX/Smart Fader, sampler slots 9–16, sampler banks, and loading a browser track into the sampler. Pad FX uses Open Deck's echo, flanger, reverb, and bit-crusher. Pads 1–4 keep the panel parameters. Pads 5–8, the shifted layer, and Pad FX2 are presets of those same inserts, documented in the pad-mode matrix. That assignment is not a rekordbox preset, and it has no physical test. Keyboard mode plays a selected hot cue at the manual's default semitones. It is not a stem mode. SHIFT+PLAY censor, SHIFT+LOOP IN/OUT boundary adjust via jog, SHIFT beat-jump size ×16, tempo-range cycling (SHIFT+SYNC), deck SHIFT buttons, the cue-point LED, track-loaded LEDs and beat-loop shift-layer LEDs are implemented below; every one of them still needs a physical FLX4 test (NOT RUN). Beat FX drives OpenDeck's per-deck echo/flanger/reverb/crusher inserts, not rekordbox's Beat FX DSP or master-channel FX position. Sampler pads share OpenDeck's 8 sampler slots across both decks and do not load or eject tracks. Hot cues follow OpenDeck set/seek semantics rather than rekordbox hold-to-preview. The second cue/play indicator address `90/91 47` stays dark because the same bytes are listed for both indicators. Unsupported controls must not be called working.
 
-Hot cue, beat loop, loop in/out, beat jump, quantize, sync, and sampler trigger/stop are applied on the controller thread at the press. Key shift and Beat FX still execute through frontend state. Engine command acknowledgements are still absent. Physical timing against a reference player is NOT RUN.
+Hot cue, beat loop, loop in/out, beat jump, quantize, sync, sampler trigger/stop, key shift, Beat FX, Pad FX, and keyboard are applied on the controller thread at the press. Engine command acknowledgements are still absent. Physical timing against a reference player is NOT RUN.
+
+## Pad-mode matrix
+
+Checked against the AlphaTheta DDJ-FLX4 MIDI message list E1 and the English hardware manual DRI1804A on 7 Nov 2026. This is the software behavior. No physical FLX4 session has been run, so every row stays hardware-unverified.
+
+Mode buttons are Note On channel `90` (deck 1) and `91` (deck 2). Press is `7F`, release is `00`, and the same note is the LED. One mode LED stays lit per deck. Performance pads are channel `97` for deck 1 and `99` for deck 2. SHIFT pads are channel `98` and `9A`. Note Off on those channels is normalized to a zero-velocity Note On before the mapping runs. A mapped toggle treats MIDI 64–127 as pressed and 0–63 as released.
+
+| Mode | Button | Pad notes | What the software does |
+| --- | --- | --- | --- |
+| Hot Cue | `1B` | `00`–`07`, SHIFT deletes the same notes | Existing set/seek and delete. An empty pad stores the playhead heard at the press. A filled pad seeks there, quantized to the grid when quantize is on. This is not rekordbox hold-to-preview. |
+| Keyboard | SHIFT+Hot Cue `69` | `40`–`47`, SHIFT `40`–`47` | See Keyboard below. Entering, leaving, or pressing `69` again clears the selection and restores a pitch a pad was holding. |
+| Pad FX1 | `1E` | `10`–`17`, SHIFT `10`–`17` | Slots 0–7, and SHIFT slots 8–15. Leaving this mode releases that deck's held inserts. |
+| Pad FX2 | SHIFT+Pad FX1 `6B` | `50`–`57`, SHIFT `50`–`57` | Slots 16–23, and SHIFT slots 24–31. Leaving this mode releases that deck's held inserts. |
+| Beat Jump | `20` | `20`–`27` | −1, +1, −2, +2, −4, +4, −8, +8 beats, times the deck scale. Matches the manual's default sizes. |
+| Beat Loop | SHIFT+Beat Jump `6D` | `60`–`67` | 1/4, 1/2, 1, 2, 4, 8, 16, 32 beats. The loop stays after release. The same pad cancels it. |
+| Sampler | `22` | `30`–`37`, SHIFT stops the same notes | Partial. See Sampler below. |
+| Key Shift | SHIFT+Sampler `6F` | `70`–`77`, SHIFT `70`–`77` | Existing scale, not the manual's default. See Key shift below. |
+
+SHIFT beat-jump pads 7 and 8 (`26`/`27` on the shift channel) multiply that deck's jump size by 1/16 or 16. Those addresses are also the track-loaded LEDs.
+
+Leaving Pad FX1 or Pad FX2, deactivating the profile, or changing the output port releases held Pad FX inserts and restores the parameters saved at the first hold of that effect. Re-pressing the same Pad FX mode does not release. The SHIFT button itself does not release a held pad. Whether the hardware emits the original note-off when SHIFT is pressed in the middle of a hold was not tested.
+
+Deck 2 uses the same note numbers on `91`, `99`, and `9A`.
+
+### Pad FX presets
+
+The manual's Effect A–AF letters are host assignments, not a fixed DSP list. Open Deck uses the four existing inserts: echo, flanger, reverb, and bit-crusher. There is no Release FX. Holding a pad turns its insert on. Releasing the pad that owns the insert turns it off, unless Beat FX had latched it, in which case the latch stays and the saved panel parameters return.
+
+Pads 1–4 keep the panel parameters and only toggle the insert. If that insert is already on, those four pads do not take ownership, so releasing them does not clear a Beat FX latch. Pads 5–8 and every shifted and Pad FX2 pad are presets. The first hold of an effect saves the panel parameters. A later preset of the same effect keeps that saved copy. Releasing a pad that does not own the insert does nothing. The last preset of an effect wins. `fx.next` still moves only latched effects.
+
+Echo time is the preset's beat count times the deck's beat length (the default beat is 0.5 s, so 1 beat is 0.5 s). Echo feedback is `0.15 + depth × 0.7`. Echo mix is `depth × 0.5` while the insert is on. Flanger uses the same beat clock. Depth, size, mix, crush, and downsample stay inside 0–1.
+
+| Slots | Layer | Notes | Pad order |
+| --- | --- | --- | --- |
+| 0–3 | Pad FX1 pads 1–4 | `10`–`13` | Panel echo, flanger, reverb, crusher |
+| 4–7 | Pad FX1 pads 5–8 | `14`–`17` | Echo 1 beat / depth 0.75; flanger 1 / 0.8; reverb size 0.9 mix 0.55; crusher crush 0.85 down 0.6 |
+| 8–15 | Pad FX1 + SHIFT | shift `10`–`17` | Echo 0.25 / 0.4; flanger 8 / 0.45; reverb 0.35 / 0.25; crusher 0.25 / 0.15; echo 2 / 0.65; flanger 2 / 0.7; reverb 0.75 / 0.7; crusher 0.7 / 0.85 |
+| 16–23 | Pad FX2 | `50`–`57` | Echo 4 / 0.55; flanger 0.5 / 0.5; reverb 0.5 / 0.45; crusher 0.6 / 0.4; echo 1/8 / 0.8; flanger 16 / 0.35; reverb 1.0 / 0.4; crusher 0.95 / 0.2 |
+| 24–31 | Pad FX2 + SHIFT | shift `50`–`57` | Echo 0.5 / 0.9; flanger 0.25 / 0.9; reverb 0.2 / 0.8; crusher 0.4 / 0.95; echo 8 / 0.35; flanger 6 / 0.55; reverb 0.85 / 0.2; crusher 0.15 / 0.5 |
+
+Controls are `deck.0.pad_fx.0`–`31` and `deck.1.pad_fx.0`–`31`.
+
+### Keyboard
+
+This is pitched hot-cue playback, not stems. The old "Toggle Stem" label in this audit was wrong.
+
+The first press selects a hot cue. An empty slot stores the heard playhead and mirrors `deck.N.hotcue.slot`. Later presses seek that cue, start playback, and set the pitch. A repeat Note On while that same pad is already held does nothing. Releasing a pad restores the pitch from before the hold only when no keyboard pad on that deck remains down. Playback keeps running after release. The manual does not define note-off; momentary pitch is an Open Deck choice. Loading a track clears the selection, and the load path sets pitch back to 0.
+
+Default semitones, then plus the transpose, clamped to ±12: pad 1 +4, pad 2 +5, pad 3 +6, pad 4 +7, pad 5 ±0, pad 6 +1, pad 7 +2, pad 8 +3.
+
+SHIFT pads 1–6 delete the selected hot cue. If nothing is selected, they delete that pad's hot cue. The UI mirror is `deck.N.clear_hotcue.slot`. SHIFT pad 7 raises the transpose by one semitone. SHIFT pad 8 lowers it by one. A pad that is already held updates immediately.
+
+Controls are `deck.N.keyboard.0`–`7` and `deck.N.keyboard_shift.0`–`7`.
+
+### Sampler
+
+Partial. Both decks address the same eight engine slots (`sampler.0`–`7`). Press plays the slot. A second press restarts a one-shot from the beginning instead of stacking another voice. A looped slot still toggles. SHIFT stops the slot. Pads light when a slot is loaded.
+
+Not implemented, and these are the blockers: deck 2 does not address sampler slots 9–16, there are no four banks, and SHIFT+pad does not load the track selected in the browser. The sampler mode LED is lit because play, retrigger, and stop are real. That is not rekordbox sampler parity.
+
+### Key shift
+
+Already shipped, and left on that scale. Unshifted pads set absolute semitones 0, +1, +2, +3, −3, −2, −1, 0. SHIFT pads add +1, +2, +3, +4, −1, −2, −3, −4, clamped to ±12. The pitch stays until another key-shift pad changes it.
+
+The manual's default for this mode is the keyboard scale (+4, +5, +6, +7, ±0, +1, +2, +3), and its SHIFT pads 7 and 8 only change the on-screen scale. Open Deck does not do that. Do not read the lit key-shift mode as that manual scale.
+
+### Still absent
+
+Smart CFX, Smart Fader, Release FX, stem pads, sampler slots 9–16, sampler banks, and browser loading into the sampler. A mode button is lit only where the behavior above exists.
 
 ## Changed behavior (T019)
 
@@ -24,7 +93,7 @@ Hot cue, beat loop, loop in/out, beat jump, quantize, sync, and sampler trigger/
 - LOOP IN held for 500 ms starts a 4-beat loop at the press position.
 - BEAT SYNC long press sets the deck as sync leader; SHIFT+RELOOP/EXIT is reloop-and-stop.
 - Key shift pads (absolute −3…+3 semitones, pads 1 and 8 reset) and SHIFT key shift pads (relative ±1…4 semitones) with lit-pad feedback.
-- Sampler pads trigger the shared sampler slots; SHIFT stops a slot; pads light when a slot is loaded. Sampler and key-shift pad-mode buttons light their mode LED.
+- Sampler pads play the shared 8 slots; a second press restarts a one-shot; SHIFT stops a slot; pads light when a slot is loaded. Deck 2 slots 9–16, banks, and browser load are not implemented. Sampler and key-shift pad-mode buttons light their mode LED. Key shift keeps the shipped semitone scale, which is not the manual's keyboard scale.
 - Beat FX: FX SELECT cycles echo → flanger → reverb → crusher (SHIFT reverses, an active effect carries over), BEAT ◀/▶ steps echo/flanger beat length, CH SELECT picks deck 1 or 2, LEVEL/DEPTH sets the selected effect amount, ON/OFF toggles it with LED feedback, SHIFT+ON/OFF turns every insert off. The status bar shows the current Beat FX selection.
 - BROWSE press toggles browsing between the track list and the sources tree (Local Library and folders); SHIFT+BROWSE rotate zooms the waveform.
 - SHIFT+PLAY censors: the deck plays backward while the button is held, then returns to the position playback would have reached. A paused deck returns to the same point and stays paused.
@@ -146,15 +215,15 @@ Hot cue, beat loop, loop in/out, beat jump, quantize, sync, and sampler trigger/
 | BEAT FX ON/OFF +SHIFT - press - Disable all enabled Beat FX Slots (when on CHAN12) | `95 43` | fx.off_all | Mapped to OpenDeck per-deck inserts, not rekordbox Beat FX DSP; physical test pending |
 | HOT CUE MODE (DECK1) - press - set hotcue mode | `90 1B` | Supported pad-mode LED | Implemented; physical test pending |
 | HOT CUE MODE (DECK2) - press - set hotcue mode | `91 1B` | Supported pad-mode LED | Implemented; physical test pending |
-| KEYBOARD MODE (DECK1) - press - set keyboard mode | `90 69` | — | Not implemented |
-| KEYBOARD MODE (DECK2) - press - set keyboard mode | `91 69` | — | Not implemented |
-| PAD FX1 MODE (DECK1) - press - set pad fx1 mode | `90 1E` | Pad-mode latch; leaving it releases held Pad FX1 inserts | Implemented offline; physical test pending |
-| PAD FX1 MODE (DECK2) - press - set pad fx1 mode | `91 1E` | Pad-mode latch; leaving it releases held Pad FX1 inserts | Implemented offline; physical test pending |
-| PAD FX2 MODE (DECK1) - press - set pad fx2 mode | `90 6B` | Pad-mode latch only | Mode button only. Its pads are not mapped. Physical test pending |
-| PAD FX2 MODE (DECK2) - press - set pad fx2 mode | `91 6B` | Pad-mode latch only | Mode button only. Its pads are not mapped. Physical test pending |
-| PAD 1–4 (DECK1) PAD FX1 - hold - Open Deck echo, flanger, reverb, bit-crusher | `97 10`–`97 13` | deck.0.pad_fx.0–3 | Hold enables, release disables. Not a rekordbox preset. Physical test pending |
-| PAD 1–4 (DECK2) PAD FX1 - hold - Open Deck echo, flanger, reverb, bit-crusher | `99 10`–`99 13` | deck.1.pad_fx.0–3 | Hold enables, release disables. Not a rekordbox preset. Physical test pending |
-| PAD 5–8 and SHIFT PAD FX1, and all PAD FX2 pads | `97/99 14`–`17`, `98/9A 10`–`17`, `97/99 50`–`57` | — | Not mapped |
+| KEYBOARD MODE (DECK1) - press - set keyboard mode | `90 69` | Keyboard selection reset and held-pitch restore | Implemented offline; physical test pending |
+| KEYBOARD MODE (DECK2) - press - set keyboard mode | `91 69` | Keyboard selection reset and held-pitch restore | Implemented offline; physical test pending |
+| PAD FX1 MODE (DECK1) - press - set pad fx1 mode | `90 1E` | Pad-mode latch; leaving Pad FX1 or Pad FX2 releases that deck's held inserts | Implemented offline; physical test pending |
+| PAD FX1 MODE (DECK2) - press - set pad fx1 mode | `91 1E` | Pad-mode latch; leaving Pad FX1 or Pad FX2 releases that deck's held inserts | Implemented offline; physical test pending |
+| PAD FX2 MODE (DECK1) - press - set pad fx2 mode | `90 6B` | Pad-mode latch; slots 16–31; leaving the mode releases held inserts | Implemented offline; physical test pending |
+| PAD FX2 MODE (DECK2) - press - set pad fx2 mode | `91 6B` | Pad-mode latch; slots 16–31; leaving the mode releases held inserts | Implemented offline; physical test pending |
+| PAD 1–4 (DECK1) PAD FX1 - hold - panel echo, flanger, reverb, bit-crusher | `97 10`–`97 13` | deck.0.pad_fx.0–3 | Hold enables, release disables. Does not steal a latched insert. Physical test pending |
+| PAD 1–4 (DECK2) PAD FX1 - hold - panel echo, flanger, reverb, bit-crusher | `99 10`–`99 13` | deck.1.pad_fx.0–3 | Hold enables, release disables. Does not steal a latched insert. Physical test pending |
+| PAD 5–8, SHIFT PAD FX1, PAD FX2, and SHIFT PAD FX2 | `97/99 14`–`17`, `98/9A 10`–`17`, `97/99 50`–`57`, `98/9A 50`–`57` | deck.0/1.pad_fx.4–31 | Open Deck presets in the pad-mode matrix. Release restores the saved panel parameters and any Beat FX latch. Physical test pending |
 | BEAT JUMP MODE (DECK1) - press - set beat jump mode | `90 20` | Supported pad-mode LED | Implemented; physical test pending |
 | BEAT JUMP MODE (DECK2) - press - set beat jump mode | `91 20` | Supported pad-mode LED | Implemented; physical test pending |
 | BEAT LOOP MODE (DECK1) - press - set beat loop mode | `90 6D` | Supported pad-mode LED | Implemented; physical test pending |
@@ -195,38 +264,10 @@ Hot cue, beat loop, loop in/out, beat jump, quantize, sync, and sampler trigger/
 | PAD 8 +SHIFT (DECK1) HOT CUE MODE - press - delete hotcue | `98 07` | deck.0.clear_hotcue.7 | Mapped; physical test pending |
 | PAD 8 (DECK2) HOT CUE MODE - press - set hotcue | `99 07` | deck.1.hotcue.7 | Mapped; physical test pending |
 | PAD 8 +SHIFT (DECK2) HOT CUE MODE - press - delete hotcue | `9A 07` | deck.1.clear_hotcue.7 | Mapped; physical test pending |
-| PAD 1 (DECK1) KEYBOARD MODE - press - Toggle Stem 1 | `97 40` | — | Not implemented |
-| PAD 1 +SHIFT (DECK1) KEYBOARD MODE - press - Only Stem 1 active | `98 40` | — | Not implemented |
-| PAD 1 (DECK2) KEYBOARD MODE - press - Toggle Stem 1 | `99 40` | — | Not implemented |
-| PAD 1 +SHIFT (DECK2) KEYBOARD MODE - press - Only Stem 1 active | `9A 40` | — | Not implemented |
-| PAD 2 (DECK1) KEYBOARD MODE - press - Toggle Stem 2 | `97 41` | — | Not implemented |
-| PAD 2 +SHIFT (DECK1) KEYBOARD MODE - press - Only Stem 2 active | `98 41` | — | Not implemented |
-| PAD 2 (DECK2) KEYBOARD MODE - press - Toggle Stem 2 | `99 41` | — | Not implemented |
-| PAD 2 +SHIFT (DECK2) KEYBOARD MODE - press - Only Stem 2 active | `9A 41` | — | Not implemented |
-| PAD 3 (DECK1) KEYBOARD MODE - press - Toggle Stem 3 | `97 42` | — | Not implemented |
-| PAD 3 +SHIFT (DECK1) KEYBOARD MODE - press - Only Stem 3 active | `98 42` | — | Not implemented |
-| PAD 3 (DECK2) KEYBOARD MODE - press - Toggle Stem 3 | `99 42` | — | Not implemented |
-| PAD 3 +SHIFT (DECK2) KEYBOARD MODE - press - Only Stem 3 active | `9A 42` | — | Not implemented |
-| PAD 4 (DECK1) KEYBOARD MODE - press - Toggle Stem 4 | `97 43` | — | Not implemented |
-| PAD 4 +SHIFT (DECK1) KEYBOARD MODE - press - Only Stem 4 active | `98 43` | — | Not implemented |
-| PAD 4 (DECK2) KEYBOARD MODE - press - Toggle Stem 4 | `99 43` | — | Not implemented |
-| PAD 4 +SHIFT (DECK2) KEYBOARD MODE - press - Only Stem 4 active | `9A 43` | — | Not implemented |
-| PAD 5 (DECK1) KEYBOARD MODE - press - Toggle Stem 1 FX | `97 44` | — | Not implemented |
-| PAD 5 +SHIFT (DECK1) KEYBOARD MODE - press - Only Stem 1 FX active | `98 44` | — | Not implemented |
-| PAD 5 (DECK2) KEYBOARD MODE - press - Toggle Stem 1 FX | `99 44` | — | Not implemented |
-| PAD 5 +SHIFT (DECK2) KEYBOARD MODE - press - Only Stem 1 FX active | `9A 44` | — | Not implemented |
-| PAD 6 (DECK1) KEYBOARD MODE - press - Toggle Stem 2 FX | `97 45` | — | Not implemented |
-| PAD 6 +SHIFT (DECK1) KEYBOARD MODE - press - Only Stem 2 FX active | `98 45` | — | Not implemented |
-| PAD 6 (DECK2) KEYBOARD MODE - press - Toggle Stem 2 FX | `99 45` | — | Not implemented |
-| PAD 6 +SHIFT (DECK2) KEYBOARD MODE - press - Only Stem 2 FX active | `9A 45` | — | Not implemented |
-| PAD 7 (DECK1) KEYBOARD MODE - press - Toggle Stem 3 FX | `97 46` | — | Not implemented |
-| PAD 7 +SHIFT (DECK1) KEYBOARD MODE - press - Only Stem 3 FX active | `98 46` | — | Not implemented |
-| PAD 7 (DECK2) KEYBOARD MODE - press - Toggle Stem 3 FX | `99 46` | — | Not implemented |
-| PAD 7 +SHIFT (DECK2) KEYBOARD MODE - press - Only Stem 3 FX active | `9A 46` | — | Not implemented |
-| PAD 8 (DECK1) KEYBOARD MODE - press - Toggle Stem 4 FX | `97 47` | — | Not implemented |
-| PAD 8 +SHIFT (DECK1) KEYBOARD MODE - press - Only Stem 4 FX active | `98 47` | — | Not implemented |
-| PAD 8 (DECK2) KEYBOARD MODE - press - Toggle Stem 4 FX | `99 47` | — | Not implemented |
-| PAD 8 +SHIFT (DECK2) KEYBOARD MODE - press - Only Stem 4 FX active | `9A 47` | — | Not implemented |
+| PAD 1–8 KEYBOARD - press - play the selected hot cue at +4,+5,+6,+7,±0,+1,+2,+3 semitones | `97/99 40`–`47` | deck.0/1.keyboard.0–7 | First press selects or stores the hot cue. Later presses seek, play, and pitch. Release restores pitch when the last pad is up. Playback continues. Physical test pending |
+| PAD 1–6 +SHIFT KEYBOARD - press - delete the selected hot cue | `98/9A 40`–`45` | deck.0/1.keyboard_shift.0–5 | Deletes the selected cue, or that pad's hot cue when none is selected. Physical test pending |
+| PAD 7 +SHIFT KEYBOARD - press - raise the scale one semitone | `98/9A 46` | deck.0/1.keyboard_shift.6 | Clamped to +12. A held pad updates immediately. Physical test pending |
+| PAD 8 +SHIFT KEYBOARD - press - lower the scale one semitone | `98/9A 47` | deck.0/1.keyboard_shift.7 | Clamped to −12. A held pad updates immediately. Physical test pending |
 | PAD 1 (DECK1) BEAT LOOP MODE - press - 1/4 Beatloop | `97 60` | deck.0.beatloop.0 | Mapped; physical test pending |
 | PAD 1 (DECK2) BEAT LOOP MODE - press - 1/4 Beatloop | `99 60` | deck.1.beatloop.0 | Mapped; physical test pending |
 | PAD 2 (DECK1) BEAT LOOP MODE - press - 1/2 Beatloop | `97 61` | deck.0.beatloop.1 | Mapped; physical test pending |
@@ -263,38 +304,38 @@ Hot cue, beat loop, loop in/out, beat jump, quantize, sync, and sampler trigger/
 | PAD 7 (DECK2) +Shift BEAT JUMP MODE - press - decrease Beatjump by a factor of 16 | `9A 26` | deck.1.beatjump.scale_down | Implemented; physical test pending. Same address as track_loaded LED |
 | PAD 8 (DECK1) +SHift BEAT JUMP MODE - press - increase Beatjump by a factor of 16 | `98 27` | deck.0.beatjump.scale_up | Implemented; physical test pending. Same address as track_loaded LED |
 | PAD 8 (DECK2) +Shift BEAT JUMP MODE - press - increase Beatjump by a factor of 16 | `9A 27` | deck.1.beatjump.scale_up | Implemented; physical test pending. Same address as track_loaded LED |
-| PAD 1 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 30` | sampler.0.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 1 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 30` | sampler.0.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 2 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 31` | sampler.1.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 2 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 31` | sampler.1.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 3 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 32` | sampler.2.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 3 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 32` | sampler.2.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 4 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 33` | sampler.3.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 4 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 33` | sampler.3.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 5 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 34` | sampler.4.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 5 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 34` | sampler.4.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 6 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 35` | sampler.5.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 6 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 35` | sampler.5.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 7 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 36` | sampler.6.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 7 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 36` | sampler.6.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 8 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 37` | sampler.7.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 8 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 37` | sampler.7.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 1 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 30` | sampler.0.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 1 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 30` | sampler.0.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 2 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 31` | sampler.1.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 2 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 31` | sampler.1.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 3 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 32` | sampler.2.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 3 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 32` | sampler.2.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 4 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 33` | sampler.3.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 4 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 33` | sampler.3.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 5 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 34` | sampler.4.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 5 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 34` | sampler.4.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 6 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 35` | sampler.5.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 6 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 35` | sampler.5.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 7 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 36` | sampler.6.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 7 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 36` | sampler.6.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 8 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 37` | sampler.7.trigger | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
-| PAD 8 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 37` | sampler.7.stop | Mapped to 8 shared OpenDeck sampler slots, no track load/eject; physical test pending |
+| PAD 1 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 30` | sampler.0.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 1 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 30` | sampler.0.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 2 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 31` | sampler.1.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 2 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 31` | sampler.1.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 3 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 32` | sampler.2.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 3 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 32` | sampler.2.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 4 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 33` | sampler.3.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 4 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 33` | sampler.3.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 5 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 34` | sampler.4.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 5 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 34` | sampler.4.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 6 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 35` | sampler.5.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 6 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 35` | sampler.5.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 7 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 36` | sampler.6.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 7 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 36` | sampler.6.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 8 (LEFT) SAMPLE MODE - press - Play Sample or Load Track | `97 37` | sampler.7.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 8 (LEFT)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `98 37` | sampler.7.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 1 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 30` | sampler.0.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 1 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 30` | sampler.0.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 2 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 31` | sampler.1.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 2 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 31` | sampler.1.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 3 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 32` | sampler.2.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 3 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 32` | sampler.2.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 4 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 33` | sampler.3.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 4 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 33` | sampler.3.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 5 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 34` | sampler.4.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 5 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 34` | sampler.4.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 6 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 35` | sampler.5.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 6 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 35` | sampler.5.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 7 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 36` | sampler.6.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 7 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 36` | sampler.6.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 8 (RIGHT) SAMPLE MODE - press - Play Sample or Load Track | `99 37` | sampler.7.trigger | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
+| PAD 8 (Right)+SHIFT SAMPLE MODE - press - Stop Playback or Eject Track | `9A 37` | sampler.7.stop | Partial: both decks share slots 1–8. A second press restarts a one-shot. SHIFT stops. No browser load, no slots 9–16, no banks. Physical test pending |
 | PAD 1 (DECK1) KEY SHIFT MODE - press - No pitch modification | `97 70` | deck.0.key_shift.0 | Mapped; physical test pending |
 | PAD 1 +SHIFT (DECK1) KEY SHIFT MODE - press - Increase the pitch by 1 semitone | `98 70` | deck.0.key_shift_step.0 | Mapped; physical test pending |
 | PAD 1 (DECK2) KEY SHIFT MODE - press - No pitch modification | `99 70` | deck.1.key_shift.0 | Mapped; physical test pending |
