@@ -19,7 +19,7 @@ const loaded = {
   key_camelot: '',
   key_name: '',
   band_peaks: [],
-  replay_gain: 1,
+  replay_gain: 1.8,
   analysis_pending: true,
   analysis_failed: false,
   peaks: [0.2, 0.4],
@@ -48,7 +48,7 @@ assert.equal(ready.bpmLabel(null, 1), '—');
 const merged = ready.mergeDeckAnalysis(loaded, analysis);
 assert.equal(merged.analysis_pending, false);
 assert.equal(merged.bpm, 126);
-assert.equal(merged.replay_gain, 1);
+assert.equal(merged.replay_gain, 1.8);
 assert.deepEqual(merged.peaks, [0.2, 0.4]);
 assert.equal(ready.gridAvailable(merged), true);
 assert.equal(ready.bpmLabel(merged, 1), '126.00');
@@ -86,4 +86,4 @@ assert.equal(unusable.beat_interval_sec, 0);
 assert.equal(unusable.replay_gain, 0.4);
 assert.equal(ready.gridAvailable(unusable), false);
 
-console.log('Deck ready: pending grid, same-path generation, both-deck identity, failure, and loudness hold passed');
+console.log('Deck ready: pending grid, same-path generation, both-deck identity, failure, and installed loudness hold passed');

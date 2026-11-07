@@ -1,11 +1,15 @@
-//! Playback becomes ready after decode. Beatgrid, key, colored waveform, and loudness
-//! are a later phase on the same load generation.
+//! Playback becomes ready after decode. Beatgrid, key, and colored waveform are a later
+//! phase on the same load generation.
 //!
-//! ReplayGain is measured with that later phase and is not written to the engine.
-//! `LoadDeck` sets pregain to unity. Applying the measurement afterwards can sit behind
-//! a Play, cue, or scratch command that has not yet updated telemetry, which would change
-//! the level of a deck the listener already started. The measured factor stays on the
-//! analysis event for a future load that can install it in the same command group as the buffer.
+//! Loudness is one linear pass over the decoded buffer and is installed in the same
+//! indivisible command group as `Load`. `LoadDeck` stops the deck and sets pregain to
+//! unity; the measured factor is the next command, so Play, cue preview, and scratch
+//! cannot land between them. Pregain is applied before the headphone tap, so the first
+//! sample on the master, cue-preview, scratch, and headphone routes already has it.
+//! A later analysis pass must not write pregain again: telemetry lags the command queue,
+//! and a write behind a queued Play or cue would jump a deck that is already sounding.
+//! There is no separate loudness cache. The next load of a file measures the buffer it
+//! just decoded and installs that factor the same way, before that load can sound.
 
 use std::sync::Arc;
 
@@ -56,7 +60,6 @@ pub(crate) struct RawAnalysis {
     pub grid: BeatGrid,
     pub key: KeyEstimate,
     pub band_peaks: Vec<[f32; 3]>,
-    pub replay_gain: f32,
 }
 
 pub(crate) struct AnalysisBody {
@@ -88,6 +91,30 @@ pub(crate) fn decoded_from(buffer: DeckBuffer, metadata: TrackMetadata) -> Decod
     }
 }
 
+pub(crate) fn installed_replay_gain(measured: f32) -> f32 {
+    if measured.is_finite() && measured > 0.0 {
+        measured.clamp(0.25, 4.0)
+    } else {
+        1.0
+    }
+}
+
+/// A loudness write after the load group. `already_installed` is true once that group
+/// carried the factor. `audible` must be true when Play, cue preview, scratch, or any
+/// other transport is queued or already producing samples, including when telemetry
+/// still says the deck is stopped. Pregain sits in front of the headphone tap, so one
+/// write changes every route.
+pub(crate) fn deferred_replay_gain(
+    already_installed: bool,
+    audible: bool,
+    measured: f32,
+) -> Option<f32> {
+    if already_installed || audible {
+        return None;
+    }
+    Some(installed_replay_gain(measured))
+}
+
 pub(crate) fn prepare_step(
     generation: u64,
     bin_frames: usize,
@@ -111,6 +138,10 @@ pub(crate) fn prepare_step(
     if !current() {
         return PrepareStep::Superseded;
     }
+    let replay_gain = installed_replay_gain(analysis::replaygain_linear(&buffer.samples));
+    if !current() {
+        return PrepareStep::Superseded;
+    }
     let body = ReadyBody {
         generation,
         path: decoded.path,
@@ -127,7 +158,7 @@ pub(crate) fn prepare_step(
         key_name: String::new(),
         peaks,
         band_peaks: Vec::new(),
-        replay_gain: 1.0,
+        replay_gain,
         analysis_pending: true,
         silence,
     };
@@ -152,13 +183,13 @@ pub(crate) fn measure_analysis(buffer: &DeckBuffer) -> RawAnalysis {
             buffer.source_rate,
             crate::WAVEFORM_BIN_FRAMES,
         ),
-        replay_gain: analysis::replaygain_linear(&buffer.samples),
     }
 }
 
 pub(crate) fn analysis_step(
     generation: u64,
     path: &str,
+    installed_gain: f32,
     current: impl Fn() -> bool,
     buffer: &DeckBuffer,
     analyze: impl FnOnce(&DeckBuffer) -> Result<RawAnalysis, String>,
@@ -202,11 +233,7 @@ pub(crate) fn analysis_step(
         key_camelot: measured.key.camelot,
         key_name: measured.key.name,
         band_peaks: measured.band_peaks,
-        measured_replay_gain: if measured.replay_gain.is_finite() {
-            measured.replay_gain
-        } else {
-            1.0
-        },
+        measured_replay_gain: installed_replay_gain(installed_gain),
         apply_replay_gain: false,
     })
 }
@@ -215,6 +242,7 @@ pub(crate) fn analysis_step(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::time::Instant;
 
     fn tone(rate: u32, seconds: f32, amplitude: f32) -> DeckBuffer {
@@ -267,12 +295,20 @@ mod tests {
         assert_eq!(body.beat_interval_sec, 0.0);
         assert!(body.key_camelot.is_empty());
         assert!(body.band_peaks.is_empty());
-        assert_eq!(body.replay_gain, 1.0);
+        assert_eq!(
+            body.replay_gain,
+            analysis::replaygain_linear(&buffer.samples)
+        );
+        assert!(
+            body.replay_gain < 1.0,
+            "this tone is above the loudness target"
+        );
         assert!(!body.peaks.is_empty());
         assert!(body.peaks.len() < buffer.frames());
         let analysis = analysis_step(
             7,
             &body.path,
+            body.replay_gain,
             || current.load(Ordering::SeqCst),
             &buffer,
             |_| {
@@ -290,7 +326,6 @@ mod tests {
                         confidence: 1.0,
                     },
                     band_peaks: vec![[0.2, 0.4, 0.1]],
-                    replay_gain: 1.8,
                 })
             },
         );
@@ -301,7 +336,7 @@ mod tests {
         assert_eq!(done.bpm, 120.0);
         assert_eq!(done.beat_interval_sec, 0.5);
         assert_eq!(done.band_peaks, vec![[0.2, 0.4, 0.1]]);
-        assert!((done.measured_replay_gain - 1.8).abs() < 1e-6);
+        assert_eq!(done.measured_replay_gain, body.replay_gain);
         assert!(!done.apply_replay_gain);
     }
 
@@ -327,6 +362,7 @@ mod tests {
         let dropped = analysis_step(
             first.generation,
             &first.path,
+            first.replay_gain,
             || false,
             &buffer,
             |_| panic!("analysis started after replacement"),
@@ -344,6 +380,7 @@ mod tests {
         let late = analysis_step(
             first.generation,
             &first.path,
+            first.replay_gain,
             || false,
             &replacement,
             |_| {
@@ -360,7 +397,6 @@ mod tests {
                         confidence: 1.0,
                     },
                     band_peaks: vec![[1.0, 0.0, 0.0]],
-                    replay_gain: 0.5,
                 })
             },
         );
@@ -368,6 +404,7 @@ mod tests {
         let AnalysisStep::Ready(done) = analysis_step(
             2,
             &second.path,
+            second.replay_gain,
             || true,
             &replacement,
             |_| {
@@ -384,7 +421,6 @@ mod tests {
                         confidence: 1.0,
                     },
                     band_peaks: vec![[0.0, 1.0, 0.0]],
-                    replay_gain: 0.7,
                 })
             },
         ) else {
@@ -392,6 +428,7 @@ mod tests {
         };
         assert_eq!(done.generation, 2);
         assert_eq!(done.bpm, 140.0);
+        assert_eq!(done.measured_replay_gain, second.replay_gain);
         assert!(!done.apply_replay_gain);
     }
 
@@ -409,6 +446,7 @@ mod tests {
         let analysis = analysis_step(
             4,
             &body.path,
+            body.replay_gain,
             || true,
             &buffer,
             |_| Err("beatgrid failed".into()),
@@ -417,6 +455,7 @@ mod tests {
         let other = analysis_step(
             9,
             "/music/b.wav",
+            body.replay_gain,
             || true,
             &buffer,
             |_| {
@@ -433,7 +472,6 @@ mod tests {
                         confidence: 1.0,
                     },
                     band_peaks: Vec::new(),
-                    replay_gain: 1.0,
                 })
             },
         );
@@ -450,6 +488,7 @@ mod tests {
         let step = analysis_step(
             1,
             "/music/quiet.wav",
+            f32::NAN,
             || true,
             &buffer,
             |_| {
@@ -466,7 +505,6 @@ mod tests {
                         confidence: 0.0,
                     },
                     band_peaks: Vec::new(),
-                    replay_gain: f32::NAN,
                 })
             },
         );
@@ -486,6 +524,7 @@ mod tests {
         let step = analysis_step(
             1,
             "/music/same.wav",
+            2.0,
             || current.load(Ordering::SeqCst),
             &buffer,
             |_| {
@@ -503,11 +542,81 @@ mod tests {
                         confidence: 1.0,
                     },
                     band_peaks: vec![[1.0, 1.0, 1.0]],
-                    replay_gain: 2.0,
                 })
             },
         );
         assert!(matches!(step, AnalysisStep::Superseded));
+    }
+
+    #[test]
+    fn loudness_installs_before_sound_and_a_late_measurement_does_not_write() {
+        let (_, quiet) = ready_body(prepare_step(
+            1,
+            512,
+            || true,
+            || Ok(Some(track(tone(8_000, 0.2, 0.01), "/music/quiet.wav"))),
+        ));
+        let (_, loud) = ready_body(prepare_step(
+            2,
+            512,
+            || true,
+            || Ok(Some(track(tone(8_000, 0.2, 1.0), "/music/loud.wav"))),
+        ));
+        assert!((quiet.replay_gain - 4.0).abs() < 1e-4);
+        assert!((loud.replay_gain - 0.25).abs() < 1e-4);
+        assert_eq!(installed_replay_gain(f32::NAN), 1.0);
+        assert_eq!(installed_replay_gain(0.0), 1.0);
+        assert_eq!(installed_replay_gain(f32::NEG_INFINITY), 1.0);
+
+        for audible in [false, true] {
+            assert_eq!(
+                deferred_replay_gain(true, audible, 0.5),
+                None,
+                "an installed factor is not written again"
+            );
+        }
+        for measured in [0.5, 4.0, f32::NAN] {
+            assert_eq!(
+                deferred_replay_gain(false, true, measured),
+                None,
+                "queued or sounding transport blocks a late write"
+            );
+        }
+        assert_eq!(deferred_replay_gain(false, false, 1.5), Some(1.5));
+        assert_eq!(deferred_replay_gain(false, false, f32::NAN), Some(1.0));
+
+        let audible = Arc::new(Mutex::new(false));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+        let mark_sounding = {
+            let audible = Arc::clone(&audible);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..400 {
+                    *audible.lock().expect("loudness race lock") = true;
+                }
+            })
+        };
+        let measure_late = {
+            let audible = Arc::clone(&audible);
+            let writes = Arc::clone(&writes);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..400 {
+                    let sounding = *audible.lock().expect("loudness race lock");
+                    if deferred_replay_gain(true, sounding, 0.4).is_some() {
+                        writes.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+        };
+        barrier.wait();
+        mark_sounding.join().expect("sounding thread");
+        measure_late.join().expect("measurement thread");
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(*audible.lock().expect("loudness race lock"));
     }
 
     /// Synthetic worker split only. These durations are not app or controller latency.
@@ -526,11 +635,14 @@ mod tests {
             ));
             ready_ms[index] = started.elapsed().as_secs_f64() * 1_000.0;
             assert!(body.analysis_pending);
-            assert_eq!(body.replay_gain, 1.0);
+            assert!(
+                (body.replay_gain - 4.0).abs() < 1e-4,
+                "quiet tone reaches the loudness ceiling"
+            );
             let started = Instant::now();
             let measured = measure_analysis(&prepared);
             analysis_ms[index] = started.elapsed().as_secs_f64() * 1_000.0;
-            assert!(!measured.replay_gain.is_finite() || measured.replay_gain > 1.0);
+            assert!(!measured.grid.bpm.is_nan());
             assert!(measured.band_peaks.len() == body.peaks.len());
         }
         eprintln!(

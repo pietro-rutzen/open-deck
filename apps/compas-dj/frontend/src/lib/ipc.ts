@@ -29,7 +29,7 @@ export interface DeckLoaded {
   peaks: number[];
   /** Per-bin `[low, mid, high]` band energy (0..1) for frequency-colored waveforms. */
   band_peaks: [number, number, number][];
-  /** Loudness factor stored with this load. Unity until a future load applies a measurement. */
+  /** Loudness factor installed with this load, before the first audible sample. */
   replay_gain: number;
   /** Silent regions `[start, end)` in source frames. Playback jumps across them. */
   silence?: [number, number][];

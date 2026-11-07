@@ -112,6 +112,7 @@ impl<T> Receiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
     #[test]
     fn shutdown_hides_abandoned_group_tail_and_keeps_peak() {
         let (tx, mut rx) = channel();
@@ -175,5 +176,54 @@ mod tests {
         drop(rx);
         assert!(tx.send_group(vec![5, 6, 7]).is_err());
         assert_eq!(tx.diagnostics().0, 0);
+    }
+    #[test]
+    fn load_replay_gain_stays_ahead_of_play_cue_and_scratch() {
+        let (tx, mut rx) = channel();
+        let barrier = Arc::new(Barrier::new(3));
+        let load = {
+            let tx = tx.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..300 {
+                    tx.send_group(vec!["load", "gain", "sync-off"]).unwrap();
+                }
+            })
+        };
+        let transport = {
+            let tx = tx.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for index in 0..300 {
+                    let command = match index % 3 {
+                        0 => "play",
+                        1 => "cue",
+                        _ => "scratch",
+                    };
+                    tx.send(command).unwrap();
+                }
+            })
+        };
+        barrier.wait();
+        load.join().unwrap();
+        transport.join().unwrap();
+        let mut items = Vec::with_capacity(1_200);
+        while let Ok(item) = rx.recv_timeout(Duration::from_millis(200)) {
+            items.push(item);
+        }
+        assert_eq!(items.len(), 1_200);
+        let mut index = 0;
+        while index < items.len() {
+            if items[index] == "load" {
+                assert_eq!(items[index + 1], "gain");
+                assert_eq!(items[index + 2], "sync-off");
+                index += 3;
+            } else {
+                assert!(matches!(items[index], "play" | "cue" | "scratch"));
+                index += 1;
+            }
+        }
     }
 }

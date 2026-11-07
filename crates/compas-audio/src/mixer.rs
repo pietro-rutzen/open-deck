@@ -2974,6 +2974,139 @@ mod tests {
         );
     }
 
+    fn constant_deck_buffer(value: f32, frames: usize) -> Arc<DeckBuffer> {
+        Arc::new(DeckBuffer::new(vec![value; frames * 2], 48_000))
+    }
+
+    fn load_constant(tx: &mut Producer<AudioCommand>, deck: usize, value: f32, frames: usize) {
+        tx.push(AudioCommand::LoadDeck {
+            deck,
+            buffer: constant_deck_buffer(value, frames),
+            beat_offset: 0.0,
+            beat_interval: 0.0,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn replay_gain_is_on_master_cue_preview_scratch_and_headphones_before_sound() {
+        let sample = 0.25;
+        let play_level = |gain: f32| {
+            let (mut tx, mut mixer) = mixer_with_commands();
+            load_constant(&mut tx, 0, sample, 64);
+            tx.push(AudioCommand::SetDeckReplayGain { deck: 0, gain })
+                .unwrap();
+            mixer.drain_commands();
+            mixer.decks[0].cue = true;
+            let stopped = mixer.next_buses();
+            assert!(
+                stopped.master.0.abs() < 1e-6 && stopped.cue.0.abs() < 1e-6,
+                "a stopped deck is silent on master and headphones"
+            );
+            assert!(!mixer.decks[0].playing);
+            tx.push(AudioCommand::SetDeckPlaying {
+                deck: 0,
+                playing: true,
+            })
+            .unwrap();
+            mixer.drain_commands();
+            assert!(mixer.decks[0].playing);
+            mixer.next_buses()
+        };
+        let unity = play_level(1.0);
+        let normalized = play_level(2.0);
+        assert!(
+            (normalized.master.0 / unity.master.0 - 2.0).abs() < 1e-3,
+            "master hears the factor from the first playing sample"
+        );
+        assert!(
+            (normalized.cue.0 / unity.cue.0 - 2.0).abs() < 1e-3,
+            "headphone tap hears the same factor"
+        );
+
+        let (mut tx, mut mixer) = mixer_with_commands();
+        tx.push(AudioCommand::SetDeckPlaying {
+            deck: 0,
+            playing: true,
+        })
+        .unwrap();
+        load_constant(&mut tx, 0, sample, 64);
+        tx.push(AudioCommand::SetDeckReplayGain { deck: 0, gain: 2.0 })
+            .unwrap();
+        mixer.drain_commands();
+        mixer.decks[0].cue = true;
+        assert!(
+            !mixer.decks[0].playing,
+            "load clears a play that arrived before the buffer"
+        );
+        let held = mixer.next_buses();
+        assert!(held.master.0.abs() < 1e-6 && held.cue.0.abs() < 1e-6);
+
+        let (mut tx, mut mixer) = mixer_with_commands();
+        load_constant(&mut tx, 0, sample, 64);
+        tx.push(AudioCommand::SetDeckReplayGain { deck: 0, gain: 2.0 })
+            .unwrap();
+        tx.push(AudioCommand::CueButton {
+            deck: 0,
+            pressed: true,
+        })
+        .unwrap();
+        mixer.drain_commands();
+        mixer.decks[0].cue = true;
+        assert!(mixer.decks[0].cue_previewing && mixer.decks[0].playing);
+        let preview = mixer.next_buses();
+        assert!(
+            (preview.master.0 / unity.master.0 - 2.0).abs() < 1e-3
+                && (preview.cue.0 / unity.cue.0 - 2.0).abs() < 1e-3,
+            "cue preview is normalized on master and headphones"
+        );
+
+        let scratch_peak = |gain: f32| {
+            let (mut tx, mut mixer) = mixer_with_commands();
+            load_constant(&mut tx, 0, sample, 4_096);
+            tx.push(AudioCommand::SetDeckReplayGain { deck: 0, gain })
+                .unwrap();
+            tx.push(AudioCommand::SetScratch {
+                deck: 0,
+                active: true,
+                speed: 1.0,
+            })
+            .unwrap();
+            mixer.drain_commands();
+            mixer.decks[0].cue = true;
+            let mut peak = 0.0_f32;
+            for _ in 0..2_000 {
+                peak = peak.max(mixer.next_buses().cue.0.abs());
+            }
+            peak
+        };
+        let scratch_ratio = scratch_peak(2.0) / scratch_peak(1.0);
+        assert!(
+            (scratch_ratio - 2.0).abs() < 1e-2,
+            "scratch and its headphone tap use the installed factor, ratio {scratch_ratio}"
+        );
+
+        let (mut tx, mut mixer) = mixer_with_commands();
+        load_constant(&mut tx, 0, sample, 64);
+        tx.push(AudioCommand::SetDeckReplayGain { deck: 0, gain: 1.0 })
+            .unwrap();
+        tx.push(AudioCommand::SetDeckPlaying {
+            deck: 0,
+            playing: true,
+        })
+        .unwrap();
+        mixer.drain_commands();
+        let first = mixer.next_buses();
+        tx.push(AudioCommand::SetDeckReplayGain { deck: 0, gain: 2.0 })
+            .unwrap();
+        mixer.drain_commands();
+        let jumped = mixer.next_buses();
+        assert!(
+            (jumped.master.0 / first.master.0 - 2.0).abs() < 1e-3,
+            "a gain command after sound starts changes the next sample"
+        );
+    }
+
     #[test]
     fn fader_stage_gain_smooths_toward_zero() {
         // ~8 ms settle time → a few thousand frames at 48 kHz drives the smoother to ~0.

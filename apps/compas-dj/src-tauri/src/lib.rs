@@ -946,8 +946,7 @@ struct DeckLoadedEvent {
     peaks: Vec<f32>,
     /// Per-bin `[low, mid, high]` band energy (0..1) for frequency-colored waveforms.
     band_peaks: Vec<[f32; 3]>,
-    /// Unity until a future load can apply measured loudness with the buffer.
-    /// This event does not change a playing deck's level.
+    /// Loudness factor installed with this load, before the first audible sample.
     replay_gain: f32,
     /// Silent regions `[start, end)` in source frames. Playback jumps across them.
     silence: Vec<(f64, f64)>,
@@ -969,7 +968,7 @@ struct DeckAnalysisEvent {
     key_camelot: String,
     key_name: String,
     band_peaks: Vec<[f32; 3]>,
-    /// Measured factor. Not applied to the engine on this load.
+    /// Factor already installed with the buffer. This event does not write pregain.
     replay_gain: f32,
     replay_gain_applied: bool,
 }
@@ -1321,6 +1320,7 @@ fn load_track(
             let analysis_app = app.clone();
             let analysis_tx = tx.clone();
             let analysis_path = body.path.clone();
+            let installed_gain = body.replay_gain;
             let submitted = app
                 .state::<deck_loads::DeckLoads>()
                 .commit(deck, ticket, || {
@@ -1333,6 +1333,7 @@ fn load_track(
                                 deck,
                                 ticket,
                                 analysis_path,
+                                installed_gain,
                                 buffer,
                             )
                         }),
@@ -1432,14 +1433,19 @@ fn install_decoded(
     buffer: Arc<DeckBuffer>,
     loaded: &DeckLoadedEvent,
 ) -> Result<(), String> {
-    // Load and the pitch reset share one channel envelope. Loudness stays at unity:
-    // the measurement is deferred and is not applied after this command.
+    // Load stops the deck and sets pregain to unity. The measured factor is the next
+    // command in the same indivisible group, so Play, cue preview, and scratch cannot
+    // split them. Analysis does not send this command again.
     let mut group = Some(vec![
         EngineMsg::Load {
             deck,
             buffer,
             beat_offset: 0.0,
             beat_interval: 0.0,
+        },
+        EngineMsg::SetDeckReplayGain {
+            deck,
+            gain: loaded.replay_gain,
         },
         EngineMsg::SetDeckSyncLive {
             deck,
@@ -1479,6 +1485,7 @@ fn run_deferred_analysis(
     deck: usize,
     ticket: u64,
     path: String,
+    installed_gain: f32,
     buffer: Arc<DeckBuffer>,
 ) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1487,9 +1494,10 @@ fn run_deferred_analysis(
                 .current(deck, ticket)
                 .unwrap_or(false)
         };
-        let step = deck_prepare::analysis_step(ticket, &path, live, &buffer, |buffer| {
-            Ok(deck_prepare::measure_analysis(buffer))
-        });
+        let step =
+            deck_prepare::analysis_step(ticket, &path, installed_gain, live, &buffer, |buffer| {
+                Ok(deck_prepare::measure_analysis(buffer))
+            });
         match step {
             deck_prepare::AnalysisStep::Superseded => {}
             deck_prepare::AnalysisStep::Failed(error) => {
@@ -1557,6 +1565,14 @@ fn publish_analysis(
                 interval,
             })?;
         }
+    }
+    let audible = {
+        let engine = app.state::<EngineHandle>();
+        engine.telemetry.is_playing(deck) || engine.telemetry.deck_rate(deck).abs() > f64::EPSILON
+    };
+    if let Some(gain) = deck_prepare::deferred_replay_gain(true, audible, body.measured_replay_gain)
+    {
+        tx.send(EngineMsg::SetDeckReplayGain { deck, gain })?;
     }
     debug_assert!(!body.apply_replay_gain);
     let _ = app.emit(
