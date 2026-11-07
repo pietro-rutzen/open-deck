@@ -12,18 +12,19 @@ impl Default for DeckLoads {
 }
 impl DeckLoads {
     /// Invalidate all previous workers for this deck, publishing loading under the same gate.
-    pub(crate) fn begin(&self, deck: usize, publish: impl FnOnce()) -> Result<u64, String> {
+    pub(crate) fn begin(&self, deck: usize, publish: impl FnOnce(u64)) -> Result<u64, String> {
         let mut generation = self
             .0
             .get(deck)
             .ok_or("Invalid load deck")?
             .lock()
             .map_err(|e| e.to_string())?;
-        *generation = generation
+        let ticket = generation
             .checked_add(1)
             .ok_or("Deck load generation exhausted")?;
-        publish();
-        Ok(*generation)
+        *generation = ticket;
+        publish(ticket);
+        Ok(ticket)
     }
     pub(crate) fn current(&self, deck: usize, ticket: u64) -> Result<bool, String> {
         Ok(*self
@@ -33,6 +34,13 @@ impl DeckLoads {
             .lock()
             .map_err(|e| e.to_string())?
             == ticket)
+    }
+    /// Drop every in-flight load. Used when the output device is replaced and decks are cleared.
+    pub(crate) fn invalidate_all(&self) -> Result<(), String> {
+        for deck in 0..NUM_DECKS {
+            self.begin(deck, |_| {})?;
+        }
+        Ok(())
     }
     /// Retire stale completions without publishing errors, installing native state or enqueueing.
     pub(crate) fn commit<T>(
@@ -59,8 +67,8 @@ mod tests {
     #[test]
     fn reversed_completions_cannot_replace_latest_track() {
         let loads = DeckLoads::default();
-        let old = loads.begin(0, || {}).unwrap();
-        let new = loads.begin(0, || {}).unwrap();
+        let old = loads.begin(0, |_| {}).unwrap();
+        let new = loads.begin(0, |_| {}).unwrap();
         let mut installed = Vec::new();
         assert!(loads
             .commit(0, new, || {
@@ -81,9 +89,9 @@ mod tests {
     #[test]
     fn unload_invalidates_decode_and_other_deck_is_independent() {
         let loads = DeckLoads::default();
-        let a = loads.begin(0, || {}).unwrap();
-        let b = loads.begin(1, || {}).unwrap();
-        let unload = loads.begin(0, || {}).unwrap();
+        let a = loads.begin(0, |_| {}).unwrap();
+        let b = loads.begin(1, |_| {}).unwrap();
+        let unload = loads.begin(0, |_| {}).unwrap();
         loads.commit(0, unload, || Ok(())).unwrap();
         assert!(!loads.current(0, a).unwrap());
         assert!(loads.current(1, b).unwrap());
@@ -92,14 +100,14 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(loads
-            .begin(NUM_DECKS, || panic!("invalid admission"))
+            .begin(NUM_DECKS, |_| panic!("invalid admission"))
             .is_err());
     }
     #[test]
     fn admission_waits_until_commit_publication_finishes() {
         use std::sync::{mpsc, Arc};
         let loads = Arc::new(DeckLoads::default());
-        let ticket = loads.begin(0, || {}).unwrap();
+        let ticket = loads.begin(0, |_| {}).unwrap();
         let (inside_tx, inside_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let worker = loads.clone();
@@ -117,7 +125,7 @@ mod tests {
         let (admit_tx, admit_rx) = mpsc::channel();
         let worker = loads.clone();
         let admission =
-            std::thread::spawn(move || worker.begin(0, || admit_tx.send(()).unwrap()).unwrap());
+            std::thread::spawn(move || worker.begin(0, |_| admit_tx.send(()).unwrap()).unwrap());
         assert!(admit_rx.try_recv().is_err());
         release_tx.send(()).unwrap();
         commit.join().unwrap();

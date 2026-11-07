@@ -522,8 +522,38 @@ impl PerformanceState {
         })?
     }
 
+    pub(crate) fn has_track(&self, deck: usize) -> bool {
+        self.with_deck(deck, |snapshot| snapshot.track_frames > 0)
+            .unwrap_or(false)
+    }
+
     pub(crate) fn clear_deck(&self, deck: usize) {
         self.install_track(deck, 0.0, 0.0, 0.0, 0.0, 0);
+    }
+
+    /// Publish a finished beatgrid without clearing cues, loops, or sync.
+    /// An unloaded deck is left untouched so a late result cannot revive it.
+    pub(crate) fn publish_analysis(
+        &self,
+        deck: usize,
+        offset: f64,
+        interval: f64,
+        bpm: f64,
+    ) -> bool {
+        self.with_deck(deck, |snapshot| {
+            if snapshot.track_frames == 0
+                || !offset.is_finite()
+                || !interval.is_finite()
+                || interval <= 0.0
+            {
+                return false;
+            }
+            snapshot.grid_offset = offset;
+            snapshot.grid_interval = interval;
+            snapshot.bpm = if bpm.is_finite() { bpm.max(0.0) } else { 0.0 };
+            snapshot.bpm > 0.0
+        })
+        .unwrap_or(false)
     }
 }
 
@@ -1668,6 +1698,49 @@ mod tests {
             Some(EngineMsg::Loop { deck: 0, in_frame, out_frame, active: true })
                 if in_frame == 1_000.0 && out_frame == 5_000.0
         ));
+    }
+
+    #[test]
+    fn sync_does_not_arm_without_a_tempo() {
+        let performance = PerformanceState::new();
+        performance.install_track(0, 0.0, 0.0, 44_100.0, 0.0, 1_000);
+        performance.set_partner(0, Some(1));
+        let tempos = [1.0; NUM_DECKS];
+        assert!(apply_performance(0, "sync", 1.0, true, None, &tempos, &performance).is_none());
+        assert!(!performance
+            .with_deck(0, |snapshot| snapshot.synced)
+            .unwrap());
+    }
+
+    #[test]
+    fn analysis_updates_the_grid_without_clearing_cues_or_reviving_an_empty_deck() {
+        let performance = PerformanceState::new();
+        assert!(!performance.publish_analysis(0, 10.0, 100.0, 120.0));
+        assert!(!performance.has_track(0));
+        performance.install_track(0, 0.0, 0.0, 44_100.0, 0.0, 4_000);
+        performance.set_hot_cue(0, 3, Some(250.0));
+        performance.set_loop(0, 10.0, 40.0, false, true, None);
+        assert!(performance.publish_analysis(0, 12.0, 22_050.0, 120.0));
+        let (bpm, cue, armed, synced) = performance
+            .with_deck(0, |snapshot| {
+                (
+                    snapshot.bpm,
+                    snapshot.hot_cues[3],
+                    snapshot.loop_armed,
+                    snapshot.synced,
+                )
+            })
+            .unwrap();
+        assert_eq!(bpm, 120.0);
+        assert_eq!(cue, Some(250.0));
+        assert!(armed);
+        assert!(!synced);
+        performance.clear_deck(0);
+        assert!(!performance.publish_analysis(0, 12.0, 22_050.0, 120.0));
+        assert_eq!(
+            performance.with_deck(0, |snapshot| snapshot.bpm).unwrap(),
+            0.0
+        );
     }
 
     #[test]

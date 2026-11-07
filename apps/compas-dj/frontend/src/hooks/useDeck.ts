@@ -14,6 +14,8 @@ import {
   setDeckPitchShift,
   inTauri,
   loadTrack,
+  onDeckAnalysisFailed,
+  onDeckAnalyzed,
   onDeckError,
   onDeckLoaded,
   onDeckLoading,
@@ -61,6 +63,11 @@ import {
   type DeckLoaded,
   type FilterMode,
 } from "../lib/ipc";
+import {
+  clearPendingAnalysis,
+  gridAvailable,
+  mergeDeckAnalysis,
+} from "../lib/deckReady";
 import { listeningModeActive } from "../lib/listeningMode";
 import { firstAudibleFrame } from "../lib/silence";
 import { TRIM_MAX } from "../lib/trim";
@@ -319,6 +326,9 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
   }, [deck, fxBeatSec]);
   // Path of the loaded track + a once-per-load guard for recording a play.
   const pathRef = useRef<string | null>(null);
+  const metaRef = useRef(meta);
+  metaRef.current = meta;
+  const loadGenerationRef = useRef(0);
   const playedRef = useRef(false);
   const quantizeRef = useRef(quantize);
   quantizeRef.current = quantize;
@@ -352,6 +362,8 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         setTempo(1);
         if (!pathRef.current) return;
         pathRef.current = null;
+        metaRef.current = null;
+        loadGenerationRef.current = 0;
         gainLoadRef.current += 1;
         setMeta(null);
         setPlaying(false);
@@ -362,15 +374,17 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
     track(
       onDeckLoading((e) => {
         if (e.deck !== deck) return;
+        loadGenerationRef.current = e.generation;
         setLoading(true);
         setError(null);
       }),
     );
     track(
       onDeckLoaded((e) => {
-        if (e.deck !== deck) return;
+        if (e.deck !== deck || e.generation !== loadGenerationRef.current) return;
         const gainLoad = ++gainLoadRef.current;
         const gainEdit = gainEditRef.current;
+        metaRef.current = e;
         setMeta(e);
         const origin = firstAudibleFrame(e.silence, e.frames);
         setFrame(origin);
@@ -380,7 +394,11 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         setKeylockState(false); // engine resets key-lock on load
         setPitchShiftState(0); // engine resets key shift on load
         setGridOffset(0);
-        setSyncedState(false); // engine resets sync on load
+        setSyncedState(false);
+        setSyncLiveState(false);
+        setSyncInternalState(false);
+        setDeckSyncLive(deck, false).catch(() => {});
+        setDeckSyncInternal(deck, false).catch(() => {});
         setHotCues(Array(8).fill(null));
         setLoopState({ active: false, beats: null, inFrame: 0, outFrame: 0 });
         // Engine resets FX on load; mirror that (keep the user's param settings).
@@ -394,19 +412,18 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         playedRef.current = false;
 
         if (dsp) {
-          // Cache analysis onto the library row, then restore saved cues/loops/grid/gain.
-          dbUpsertAnalysis(e).catch(() => {});
           dbTrackState(e.path)
             .then((st) => {
-              if (pathRef.current !== e.path) return; // a newer track loaded meanwhile
+              const loaded = metaRef.current;
+              if (!loaded || loaded.path !== e.path || loaded.generation !== e.generation) return;
               if (st.grid_offset_sec) {
                 setGridOffset(st.grid_offset_sec);
-                if ((e.beat_interval_sec ?? 0) > 0) {
-                  const sr = e.source_rate;
+                if (gridAvailable(loaded)) {
+                  const sr = loaded.source_rate;
                   setBeatgrid(
                     deck,
-                    (e.first_beat_sec + st.grid_offset_sec) * sr,
-                    e.beat_interval_sec * sr,
+                    (loaded.first_beat_sec + st.grid_offset_sec) * sr,
+                    loaded.beat_interval_sec * sr,
                   ).catch(() => {});
                 }
               }
@@ -453,6 +470,37 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
       }),
     );
     track(
+      onDeckAnalyzed((event) => {
+        if (event.deck !== deck) return;
+        const current = metaRef.current;
+        if (!current) return;
+        const merged = mergeDeckAnalysis(current, event);
+        if (!merged) return;
+        metaRef.current = merged;
+        setMeta(merged);
+        if (!dsp) return;
+        dbUpsertAnalysis(merged).catch(() => {});
+        if (!gridAvailable(merged)) return;
+        const offset = gridOffsetRef.current;
+        setBeatgrid(
+          deck,
+          (merged.first_beat_sec + offset) * merged.source_rate,
+          merged.beat_interval_sec * merged.source_rate,
+        ).catch(() => {});
+      }),
+    );
+    track(
+      onDeckAnalysisFailed((event) => {
+        if (event.deck !== deck) return;
+        const current = metaRef.current;
+        if (!current) return;
+        const cleared = clearPendingAnalysis(current, event);
+        if (!cleared) return;
+        metaRef.current = cleared;
+        setMeta(cleared);
+      }),
+    );
+    track(
       onDeckPosition((e) => {
         if (e.deck !== deck) return;
         const previousFrame = frameRef.current;
@@ -482,7 +530,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
     );
     track(
       onDeckError((e) => {
-        if (e.deck !== deck) return;
+        if (e.deck !== deck || e.generation !== loadGenerationRef.current) return;
         setError(e.message);
         setLoading(false);
       }),
@@ -606,6 +654,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
       },
       // Continuous beat-sync: follow `master` (deck index), or null to disengage.
       sync: (master: number | null) => {
+        if (master !== null && !gridAvailable(metaRef.current)) return;
         setSyncedState(master !== null);
         if (master !== null) {
           // The engine cancels live and internal-clock sync; mirror it in the UI.
@@ -618,6 +667,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
       // Tempo-match the live mic/aux beat clock (mutually exclusive with deck and internal sync).
       toggleSyncLive: () => {
         const next = !syncLive;
+        if (next && !gridAvailable(metaRef.current)) return;
         setSyncLiveState(next);
         if (next) {
           setSyncedState(false);
@@ -628,6 +678,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
       // Tempo/phase-match the internal master clock (mutually exclusive with deck and live sync).
       toggleSyncInternal: () => {
         const next = !syncInternal;
+        if (next && !gridAvailable(metaRef.current)) return;
         setSyncInternalState(next);
         if (next) {
           setSyncedState(false);

@@ -24,6 +24,9 @@ pub(crate) struct DecodeWorker {
 }
 impl DecodeWorker {
     fn new() -> Result<Self, String> {
+        Self::spawn("deck-decoder")
+    }
+    fn spawn(name: &'static str) -> Result<Self, String> {
         let pending = Arc::new((
             Mutex::new(Pending {
                 slots: std::array::from_fn(|_| None),
@@ -33,7 +36,7 @@ impl DecodeWorker {
         ));
         let worker = pending.clone();
         std::thread::Builder::new()
-            .name("deck-decoder".into())
+            .name(name.into())
             .spawn(move || loop {
                 let job = {
                     let (lock, wake) = &*worker;
@@ -55,6 +58,14 @@ impl DecodeWorker {
     pub(crate) fn shared() -> Result<&'static Self, String> {
         static WORKER: OnceLock<Result<DecodeWorker, String>> = OnceLock::new();
         WORKER.get_or_init(Self::new).as_ref().map_err(Clone::clone)
+    }
+    /// One analysis job per deck. A newer load replaces a job that has not started.
+    pub(crate) fn analysis() -> Result<&'static Self, String> {
+        static WORKER: OnceLock<Result<DecodeWorker, String>> = OnceLock::new();
+        WORKER
+            .get_or_init(|| Self::spawn("deck-analysis"))
+            .as_ref()
+            .map_err(Clone::clone)
     }
     /// Call under DeckLoads::commit so an older submission cannot replace a newer slot.
     pub(crate) fn submit(&self, deck: usize, job: Job) -> Result<(), String> {
@@ -92,7 +103,7 @@ mod tests {
             )
             .unwrap();
         started.recv_timeout(Duration::from_secs(5)).unwrap();
-        let ticket = loads.begin(1, || {}).unwrap();
+        let ticket = loads.begin(1, |_| {}).unwrap();
         let job_loads = loads.clone();
         let (result, done) = mpsc::channel();
         loads
@@ -105,7 +116,7 @@ mod tests {
                 )
             })
             .unwrap();
-        loads.begin(1, || {}).unwrap(); // Eject invalidates the waiting request.
+        loads.begin(1, |_| {}).unwrap(); // Eject invalidates the waiting request.
         release.send(()).unwrap();
         assert!(!done.recv_timeout(Duration::from_secs(5)).unwrap());
     }

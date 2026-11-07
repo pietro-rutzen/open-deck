@@ -10,7 +10,7 @@
     "icons": "node scripts/gen-icons.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "node scripts/test-library-controller.mjs && node scripts/test-hot-cue-markers.mjs && node scripts/test-waveform-rgb.mjs && node scripts/test-cue-countdown.mjs && node scripts/test-phase-meter.mjs && node scripts/test-recording-filename.mjs"
+    "test": "node scripts/test-library-controller.mjs && node scripts/test-hot-cue-markers.mjs && node scripts/test-waveform-rgb.mjs && node scripts/test-cue-countdown.mjs && node scripts/test-phase-meter.mjs && node scripts/test-recording-filename.mjs && node scripts/test-deck-ready.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

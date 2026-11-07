@@ -29,10 +29,36 @@ export interface DeckLoaded {
   peaks: number[];
   /** Per-bin `[low, mid, high]` band energy (0..1) for frequency-colored waveforms. */
   band_peaks: [number, number, number][];
-  /** Loudness-normalization factor applied on load (1.0 = none). */
+  /** Loudness factor stored with this load. Unity until a future load applies a measurement. */
   replay_gain: number;
   /** Silent regions `[start, end)` in source frames. Playback jumps across them. */
   silence?: [number, number][];
+  /** Matches the loading and analysis events for this request. */
+  generation: number;
+  /** Beatgrid, key, and waveform color are still outstanding. */
+  analysis_pending: boolean;
+  analysis_failed?: boolean;
+}
+
+export interface DeckAnalysis {
+  deck: number;
+  generation: number;
+  path: string;
+  bpm: number;
+  bpm_confidence: number;
+  first_beat_sec: number;
+  beat_interval_sec: number;
+  key_camelot: string;
+  key_name: string;
+  band_peaks: [number, number, number][];
+  replay_gain: number;
+  replay_gain_applied: boolean;
+}
+
+export interface DeckAnalysisFailed {
+  deck: number;
+  generation: number;
+  path: string;
 }
 
 /** How a musical key is displayed: Camelot wheel codes (8A/7B) or standard names (C#m/D). */
@@ -140,6 +166,7 @@ export interface EngineLoad {
 
 export interface DeckError {
   deck: number;
+  generation: number;
   message: string;
 }
 
@@ -915,11 +942,16 @@ export const setDeckSyncInternal = (deck: number, active: boolean) =>
 export interface DeckLoading {
   deck: number;
   path: string;
+  generation: number;
 }
 export const onDeckLoading = (cb: (e: DeckLoading) => void): Promise<UnlistenFn> =>
   listen<DeckLoading>("deck:loading", (e) => cb(e.payload));
 export const onDeckLoaded = (cb: (e: DeckLoaded) => void): Promise<UnlistenFn> =>
   listen<DeckLoaded>("deck:loaded", (e) => cb(e.payload));
+export const onDeckAnalyzed = (cb: (e: DeckAnalysis) => void): Promise<UnlistenFn> =>
+  listen<DeckAnalysis>("deck:analyzed", (e) => cb(e.payload));
+export const onDeckAnalysisFailed = (cb: (e: DeckAnalysisFailed) => void): Promise<UnlistenFn> =>
+  listen<DeckAnalysisFailed>("deck:analysis-failed", (e) => cb(e.payload));
 export const onDeckPosition = (cb: (e: DeckPosition) => void): Promise<UnlistenFn> =>
   listen<DeckPosition>("deck:position", (e) => cb(e.payload));
 export const onDeckError = (cb: (e: DeckError) => void): Promise<UnlistenFn> =>

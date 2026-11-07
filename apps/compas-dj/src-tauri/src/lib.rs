@@ -3,7 +3,8 @@
 //! Threading: the real-time audio engine (`compas-audio`) lives on its own thread
 //! because `cpal::Stream` is not `Send`. Tauri commands send coarse [`EngineMsg`]s over
 //! an mpsc channel; the engine thread forwards them as lock-free `AudioCommand`s.
-//! Decoding/analysis runs on a shared bounded-admission worker thread and reports back via Tauri events.
+//! Decoding runs on a shared worker and can publish playback before analysis.
+//! Analysis uses a second one-slot worker and reports back via Tauri events.
 //! A telemetry thread samples lock-free deck position/state and emits it at UI rate.
 
 use std::fs::File;
@@ -33,6 +34,7 @@ mod deck_decode_worker;
 mod deck_loading;
 mod deck_loads;
 mod deck_meters;
+mod deck_prepare;
 mod library_analysis;
 #[cfg(target_os = "macos")]
 mod macos_drag;
@@ -42,8 +44,7 @@ mod sampler_loading;
 mod track_visuals;
 
 use compas_audio::{
-    compute_peaks, silence_spans, AudioCommand, AudioEngine, DeckBuffer, DeckTelemetry,
-    EngineConfig, FilterMode,
+    AudioCommand, AudioEngine, DeckBuffer, DeckTelemetry, EngineConfig, FilterMode,
 };
 use midir::{MidiInput, MidiInputConnection};
 use notify::Watcher;
@@ -945,10 +946,39 @@ struct DeckLoadedEvent {
     peaks: Vec<f32>,
     /// Per-bin `[low, mid, high]` band energy (0..1) for frequency-colored waveforms.
     band_peaks: Vec<[f32; 3]>,
-    /// Loudness-normalization (ReplayGain) factor the engine applied on load.
+    /// Unity until a future load can apply measured loudness with the buffer.
+    /// This event does not change a playing deck's level.
     replay_gain: f32,
     /// Silent regions `[start, end)` in source frames. Playback jumps across them.
     silence: Vec<(f64, f64)>,
+    /// Matches `deck:loading` / `deck:analyzed` for this request. A same-path reload gets a new one.
+    generation: u64,
+    /// True while beatgrid, key, and colored waveform are still outstanding.
+    analysis_pending: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct DeckAnalysisEvent {
+    deck: usize,
+    generation: u64,
+    path: String,
+    bpm: f32,
+    bpm_confidence: f32,
+    first_beat_sec: f32,
+    beat_interval_sec: f32,
+    key_camelot: String,
+    key_name: String,
+    band_peaks: Vec<[f32; 3]>,
+    /// Measured factor. Not applied to the engine on this load.
+    replay_gain: f32,
+    replay_gain_applied: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct DeckAnalysisFailedEvent {
+    deck: usize,
+    generation: u64,
+    path: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -987,11 +1017,13 @@ struct EngineLoadEvent {
 struct DeckLoadingEvent {
     deck: usize,
     path: String,
+    generation: u64,
 }
 
 #[derive(Serialize, Clone)]
 struct DeckErrorEvent {
     deck: usize,
+    generation: u64,
     message: String,
 }
 
@@ -1219,8 +1251,8 @@ fn export_diagnostics(
         .map_err(|e| e.to_string())
 }
 
-/// Decode + analyze a file on a worker thread, then install it on `deck` and emit
-/// `deck:loaded` (or `deck:error`). Returns immediately.
+/// Decode a file, install it as soon as the buffer is ready, and analyze later.
+/// Returns immediately. Playback does not wait for beatgrid, key, color, or loudness.
 #[tauri::command]
 fn load_track(
     jog: State<'_, flx4_runtime::JogRuntime>,
@@ -1230,171 +1262,105 @@ fn load_track(
     path: String,
 ) -> Result<(), String> {
     let worker = deck_decode_worker::DecodeWorker::shared()?;
-    let ticket = app.state::<deck_loads::DeckLoads>().begin(deck, || {
-        jog.reset();
-        let _ = app.emit(
-            "deck:loading",
-            DeckLoadingEvent {
-                deck,
-                path: path.clone(),
-            },
-        );
-    })?;
+    let analysis = deck_decode_worker::DecodeWorker::analysis()?;
+    let ticket = app
+        .state::<deck_loads::DeckLoads>()
+        .begin(deck, |generation| {
+            jog.reset();
+            let _ = app.emit(
+                "deck:loading",
+                DeckLoadingEvent {
+                    deck,
+                    path: path.clone(),
+                    generation,
+                },
+            );
+        })?;
     let tx = state.tx.clone();
     let error_app = app.clone();
     let job_app = app.clone();
     let job = Box::new(move || {
         let app = job_app;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // Queued requests invalidated by another LOAD or eject do no decode work.
-            if !app
-                .state::<deck_loads::DeckLoads>()
-                .current(deck, ticket)
-                .unwrap_or(false)
-            {
-                return;
-            }
-            let (buffer, metadata) = match deck_loading::decode(std::path::Path::new(&path), || {
+            let live = || {
                 app.state::<deck_loads::DeckLoads>()
                     .current(deck, ticket)
                     .unwrap_or(false)
-            }) {
-                Ok(Some(v)) => v,
-                Ok(None) => return,
-                Err(e) => {
-                    // A retired worker must not replace a newer load's status with its error.
-                    let _ = app
-                        .state::<deck_loads::DeckLoads>()
-                        .commit(deck, ticket, || {
-                            let _ = app.emit(
-                                "deck:error",
-                                DeckErrorEvent {
-                                    deck,
-                                    message: format!("decode failed: {e}"),
-                                },
-                            );
-                            Ok(())
-                        });
+            };
+            let prepared = deck_prepare::prepare_step(ticket, WAVEFORM_BIN_FRAMES, &live, || {
+                match deck_loading::decode(std::path::Path::new(&path), &live) {
+                    Ok(Some((buffer, metadata))) => {
+                        Ok(Some(deck_prepare::decoded_from(buffer, metadata)))
+                    }
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
+                }
+            });
+            let (buffer, body) = match prepared {
+                deck_prepare::PrepareStep::Ready(prepared) => (prepared.buffer, prepared.body),
+                deck_prepare::PrepareStep::Superseded => return,
+                deck_prepare::PrepareStep::Failed(error) => {
+                    emit_load_error(&app, deck, ticket, format!("decode failed: {error}"));
                     return;
                 }
             };
-            if !app
-                .state::<deck_loads::DeckLoads>()
-                .current(deck, ticket)
-                .unwrap_or(false)
-            {
-                return;
-            }
-            let peaks = compute_peaks(&buffer.samples, WAVEFORM_BIN_FRAMES);
-            let silence = silence_spans(&buffer.samples, buffer.source_rate);
-            let buffer = buffer.with_silence(silence.clone());
-            let band_peaks = compas_dsp::analysis::band_peaks(
-                &buffer.samples,
-                buffer.source_rate,
-                WAVEFORM_BIN_FRAMES,
-            );
-            if !app
-                .state::<deck_loads::DeckLoads>()
-                .current(deck, ticket)
-                .unwrap_or(false)
-            {
-                return;
-            }
-            let (grid, key) = analyze_track(&buffer);
-            if !app
-                .state::<deck_loads::DeckLoads>()
-                .current(deck, ticket)
-                .unwrap_or(false)
-            {
-                return;
-            }
-            let replay_gain = compas_dsp::analysis::replaygain_linear(&buffer.samples);
-            let sr = buffer.source_rate as f64;
-            let beat_offset = grid.first_beat_sec as f64 * sr;
-            let beat_interval = grid.beat_interval_sec as f64 * sr;
-            let loaded = DeckLoadedEvent {
-                deck,
-                path: metadata.provider_id.clone(),
-                title: metadata.title.clone(),
-                artist: metadata.artist.clone(),
-                duration_ms: buffer.duration_ms(),
-                source_rate: buffer.source_rate,
-                frames: buffer.frames(),
-                bpm: grid.bpm,
-                bpm_confidence: grid.confidence,
-                first_beat_sec: grid.first_beat_sec,
-                beat_interval_sec: grid.beat_interval_sec,
-                key_camelot: key.camelot,
-                key_name: key.name,
-                peaks,
-                band_peaks,
-                replay_gain,
-                silence,
-            };
-
-            let result = app
+            let loaded = ready_event(deck, &body);
+            let installed = app
                 .state::<deck_loads::DeckLoads>()
                 .commit(deck, ticket, || {
-                    // Submit load, loudness and pitch reset as one channel envelope.
-                    // This is all-or-none admission, not atomic callback application.
-                    let mut group = Some(vec![
-                        EngineMsg::Load {
-                            deck,
-                            buffer: Arc::new(buffer),
-                            beat_offset,
-                            beat_interval,
-                        },
-                        EngineMsg::SetDeckReplayGain {
-                            deck,
-                            gain: replay_gain,
-                        },
-                    ]);
-                    let snapshot = app.state::<native_effects::NativeEffects>().update(
-                        deck,
-                        native_effects::EffectUpdate::Pitch { semitones: 0.0 },
-                        |message| {
-                            let mut commands =
-                                group.take().ok_or("Load pitch reset sent more than once")?;
-                            commands.push(message);
-                            tx.send_group(commands)
-                        },
-                    )?;
-                    app.state::<native_controls::PerformanceState>()
-                        .install_track(
-                            deck,
-                            beat_offset,
-                            beat_interval,
-                            sr,
-                            f64::from(grid.bpm),
-                            loaded.frames,
-                        );
-                    let _ = app.emit("effects:update", snapshot);
-                    // Commands are enqueued before publication; this is not an audio-callback ack.
-                    let _ = app.emit("deck:loaded", loaded);
-                    Ok(())
+                    install_decoded(&app, &tx, deck, Arc::clone(&buffer), &loaded)
                 });
-            if let Err(message) = result {
+            match installed {
+                Ok(Some(())) => {}
+                Ok(None) => return,
+                Err(message) => {
+                    emit_load_error(&app, deck, ticket, message);
+                    return;
+                }
+            }
+            let analysis_app = app.clone();
+            let analysis_tx = tx.clone();
+            let analysis_path = body.path.clone();
+            let submitted = app
+                .state::<deck_loads::DeckLoads>()
+                .commit(deck, ticket, || {
+                    analysis.submit(
+                        deck,
+                        Box::new(move || {
+                            run_deferred_analysis(
+                                analysis_app,
+                                analysis_tx,
+                                deck,
+                                ticket,
+                                analysis_path,
+                                buffer,
+                            )
+                        }),
+                    )
+                });
+            if submitted.is_err() {
                 let _ = app
                     .state::<deck_loads::DeckLoads>()
                     .commit(deck, ticket, || {
-                        let _ = app.emit("deck:error", DeckErrorEvent { deck, message });
+                        let _ = app.emit(
+                            "deck:analysis-failed",
+                            DeckAnalysisFailedEvent {
+                                deck,
+                                generation: ticket,
+                                path: body.path.clone(),
+                            },
+                        );
                         Ok(())
                     });
             }
         }));
         if outcome.is_err() {
-            let _ = app
-                .state::<deck_loads::DeckLoads>()
-                .commit(deck, ticket, || {
-                    let _ = app.emit(
-                        "deck:error",
-                        DeckErrorEvent {
-                            deck,
-                            message: "Track decoding failed unexpectedly; try another track".into(),
-                        },
-                    );
-                    Ok(())
-                });
+            emit_load_error(
+                &app,
+                deck,
+                ticket,
+                "Track decoding failed unexpectedly; try another track".into(),
+            );
         }
     });
     let submitted = app
@@ -1408,6 +1374,7 @@ fn load_track(
                     "deck:error",
                     DeckErrorEvent {
                         deck,
+                        generation: ticket,
                         message: message.clone(),
                     },
                 );
@@ -1418,22 +1385,198 @@ fn load_track(
     Ok(())
 }
 
-/// Downmix to mono (capped to [`ANALYSIS_MAX_SECS`]) and estimate beatgrid + key.
-fn analyze_track(
-    buffer: &DeckBuffer,
-) -> (
-    compas_dsp::analysis::BeatGrid,
-    compas_dsp::analysis::KeyEstimate,
-) {
-    let max_frames = ANALYSIS_MAX_SECS * buffer.source_rate as usize;
-    let frames = buffer.frames().min(max_frames);
-    let mut mono = Vec::with_capacity(frames);
-    for f in 0..frames {
-        mono.push(0.5 * (buffer.samples[f * 2] + buffer.samples[f * 2 + 1]));
+fn emit_load_error(app: &AppHandle, deck: usize, generation: u64, message: String) {
+    let _ = app
+        .state::<deck_loads::DeckLoads>()
+        .commit(deck, generation, || {
+            let _ = app.emit(
+                "deck:error",
+                DeckErrorEvent {
+                    deck,
+                    generation,
+                    message,
+                },
+            );
+            Ok(())
+        });
+}
+
+fn ready_event(deck: usize, body: &deck_prepare::ReadyBody) -> DeckLoadedEvent {
+    DeckLoadedEvent {
+        deck,
+        path: body.path.clone(),
+        title: body.title.clone(),
+        artist: body.artist.clone(),
+        duration_ms: body.duration_ms,
+        source_rate: body.source_rate,
+        frames: body.frames,
+        bpm: body.bpm,
+        bpm_confidence: body.bpm_confidence,
+        first_beat_sec: body.first_beat_sec,
+        beat_interval_sec: body.beat_interval_sec,
+        key_camelot: body.key_camelot.clone(),
+        key_name: body.key_name.clone(),
+        peaks: body.peaks.clone(),
+        band_peaks: body.band_peaks.clone(),
+        replay_gain: body.replay_gain,
+        silence: body.silence.clone(),
+        generation: body.generation,
+        analysis_pending: body.analysis_pending,
     }
-    let grid = compas_dsp::analysis::estimate_beatgrid(&mono, buffer.source_rate);
-    let key = compas_dsp::analysis::estimate_key(&mono, buffer.source_rate);
-    (grid, key)
+}
+
+fn install_decoded(
+    app: &AppHandle,
+    tx: &engine_commands::Sender<EngineMsg>,
+    deck: usize,
+    buffer: Arc<DeckBuffer>,
+    loaded: &DeckLoadedEvent,
+) -> Result<(), String> {
+    // Load and the pitch reset share one channel envelope. Loudness stays at unity:
+    // the measurement is deferred and is not applied after this command.
+    let mut group = Some(vec![
+        EngineMsg::Load {
+            deck,
+            buffer,
+            beat_offset: 0.0,
+            beat_interval: 0.0,
+        },
+        EngineMsg::SetDeckSyncLive {
+            deck,
+            active: false,
+        },
+        EngineMsg::SetDeckSyncInternal {
+            deck,
+            active: false,
+        },
+    ]);
+    let snapshot = app.state::<native_effects::NativeEffects>().update(
+        deck,
+        native_effects::EffectUpdate::Pitch { semitones: 0.0 },
+        |message| {
+            let mut commands = group.take().ok_or("Load pitch reset sent more than once")?;
+            commands.push(message);
+            tx.send_group(commands)
+        },
+    )?;
+    app.state::<native_controls::PerformanceState>()
+        .install_track(
+            deck,
+            0.0,
+            0.0,
+            loaded.source_rate as f64,
+            0.0,
+            loaded.frames,
+        );
+    let _ = app.emit("effects:update", snapshot);
+    let _ = app.emit("deck:loaded", loaded.clone());
+    Ok(())
+}
+
+fn run_deferred_analysis(
+    app: AppHandle,
+    tx: engine_commands::Sender<EngineMsg>,
+    deck: usize,
+    ticket: u64,
+    path: String,
+    buffer: Arc<DeckBuffer>,
+) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let live = || {
+            app.state::<deck_loads::DeckLoads>()
+                .current(deck, ticket)
+                .unwrap_or(false)
+        };
+        let step = deck_prepare::analysis_step(ticket, &path, live, &buffer, |buffer| {
+            Ok(deck_prepare::measure_analysis(buffer))
+        });
+        match step {
+            deck_prepare::AnalysisStep::Superseded => {}
+            deck_prepare::AnalysisStep::Failed(error) => {
+                tracing::debug!("deck {deck} analysis failed: {error}");
+                let _ = app
+                    .state::<deck_loads::DeckLoads>()
+                    .commit(deck, ticket, || {
+                        let _ = app.emit(
+                            "deck:analysis-failed",
+                            DeckAnalysisFailedEvent {
+                                deck,
+                                generation: ticket,
+                                path: path.clone(),
+                            },
+                        );
+                        Ok(())
+                    });
+            }
+            deck_prepare::AnalysisStep::Ready(body) => {
+                let rate = buffer.source_rate;
+                let _ = app
+                    .state::<deck_loads::DeckLoads>()
+                    .commit(deck, ticket, || {
+                        publish_analysis(&app, &tx, deck, rate, &body)
+                    });
+            }
+        }
+    }));
+    if outcome.is_err() {
+        let _ = app
+            .state::<deck_loads::DeckLoads>()
+            .commit(deck, ticket, || {
+                let _ = app.emit(
+                    "deck:analysis-failed",
+                    DeckAnalysisFailedEvent {
+                        deck,
+                        generation: ticket,
+                        path,
+                    },
+                );
+                Ok(())
+            });
+    }
+}
+
+fn publish_analysis(
+    app: &AppHandle,
+    tx: &engine_commands::Sender<EngineMsg>,
+    deck: usize,
+    source_rate: u32,
+    body: &deck_prepare::AnalysisBody,
+) -> Result<(), String> {
+    let performance = app.state::<native_controls::PerformanceState>();
+    if !performance.has_track(deck) {
+        return Ok(());
+    }
+    if body.beat_interval_sec > 0.0 && body.bpm > 0.0 && source_rate > 0 {
+        let rate = f64::from(source_rate);
+        let offset = f64::from(body.first_beat_sec) * rate;
+        let interval = f64::from(body.beat_interval_sec) * rate;
+        if performance.publish_analysis(deck, offset, interval, f64::from(body.bpm)) {
+            tx.send(EngineMsg::Beatgrid {
+                deck,
+                offset,
+                interval,
+            })?;
+        }
+    }
+    debug_assert!(!body.apply_replay_gain);
+    let _ = app.emit(
+        "deck:analyzed",
+        DeckAnalysisEvent {
+            deck,
+            generation: body.generation,
+            path: body.path.clone(),
+            bpm: body.bpm,
+            bpm_confidence: body.bpm_confidence,
+            first_beat_sec: body.first_beat_sec,
+            beat_interval_sec: body.beat_interval_sec,
+            key_camelot: body.key_camelot.clone(),
+            key_name: body.key_name.clone(),
+            band_peaks: body.band_peaks.clone(),
+            replay_gain: body.measured_replay_gain,
+            replay_gain_applied: false,
+        },
+    );
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2413,7 +2556,7 @@ fn deck_unload(
     deck: usize,
 ) -> Result<(), String> {
     let loads = app.state::<deck_loads::DeckLoads>();
-    let ticket = loads.begin(deck, || {})?;
+    let ticket = loads.begin(deck, |_| {})?;
     loads.commit(deck, ticket, || {
         jog.reset();
         state.send(EngineMsg::Unload { deck })?;

@@ -333,6 +333,14 @@ pub(crate) fn set_master_output(
     if !wait_until_applied(&audio, generation) {
         return Err("Speaker output did not finish switching".into());
     }
+    if let Some(loads) = app.try_state::<crate::deck_loads::DeckLoads>() {
+        let _ = loads.invalidate_all();
+    }
+    if let Some(performance) = app.try_state::<crate::native_controls::PerformanceState>() {
+        for deck in 0..compas_audio::NUM_DECKS {
+            performance.clear_deck(deck);
+        }
+    }
     let _ = app.emit("audio:output-reset", ());
     if let Err(error) = headphone::rearm_after_master_change(&app, headphones_were_enabled) {
         tracing::warn!("speakers changed; headphones were not rearmed: {error}");

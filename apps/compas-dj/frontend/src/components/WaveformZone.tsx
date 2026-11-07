@@ -5,6 +5,7 @@ import { type CSSProperties, memo, useCallback, useEffect, useLayoutEffect, useM
 import { useElementSize } from "../hooks/useElementSize";
 import type { DeckState } from "../hooks/useDeck";
 import { wavePaths, structureGain, RGB_WAVE_KEY, waveColumn, waveformScale, type WavePoint } from "../lib/waveformDisplay";
+import { laneTempo } from "../lib/deckReady";
 import { inTauri, onControllerUpdate } from "../lib/ipc";
 
 const NOW_FRAC = 0.38; // NOW playhead sits 38% from the left; track scrolls under it
@@ -285,7 +286,6 @@ const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; vi
   const VH = Math.max(1, size.height - 29);
   const meta = state.meta;
   const streaming = !state.dsp;
-  const effBpm = meta ? meta.bpm * state.tempo : 0;
   const stretch = playbackStretch(state.tempo);
 
   const sr = meta?.source_rate ?? 1;
@@ -459,7 +459,7 @@ const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; vi
       <div className="wf-label">
         <span className="wf-chip" style={{ color, background: `color-mix(in srgb, ${color} 12%, transparent)`, borderColor: color }}>{letter}</span>
         <span className="mono wf-bpm">
-          {meta && effBpm > 0 ? `${effBpm.toFixed(2)} · ${meta.key_camelot}` : "— · —"}
+          {laneTempo(meta, state.tempo)}
         </span>
         <span className="wf-title">{meta ? `${meta.title} — ${meta.artist}` : "No track loaded"}</span>
         {streaming && <span className="wf-badge">STREAM · CONTROL-ONLY</span>}

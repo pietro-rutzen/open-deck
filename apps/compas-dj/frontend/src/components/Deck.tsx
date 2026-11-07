@@ -17,6 +17,7 @@ import {
   transposeKey,
   type KeyNotation,
 } from '../lib/ipc';
+import { bpmLabel, gridAvailable } from '../lib/deckReady';
 import { audibleFramesRemaining } from '../lib/silence';
 import {
   waveColumn,
@@ -212,7 +213,7 @@ export function Deck({
   useEffect(() => setArtworkFailed(false), [meta?.path, artwork]);
   const rate = meta?.source_rate ?? 1;
   const frames = meta?.frames ?? 0;
-  const noGrid = !meta || (meta.beat_interval_sec ?? 0) <= 0;
+  const noGrid = !gridAvailable(meta);
 
   // Loop-roll is momentary: held while the pad is pressed, released on pointer up/leave.
   // Full control layout is the default; workspace scrolling handles smaller windows.
@@ -230,8 +231,6 @@ export function Deck({
     setRollBeats(null);
     actions.loopRoll(0, false);
   };
-  const effBpm = meta ? meta.bpm * tempo : 0;
-
   // Ending lights follow audible time. Silent spans are jumped, so a quiet tail
   // does not count toward the last minute.
   const audibleLeft = audibleFramesRemaining(frame, frames, meta?.silence);
@@ -534,7 +533,7 @@ export function Deck({
           </div>
           <div className="deck-sub">
             {loading
-              ? 'decoding & analyzing…'
+              ? 'Decoding…'
               : meta
                 ? meta.artist
                 : 'No track'}
@@ -584,13 +583,22 @@ export function Deck({
       <div className="readouts">
         <div className="tile">
           <span className="overline">BPM</span>
-          <span className="mono tile-val">
-            {meta && effBpm > 0 ? effBpm.toFixed(2) : '—'}
+          <span
+            className="mono tile-val"
+            title={meta?.analysis_pending ? 'Beatgrid is still being measured' : meta?.analysis_failed ? 'Beatgrid unavailable' : undefined}
+          >
+            {bpmLabel(meta, tempo)}
           </span>
         </div>
         <div className="tile">
           <span className="overline">KEY</span>
           {(() => {
+            if (meta?.analysis_pending)
+              return (
+                <span className="mono tile-val" style={{ color }} title="Key is still being measured">
+                  …
+                </span>
+              );
             if (!meta?.key_camelot)
               return (
                 <span className="mono tile-val" style={{ color }}>
@@ -696,7 +704,7 @@ export function Deck({
             </svg>
             <div className="platter-center">
               <span className="mono platter-bpm">
-                {meta && effBpm > 0 ? effBpm.toFixed(2) : '—'}
+                {bpmLabel(meta, tempo)}
               </span>
               <span
                 className="overline"
@@ -735,7 +743,7 @@ export function Deck({
               style={endLightStyle}
               onClick={actions.togglePlay}
               disabled={!meta}
-              title={playing ? 'Pause' : meta ? 'Play (ready)' : 'Play'}
+              title={playing ? 'Pause' : meta?.analysis_pending ? 'Play. Beatgrid still measuring' : meta ? 'Play (ready)' : 'Play'}
             >
               <Icon name={playing ? 'pause' : 'play'} size={18} />
               <span className="transport-label">{playing ? 'PAUSE' : 'PLAY'}</span>
@@ -1168,7 +1176,7 @@ export function Deck({
                 <button
                   className={`chip mic-sync ${state.syncLive ? 'chip--on' : ''}`}
                   onClick={actions.toggleSyncLive}
-                  disabled={!meta}
+                  disabled={!gridAvailable(meta)}
                   title="Beat-match this deck to the live mic/aux input (tempo). Turn AUX on first."
                 >
                   MIC
@@ -1176,7 +1184,7 @@ export function Deck({
                 <button
                   className={`chip int-sync ${state.syncInternal ? 'chip--on' : ''}`}
                   onClick={actions.toggleSyncInternal}
-                  disabled={!meta}
+                  disabled={!gridAvailable(meta)}
                   title="Beat-match this deck to the internal master clock. Turn INT CLK on first."
                 >
                   INT
