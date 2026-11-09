@@ -1253,9 +1253,10 @@ fn export_diagnostics(
     };
 
     let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
-    let file = File::create(&dest_path).map_err(|e| e.to_string())?;
-    export::write_single_entry_zip(file, "diagnostics.json", json.as_bytes())
-        .map_err(|e| e.to_string())
+    export::write_file_atomically(std::path::Path::new(&dest_path), |file| {
+        export::write_single_entry_zip(file, "diagnostics.json", json.as_bytes())
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Decode a file, install it as soon as the buffer is ready, and analyze later.
@@ -2464,7 +2465,8 @@ fn db_crate_tracks(db: State<'_, db::Db>, crate_id: i64) -> Result<Vec<db::Track
 fn export_crate(db: State<'_, db::Db>, crate_id: i64, dest_path: String) -> Result<(), String> {
     let manifest = with_db(&db, |c| export::gather_crate(c, crate_id))?;
     let json = export::to_json(&manifest).map_err(|e| e.to_string())?;
-    std::fs::write(&dest_path, json).map_err(|e| e.to_string())
+    export::replace_file_bytes(std::path::Path::new(&dest_path), json.as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 /// Export a crate to a portable `.zip` package: `manifest.json` plus the crate's audio files, so a
@@ -2478,9 +2480,10 @@ fn export_crate_package(
 ) -> Result<(), String> {
     let mut manifest = with_db(&db, |c| export::gather_crate(c, crate_id))?;
     export::assign_bundle_files(&mut manifest);
-    let file = File::create(&dest_path).map_err(|e| e.to_string())?;
-    export::write_package(file, &manifest, |path| Ok(Box::new(File::open(path)?)))
-        .map_err(|e| e.to_string())
+    export::write_file_atomically(std::path::Path::new(&dest_path), |file| {
+        export::write_package(file, &manifest, |path| Ok(Box::new(File::open(path)?)))
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Import a crate written by [`export_crate`] (a `.json` manifest) or [`export_crate_package`] (a
@@ -2509,7 +2512,7 @@ fn import_crate(
                 continue;
             };
             let dest = dir.join(file);
-            std::fs::write(&dest, bytes).map_err(|e| e.to_string())?;
+            export::replace_file_bytes(&dest, bytes).map_err(|e| e.to_string())?;
             t.path = dest.to_string_lossy().to_string();
         }
         with_db(&db, |c| export::apply_manifest(c, &manifest, true))
@@ -3902,7 +3905,8 @@ fn export_profile_pack(
     let count = selected.len();
     let pack = controllers::pack_profiles(selected);
     let json = serde_json::to_string_pretty(&pack).map_err(|e| e.to_string())?;
-    std::fs::write(&dest_path, json).map_err(|e| e.to_string())?;
+    export::replace_file_bytes(std::path::Path::new(&dest_path), json.as_bytes())
+        .map_err(|e| e.to_string())?;
     Ok(count)
 }
 

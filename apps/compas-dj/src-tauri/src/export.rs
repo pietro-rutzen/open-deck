@@ -325,6 +325,46 @@ pub fn assign_bundle_files(manifest: &mut CrateManifest) {
     }
 }
 
+/// Write `path` by renaming a completed temporary file over it. A failed write leaves the
+/// previous file in place.
+pub fn write_file_atomically(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("export");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let temporary = parent.join(format!(".{file_name}-{}-{nonce}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = write(&mut file).and_then(|_| file.sync_all());
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn replace_file_bytes(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    write_file_atomically(path, |file| file.write_all(bytes))
+}
+
 /// Write a `.zip` package: `manifest.json` (with bundle filenames already assigned) plus an
 /// `audio/<file>` entry for every track that has a `file`. `open_audio(path)` yields a reader for a
 /// track's source audio, streamed into the archive (so files aren't all held in memory at once).
@@ -609,5 +649,45 @@ mod tests {
             tracks: Vec::new(),
         };
         assert!(apply_manifest(&dst, &manifest, false).is_err());
+    }
+
+    #[test]
+    fn an_interrupted_export_keeps_the_previous_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "opendeck-export-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crate.json");
+        replace_file_bytes(&path, b"{\"old\":true}").unwrap();
+        let failed = write_file_atomically(&path, |_| Err(std::io::Error::other("disk full")));
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"old\":true}");
+        replace_file_bytes(&path, b"{\"new\":true}").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"new\":true}");
+        let leftover = std::fs::read_dir(&dir).unwrap().flatten().any(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("tmp")
+        });
+        assert!(!leftover);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+            permissions.set_mode(0o555);
+            std::fs::set_permissions(&dir, permissions.clone()).unwrap();
+            assert!(replace_file_bytes(&path, b"{\"lost\":true}").is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"{\"new\":true}");
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&dir, permissions).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
