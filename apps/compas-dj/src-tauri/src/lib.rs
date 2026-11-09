@@ -2390,8 +2390,17 @@ fn db_upsert_analysis(
 }
 
 #[tauri::command]
-fn db_set_cue(db: State<'_, db::Db>, path: String, slot: i64, frame: f64) -> Result<(), String> {
-    with_db(&db, |c| db::set_cue(c, &path, slot, frame))
+fn db_set_cue(
+    db: State<'_, db::Db>,
+    path: String,
+    slot: i64,
+    frame: f64,
+    out_frame: Option<f64>,
+) -> Result<(), String> {
+    with_db(&db, |c| match out_frame {
+        Some(out) => db::set_cue_range(c, &path, slot, frame, Some(out)),
+        None => db::set_cue(c, &path, slot, frame),
+    })
 }
 
 #[tauri::command]
@@ -2681,8 +2690,9 @@ fn performance_set_hot_cue(
     deck: usize,
     slot: usize,
     frame: Option<f64>,
+    out_frame: Option<f64>,
 ) {
-    performance.set_hot_cue(deck, slot, frame);
+    performance.set_hot_cue_range(deck, slot, frame, out_frame);
 }
 
 #[tauri::command]
@@ -2690,8 +2700,9 @@ fn performance_set_hot_cues(
     performance: State<'_, native_controls::PerformanceState>,
     deck: usize,
     frames: Vec<Option<f64>>,
+    out_frames: Option<Vec<Option<f64>>>,
 ) {
-    performance.set_hot_cues(deck, &frames);
+    performance.set_hot_cue_ranges(deck, &frames, out_frames.as_deref().unwrap_or(&[]));
 }
 
 #[tauri::command]
@@ -2714,12 +2725,12 @@ fn performance_set_memory_loops(
     deck: usize,
     loops: Vec<db::MemoryLoopRow>,
 ) -> Result<(), String> {
-    let stored: Vec<(u8, f64, f64, bool)> = loops
+    let stored: Vec<(u8, f64, f64, bool, bool)> = loops
         .iter()
         .filter_map(|row| {
             u8::try_from(row.slot)
                 .ok()
-                .map(|slot| (slot, row.in_frame, row.out_frame, row.active))
+                .map(|slot| (slot, row.in_frame, row.out_frame, row.active, row.point))
         })
         .collect();
     performance.set_memory_loops(deck, &stored);
@@ -2754,12 +2765,15 @@ fn deck_memory(
     let heard = (frame
         - state.telemetry.deck_rate(deck) * f64::from(state.telemetry.output_latency_secs()))
     .max(0.0);
+    let standby =
+        (state.telemetry.is_at_cue(deck) && !state.telemetry.is_playing(deck)).then_some(frame);
     let action = native_controls::memory_button(
         deck,
         &action,
         frame,
         heard,
         state.telemetry.is_loaded(deck),
+        standby,
         &performance,
     );
     for message in action.message.into_iter().chain(action.messages) {

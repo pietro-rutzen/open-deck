@@ -165,6 +165,8 @@
 .ov-motion { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2; }
 .ov-loop { position: absolute; top: 0; bottom: 0; border-left: 1px solid; border-right: 1px solid; pointer-events: none; }
 .ov-memory { position: absolute; top: 0; bottom: 0; border-left: 1px solid; border-right: 1px solid; pointer-events: none; }
+.ov-hot-loop { position: absolute; top: 0; bottom: 0; border-left: 1px solid; border-right: 1px solid; pointer-events: none; }
+.ov-memory-cue { position: absolute; top: 0; bottom: 0; width: 1.5px; margin-left: -0.75px; background: #e6b325; pointer-events: none; }
 .ov-marks { position: absolute; top: 4px; right: 4px; display: flex; gap: 4px; z-index: 2; }
 .sq-check { width: 13px; height: 13px; margin: 0; padding: 0; border: 1px solid var(--text-tertiary); border-radius: 0; background: transparent; flex: none; }
 .sq-check--on { background: #e6b325; border-color: #e6b325; }
@@ -233,6 +235,7 @@
 .pad { height: 28px; border-radius: var(--r-pad); background: var(--surface-control); border: 1px solid var(--border-hairline); color: var(--text-secondary); font-family: var(--font-mono); font-size: 12px; transition: background 90ms, border-color 90ms; }
 .pad:hover:not(:disabled) { border-color: var(--border-hairline-strong); background: var(--surface-1-top); }
 .pad--set { font-weight: 700; }
+.pad--loop { outline: 1px dashed currentColor; outline-offset: -4px; }
 .pad:disabled { opacity: 0.45; color: var(--text-disabled); }
 .chip-row { display: flex; gap: 6px; }
 .chip { flex: 1; background: var(--surface-control); border: 1px solid var(--border-hairline); color: var(--text-secondary); border-radius: var(--r-pad); padding: 6px 0; font-size: 10px; font-weight: 600; letter-spacing: 0.06em; transition: background 90ms, border-color 90ms, color 90ms; }

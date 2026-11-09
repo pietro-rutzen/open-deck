@@ -6,7 +6,7 @@ const source = readFileSync(new URL("../src/lib/memoryLoops.ts", import.meta.url
 const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { memoryLoopSpans, memoryLoopFractions, memoryLoopColor, memoryMatchesLoop } = await import(
+const { memoryLoopSpans, memoryLoopFractions, memoryLoopColor, memoryMatchesLoop, memoryCueFractions, memoryCueMarks, isMemoryCue } = await import(
   `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`
 );
 
@@ -30,10 +30,19 @@ assert.deepEqual(memoryLoopFractions([saved, active], 192_000), [
   { slot: 1, left: 0, width: 0.25, active: true },
 ]);
 assert.deepEqual(memoryLoopFractions([saved], 0), []);
+const cue = { slot: 2, in_frame: 48_000, out_frame: 48_000, active: false, point: true };
+assert.equal(isMemoryCue(cue), true);
+assert.equal(isMemoryCue(saved), false);
+assert.deepEqual(memoryLoopSpans([cue], 48_000, 1, 0, 4, 400), []);
+assert.deepEqual(memoryCueFractions([cue, saved], 192_000), [{ slot: 2, left: 0.25 }]);
+assert.deepEqual(memoryCueMarks([cue], 48_000, 1, 0, 4, 400), [{ slot: 2, x: 100 }]);
+assert.deepEqual(memoryCueMarks([cue], 48_000, 1, 2, 4, 400), []);
 
 const deck = readFileSync(new URL("../src/components/Deck.tsx", import.meta.url), "utf8");
 const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
 assert.match(deck, /title="Memory loop"/);
+assert.match(deck, /title="Memory cue"/);
+assert.match(deck, /Loop hot cue/);
 assert.match(deck, /title="Active loop"/);
 assert.match(css, /\.sq-check \{[^}]*border-radius:\s*0;/);
 

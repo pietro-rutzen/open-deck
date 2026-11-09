@@ -203,6 +203,7 @@ export interface DeckState {
   /** Channel fader: 0 = silent, 1 = unity. */
   volume: number;
   hotCues: (number | null)[];
+  hotCueOuts: (number | null)[];
   loop: LoopState;
   memoryLoops: MemoryLoopPoint[];
   echo: EchoState;
@@ -262,6 +263,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
   const gainEditRef = useRef(0);
   const gainLoadRef = useRef(0);
   const [hotCues, setHotCues] = useState<(number | null)[]>(Array(8).fill(null));
+  const [hotCueOuts, setHotCueOuts] = useState<(number | null)[]>(Array(8).fill(null));
   const [loop, setLoopState] = useState<LoopState>({ active: false, beats: null, inFrame: 0, outFrame: 0 });
   const [memoryLoops, setMemoryLoops] = useState<MemoryLoopPoint[]>([]);
   const [echo, setEchoState] = useState<EchoState>({ active: false, beats: 0.5, depth: 0.5 });
@@ -283,6 +285,10 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
   loopRef.current = loop;
   const memoryLoopsRef = useRef(memoryLoops);
   memoryLoopsRef.current = memoryLoops;
+  const hotCuesRef = useRef(hotCues);
+  const hotCueOutsRef = useRef(hotCueOuts);
+  hotCuesRef.current = hotCues;
+  hotCueOutsRef.current = hotCueOuts;
   const echoRef = useRef(echo);
   echoRef.current = echo;
   const reverbRef = useRef(reverb);
@@ -408,6 +414,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         setDeckSyncLive(deck, false).catch(() => {});
         setDeckSyncInternal(deck, false).catch(() => {});
         setHotCues(Array(8).fill(null));
+        setHotCueOuts(Array(8).fill(null));
         setLoopState({ active: false, beats: null, inFrame: 0, outFrame: 0 });
         setMemoryLoops([]);
         // Engine resets FX on load; mirror that (keep the user's param settings).
@@ -450,10 +457,17 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
                 setDeckGain(deck, volumeRef.current).catch(() => {});
               }
               if (st.cues.length) {
-                const arr: (number | null)[] = Array(8).fill(null);
-                for (const c of st.cues) if (c.slot >= 0 && c.slot < 8) arr[c.slot] = c.frame;
-                setHotCues(arr);
-                performanceSetHotCues(deck, arr).catch(() => {});
+                const frames: (number | null)[] = Array(8).fill(null);
+                const outs: (number | null)[] = Array(8).fill(null);
+                for (const cue of st.cues) {
+                  if (cue.slot < 0 || cue.slot >= 8 || !Number.isFinite(cue.frame)) continue;
+                  frames[cue.slot] = cue.frame;
+                  const out = cue.out_frame;
+                  outs[cue.slot] = out != null && Number.isFinite(out) && out > cue.frame ? out : null;
+                }
+                setHotCues(frames);
+                setHotCueOuts(outs);
+                performanceSetHotCues(deck, frames, outs).catch(() => {});
               }
               // Restore the saved loop region, but leave it disarmed (don't jump the play-head).
               const lp = st.loops.find((l) => l.slot === 0);
@@ -832,23 +846,19 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         if (cue) {
           const slot = Number(cue[2]);
           if (cue[1] === "clear_hotcue") {
-            setHotCues((current) => {
-              const next = [...current];
-              next[slot] = null;
-              return next;
-            });
+            setHotCues((current) => current.map((frame, index) => (index === slot ? null : frame)));
+            setHotCueOuts((current) => current.map((out, index) => (index === slot ? null : out)));
             if (canPersist) dbClearCue(path as string, slot).catch(swallow);
             return;
           }
           const frame = mirror?.hot_cue_frame;
-          if (frame == null || !Number.isFinite(frame)) return;
-          setHotCues((current) => {
-            const next = [...current];
-            next[slot] = frame;
-            return next;
-          });
-          if (canPersist) dbSetCue(path as string, slot, frame).catch(swallow);
-          return;
+          if (frame != null && Number.isFinite(frame)) {
+            const out = mirror?.hot_cue_out;
+            const loopOut = out != null && Number.isFinite(out) && out > frame ? out : null;
+            setHotCues((current) => current.map((stored, index) => (index === slot ? frame : stored)));
+            setHotCueOuts((current) => current.map((stored, index) => (index === slot ? loopOut : stored)));
+            if (canPersist) dbSetCue(path as string, slot, frame, loopOut).catch(swallow);
+          }
         }
         if (mirror?.quantize != null) setQuantize(mirror.quantize);
         if (mirror?.jump_scale != null && Number.isFinite(mirror.jump_scale)) {
@@ -883,28 +893,45 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         }
       },
       setHotCue: (i: number, atFrame = frameRef.current) => {
-        setHotCues((cur) => {
-          const next = [...cur];
-          // Set if empty, else jump to it.
-          if (next[i] == null) {
-            next[i] = atFrame;
-            if (canPersist) dbSetCue(path as string, i, atFrame).catch(swallow);
-            performanceSetHotCue(deck, i, atFrame).catch(swallow);
-          } else {
-            const target = quantizeRef.current ? snapBeat(next[i] as number) : (next[i] as number);
-            deckSeek(deck, target).catch(swallow);
-          }
-          return next;
-        });
+        const frames = hotCuesRef.current;
+        const outs = hotCueOutsRef.current;
+        const stored = frames[i];
+        if (stored == null) {
+          const loop = loopRef.current;
+          const loopOut = loop.active && loop.outFrame > loop.inFrame ? loop.outFrame : null;
+          const frame = loopOut == null ? atFrame : loop.inFrame;
+          const nextFrames = frames.map((value, index) => (index === i ? frame : value));
+          const nextOuts = outs.map((value, index) => (index === i ? loopOut : value));
+          hotCuesRef.current = nextFrames;
+          hotCueOutsRef.current = nextOuts;
+          setHotCues(nextFrames);
+          setHotCueOuts(nextOuts);
+          if (canPersist) dbSetCue(path as string, i, frame, loopOut).catch(swallow);
+          performanceSetHotCue(deck, i, frame, loopOut).catch(swallow);
+          return;
+        }
+        const out = outs[i];
+        if (out != null && out > stored) {
+          recallLoop(deck, stored, out).catch(swallow);
+          deckPlay(deck).catch(swallow);
+          const next = { active: true, beats: null, inFrame: stored, outFrame: out, armed: false };
+          loopRef.current = next;
+          setLoopState(next);
+          publishLoop(next);
+          return;
+        }
+        const target = quantizeRef.current ? snapBeat(stored) : stored;
+        deckSeek(deck, target).catch(swallow);
       },
       clearHotCue: (i: number) => {
-        setHotCues((cur) => {
-          const next = [...cur];
-          next[i] = null;
-          return next;
-        });
+        const nextFrames = hotCuesRef.current.map((frame, index) => (index === i ? null : frame));
+        const nextOuts = hotCueOutsRef.current.map((out, index) => (index === i ? null : out));
+        hotCuesRef.current = nextFrames;
+        hotCueOutsRef.current = nextOuts;
+        setHotCues(nextFrames);
+        setHotCueOuts(nextOuts);
         if (canPersist) dbClearCue(path as string, i).catch(swallow);
-        performanceSetHotCue(deck, i, null).catch(swallow);
+        performanceSetHotCue(deck, i, null, null).catch(swallow);
       },
       beatLoop: (beats: number, atFrame = frameRef.current) => {
         if (!meta || (meta.beat_interval_sec ?? 0) <= 0) return;
@@ -1183,7 +1210,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
     };
   }, [deck, playing, tempo, meta, isLeader, syncLive, syncInternal, applyEcho, applyFlanger]);
 
-  const state: DeckState = useMemo(() => ({ meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, keyPad, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, memoryLoops, echo, reverb, flanger, crusher, error, loading, dsp }), [meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, keyPad, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, memoryLoops, echo, reverb, flanger, crusher, error, loading, dsp]);
+  const state: DeckState = useMemo(() => ({ meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, keyPad, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, hotCueOuts, loop, memoryLoops, echo, reverb, flanger, crusher, error, loading, dsp }), [meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, keyPad, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, hotCueOuts, loop, memoryLoops, echo, reverb, flanger, crusher, error, loading, dsp]);
   return useMemo(() => ({ state, actions, deck }), [state, actions, deck]);
 }
 

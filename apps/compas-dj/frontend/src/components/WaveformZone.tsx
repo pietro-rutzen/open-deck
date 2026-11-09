@@ -1,7 +1,7 @@
 import "./phaseMeter.css";
 import { phaseInBar } from "../lib/phaseMeter";
-import { hotCueMarkers } from "../lib/hotCueMarkers";
-import { memoryLoopColor, memoryLoopSpans } from "../lib/memoryLoops";
+import { hotCueLoopSpans, hotCueMarkers } from "../lib/hotCueMarkers";
+import { memoryCueMarks, memoryLoopColor, memoryLoopSpans } from "../lib/memoryLoops";
 import { type CSSProperties, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { useElementSize } from "../hooks/useElementSize";
 import type { DeckState } from "../hooks/useDeck";
@@ -417,7 +417,7 @@ const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; vi
         <div ref={scrollRef} className="wf-scroll">
           <svg className="wf-svg" viewBox={`0 0 ${Math.max(1, VW * WAVE_SPAN)} ${VH}`} preserveAspectRatio="none">
             <WaveGraphic peaks={peaks} bands={bands} origin={origin} binSec={binSec} view={view} width={VW} height={VH} beatInterval={beatInterval} beatOffset={beatOffset} stretch={stretch} />
-            {memoryLoopSpans(state.memoryLoops, sr, stretch, origin, view, VW * WAVE_SPAN).map((span) => (
+            {memoryLoopSpans(state.memoryLoops, sr, stretch, origin, view * WAVE_SPAN, VW * WAVE_SPAN).map((span) => (
               <rect
                 key={`memory-${span.slot}`}
                 x={span.x}
@@ -431,6 +431,36 @@ const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; vi
                 vectorEffect="non-scaling-stroke"
               >
                 <title>{span.active ? "Active loop" : "Memory loop"}</title>
+              </rect>
+            ))}
+            {memoryCueMarks(state.memoryLoops, sr, stretch, origin, view * WAVE_SPAN, VW * WAVE_SPAN).map((mark) => (
+              <line
+                key={`memory-cue-${mark.slot}`}
+                x1={mark.x}
+                x2={mark.x}
+                y1={0}
+                y2={VH}
+                stroke="#e6b325"
+                strokeWidth={2}
+                vectorEffect="non-scaling-stroke"
+              >
+                <title>Memory cue</title>
+              </line>
+            ))}
+            {hotCueLoopSpans(state.hotCues, state.hotCueOuts, sr, stretch, origin, view * WAVE_SPAN, VW * WAVE_SPAN).map((span) => (
+              <rect
+                key={`hot-loop-${span.slot}`}
+                x={span.x}
+                y={0}
+                width={span.width}
+                height={VH}
+                fill={span.color}
+                fillOpacity={0.16}
+                stroke={span.color}
+                strokeWidth={1}
+                vectorEffect="non-scaling-stroke"
+              >
+                <title>Loop hot cue</title>
               </rect>
             ))}
             {state.loop.active && state.loop.outFrame > state.loop.inFrame && (

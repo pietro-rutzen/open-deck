@@ -2,7 +2,7 @@ import { DeckMeterStrip, MeterMenu, useMeterSelection } from "./DeckMeters";
 import { nextHotCue, SHOW_CUE_COUNTDOWN } from "../lib/cueCountdown";
 import { CueCountdownReadout } from "./CueCountdown";
 import { CUE_COLORS } from "../lib/hotCueMarkers";
-import { memoryLoopColor, memoryLoopFractions, memoryMatchesLoop } from "../lib/memoryLoops";
+import { memoryCueFractions, memoryLoopColor, memoryLoopFractions, memoryMatchesLoop } from "../lib/memoryLoops";
 import {
   type CSSProperties,
   memo,
@@ -767,12 +767,13 @@ export function Deck({
             <div className="pads">
               {Array.from({ length: 8 }, (_, i) => {
                 const set = state.hotCues[i] != null;
+                const loopCue = set && state.hotCueOuts[i] != null && (state.hotCueOuts[i] as number) > (state.hotCues[i] as number);
                 const navOnly = !dsp && i >= 2; // streaming: only nav cues 1-2
                 const c = CUE_COLORS[i % CUE_COLORS.length];
                 return (
                   <button
                     key={i}
-                    className={`pad ${set ? 'pad--set' : ''}`}
+                    className={`pad ${set ? 'pad--set' : ''}${loopCue ? ' pad--loop' : ''}`}
                     disabled={navOnly || !meta}
                     onClick={() => actions.setHotCue(i)}
                     onContextMenu={(e) => {
@@ -789,7 +790,7 @@ export function Deck({
                           }
                         : undefined
                     }
-                    title={set ? 'Jump to this saved track position. Right-click to clear it.' : 'Save this track position so you can jump back to it.'}
+                    title={loopCue ? 'Loop hot cue. Right-click to clear it.' : set ? 'Jump to this saved track position. Right-click to clear it.' : 'Save this track position so you can jump back to it.'}
                   >
                     {i + 1}
                   </button>
@@ -1268,6 +1269,10 @@ function OverviewMarks({
   const stored = memoryMatchesLoop(state.memoryLoops, state.loop.inFrame, state.loop.outFrame);
   const active = state.memoryLoops.some((loop) => loop.active);
   const region = state.loop.outFrame > state.loop.inFrame;
+  const loopHotCue = state.hotCueOuts.some((out, index) => {
+    const frame = state.hotCues[index];
+    return out != null && frame != null && out > frame;
+  });
   return (
     <div className="ov-marks" onPointerDown={(event) => event.stopPropagation()}>
       <button
@@ -1275,7 +1280,7 @@ function OverviewMarks({
         className={`sq-check${stored ? " sq-check--on" : ""}`}
         title="Memory loop"
         aria-pressed={stored}
-        disabled={!meta || !region}
+        disabled={!meta || (!region && !loopHotCue)}
         onClick={onStoreMemory}
       />
       <button
@@ -1354,6 +1359,34 @@ function OverviewBar({
     >
       <OverviewWave peaks={peaks} bands={meta.band_peaks ?? []} />
       <OverviewPlayhead state={state} color={color} />
+      {memoryCueFractions(state.memoryLoops, frames).map((mark) => (
+        <div
+          key={`memory-cue-${mark.slot}`}
+          className="ov-memory-cue"
+          title="Memory cue"
+          style={{ left: `${mark.left * 100}%` }}
+        />
+      ))}
+      {state.hotCues.map((frame, index) => {
+        const out = state.hotCueOuts[index];
+        if (frame == null || out == null || out <= frame) return null;
+        const left = Math.max(0, Math.min(1, frame / frames));
+        const right = Math.max(0, Math.min(1, out / frames));
+        if (right <= left) return null;
+        return (
+          <div
+            key={`hot-loop-${index}`}
+            className="ov-hot-loop"
+            title="Loop hot cue"
+            style={{
+              left: `${left * 100}%`,
+              width: `${(right - left) * 100}%`,
+              background: `${CUE_COLORS[index % CUE_COLORS.length]}33`,
+              borderColor: CUE_COLORS[index % CUE_COLORS.length],
+            }}
+          />
+        );
+      })}
       {memoryLoopFractions(state.memoryLoops, frames).map((span) => (
         <div
           key={`memory-${span.slot}`}

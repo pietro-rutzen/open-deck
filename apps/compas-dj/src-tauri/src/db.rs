@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS cues (
     track_path TEXT NOT NULL REFERENCES tracks(path) ON DELETE CASCADE,
     slot       INTEGER NOT NULL,
     frame      REAL NOT NULL,
+    -- NULL keeps a single-point hot cue. A later frame is the loop out of a loop hot cue.
+    out_frame  REAL,
     PRIMARY KEY (track_path, slot)
 );
 
@@ -67,6 +69,8 @@ CREATE TABLE IF NOT EXISTS memory_loops (
     in_frame   REAL NOT NULL,
     out_frame  REAL NOT NULL,
     active     INTEGER NOT NULL DEFAULT 0,
+    -- 0 = loop range. 1 = memory cue; out_frame then repeats in_frame.
+    point      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (track_path, slot)
 );
 
@@ -130,12 +134,22 @@ pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Db> {
     conn.execute_batch(SCHEMA)?;
     // Idempotent migration for DBs created before smart crates: add the column if missing.
     // (Errors — i.e. "duplicate column" — are expected and ignored.)
+    migrate(&conn);
+    Ok(Db(Mutex::new(conn)))
+}
+
+/// Add columns that older library files do not have. Duplicate-column errors are the steady state.
+fn migrate(conn: &Connection) {
     let _ = conn.execute("ALTER TABLE crates ADD COLUMN query TEXT", []);
     let _ = conn.execute(
         "ALTER TABLE tracks ADD COLUMN analysis_rev INTEGER NOT NULL DEFAULT 0",
         [],
     );
-    Ok(Db(Mutex::new(conn)))
+    let _ = conn.execute("ALTER TABLE cues ADD COLUMN out_frame REAL", []);
+    let _ = conn.execute(
+        "ALTER TABLE memory_loops ADD COLUMN point INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
 }
 
 pub struct OpenedLibrary {
@@ -315,6 +329,9 @@ pub struct TrackRow {
 pub struct CueRow {
     pub slot: i64,
     pub frame: f64,
+    /// Loop out of a hot-cue loop. Absent for a single-point hot cue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out_frame: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -331,6 +348,13 @@ pub struct MemoryLoopRow {
     pub in_frame: f64,
     pub out_frame: f64,
     pub active: bool,
+    /// A saved cue point. Older rows and exports omit this and stay loops.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub point: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Everything needed to restore a deck when a track is reloaded.
@@ -671,12 +695,15 @@ pub fn track_state(c: &Connection, path: &str) -> rusqlite::Result<TrackState> {
         .unwrap_or((0.0, 1.0));
 
     let mut cue_stmt =
-        c.prepare("SELECT slot, frame FROM cues WHERE track_path = ?1 ORDER BY slot")?;
+        c.prepare("SELECT slot, frame, out_frame FROM cues WHERE track_path = ?1 ORDER BY slot")?;
     let cues = cue_stmt
         .query_map(params![path], |r| {
+            let frame = r.get::<_, f64>(1)?;
+            let out_frame = r.get::<_, Option<f64>>(2)?;
             Ok(CueRow {
                 slot: r.get(0)?,
-                frame: r.get(1)?,
+                frame,
+                out_frame: out_frame.filter(|out| out.is_finite() && *out > frame),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -696,7 +723,7 @@ pub fn track_state(c: &Connection, path: &str) -> rusqlite::Result<TrackState> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut memory_stmt = c.prepare(
-        "SELECT slot, in_frame, out_frame, active FROM memory_loops WHERE track_path = ?1 ORDER BY slot",
+        "SELECT slot, in_frame, out_frame, active, point FROM memory_loops WHERE track_path = ?1 ORDER BY slot",
     )?;
     let memory_loops = memory_stmt
         .query_map(params![path], |r| {
@@ -705,6 +732,7 @@ pub fn track_state(c: &Connection, path: &str) -> rusqlite::Result<TrackState> {
                 in_frame: r.get(1)?,
                 out_frame: r.get(2)?,
                 active: r.get::<_, i64>(3)? != 0,
+                point: r.get::<_, i64>(4)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -719,10 +747,33 @@ pub fn track_state(c: &Connection, path: &str) -> rusqlite::Result<TrackState> {
 }
 
 pub fn set_cue(c: &Connection, path: &str, slot: i64, frame: f64) -> rusqlite::Result<()> {
+    write_cue(c, path, slot, frame, None)
+}
+
+/// Store a hot cue. `out_frame` is kept only when it is a real loop end after `frame`.
+pub fn set_cue_range(
+    c: &Connection,
+    path: &str,
+    slot: i64,
+    frame: f64,
+    out_frame: Option<f64>,
+) -> rusqlite::Result<()> {
+    let out_frame = out_frame.filter(|out| out.is_finite() && *out > frame);
+    write_cue(c, path, slot, frame, out_frame)
+}
+
+fn write_cue(
+    c: &Connection,
+    path: &str,
+    slot: i64,
+    frame: f64,
+    out_frame: Option<f64>,
+) -> rusqlite::Result<()> {
     c.execute(
-        "INSERT INTO cues (track_path, slot, frame) VALUES (?1, ?2, ?3)
-         ON CONFLICT(track_path, slot) DO UPDATE SET frame = excluded.frame",
-        params![path, slot, frame],
+        "INSERT INTO cues (track_path, slot, frame, out_frame) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(track_path, slot) DO UPDATE SET
+            frame = excluded.frame, out_frame = excluded.out_frame",
+        params![path, slot, frame, out_frame],
     )?;
     Ok(())
 }
@@ -764,22 +815,29 @@ pub fn replace_memory_loops(
     )?;
     let mut armed = false;
     for row in loops.iter().take(8) {
-        if row.slot < 0
-            || row.slot >= 8
-            || !row.in_frame.is_finite()
-            || !row.out_frame.is_finite()
-            || row.out_frame <= row.in_frame
-        {
+        if row.slot < 0 || row.slot >= 8 || !row.in_frame.is_finite() {
             continue;
         }
-        let active = row.active && !armed;
+        let point = row.point;
+        if !point && (!row.out_frame.is_finite() || row.out_frame <= row.in_frame) {
+            continue;
+        }
+        let out_frame = if point { row.in_frame } else { row.out_frame };
+        let active = !point && row.active && !armed;
         if active {
             armed = true;
         }
         tx.execute(
-            "INSERT INTO memory_loops (track_path, slot, in_frame, out_frame, active)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![path, row.slot, row.in_frame, row.out_frame, active as i64],
+            "INSERT INTO memory_loops (track_path, slot, in_frame, out_frame, active, point)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                path,
+                row.slot,
+                row.in_frame,
+                out_frame,
+                active as i64,
+                point as i64
+            ],
         )?;
     }
     tx.commit()
@@ -1374,6 +1432,117 @@ mod tests {
     }
 
     #[test]
+    fn older_cues_and_memory_loops_gain_the_new_columns_as_points_and_loops() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE tracks (
+                path TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                artist TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                grid_offset_sec REAL NOT NULL DEFAULT 0,
+                gain REAL NOT NULL DEFAULT 1,
+                added_at INTEGER NOT NULL,
+                play_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE cues (
+                track_path TEXT NOT NULL,
+                slot INTEGER NOT NULL,
+                frame REAL NOT NULL,
+                PRIMARY KEY (track_path, slot)
+            );
+            CREATE TABLE loops (
+                track_path TEXT NOT NULL,
+                slot INTEGER NOT NULL DEFAULT 0,
+                in_frame REAL NOT NULL,
+                out_frame REAL NOT NULL,
+                beats REAL,
+                PRIMARY KEY (track_path, slot)
+            );
+            CREATE TABLE memory_loops (
+                track_path TEXT NOT NULL,
+                slot INTEGER NOT NULL,
+                in_frame REAL NOT NULL,
+                out_frame REAL NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (track_path, slot)
+            );",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO tracks (path, title, artist, duration_ms, added_at) VALUES ('/old.wav', 'Old', 'A', 1, 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO cues (track_path, slot, frame) VALUES ('/old.wav', 2, 42.0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO memory_loops (track_path, slot, in_frame, out_frame, active) VALUES ('/old.wav', 0, 5.0, 9.0, 0)",
+            [],
+        )
+        .unwrap();
+        migrate(&c);
+        let state = track_state(&c, "/old.wav").unwrap();
+        assert_eq!(state.cues[0].frame, 42.0);
+        assert_eq!(state.cues[0].out_frame, None);
+        assert!(!state.memory_loops[0].point);
+        assert_eq!(state.memory_loops[0].out_frame, 9.0);
+        set_cue_range(&c, "/old.wav", 2, 42.0, Some(80.0)).unwrap();
+        set_cue(&c, "/old.wav", 1, 10.0).unwrap();
+        replace_memory_loops(
+            &c,
+            "/old.wav",
+            &[
+                MemoryLoopRow {
+                    slot: 0,
+                    in_frame: 5.0,
+                    out_frame: 9.0,
+                    active: false,
+                    point: false,
+                },
+                MemoryLoopRow {
+                    slot: 1,
+                    in_frame: 12.0,
+                    out_frame: 12.0,
+                    active: true,
+                    point: true,
+                },
+            ],
+        )
+        .unwrap();
+        let updated = track_state(&c, "/old.wav").unwrap();
+        assert_eq!(
+            updated
+                .cues
+                .iter()
+                .find(|cue| cue.slot == 2)
+                .unwrap()
+                .out_frame,
+            Some(80.0)
+        );
+        assert_eq!(
+            updated
+                .cues
+                .iter()
+                .find(|cue| cue.slot == 1)
+                .unwrap()
+                .out_frame,
+            None
+        );
+        let cue = updated
+            .memory_loops
+            .iter()
+            .find(|row| row.slot == 1)
+            .unwrap();
+        assert!(cue.point);
+        assert!(!cue.active);
+        assert_eq!(cue.in_frame, 12.0);
+    }
+
+    #[test]
     fn memory_loops_replace_and_move_with_the_file() {
         let c = mem();
         add_track(&c, "/a.wav", "A", "Artist", 1000).unwrap();
@@ -1386,12 +1555,14 @@ mod tests {
                     in_frame: 10.0,
                     out_frame: 20.0,
                     active: true,
+                    point: false,
                 },
                 MemoryLoopRow {
                     slot: 1,
                     in_frame: 30.0,
                     out_frame: 40.0,
                     active: true,
+                    point: false,
                 },
             ],
         )
@@ -1408,6 +1579,7 @@ mod tests {
                 in_frame: 50.0,
                 out_frame: 80.0,
                 active: false,
+                point: false,
             }],
         )
         .unwrap();

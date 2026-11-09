@@ -79,12 +79,22 @@ pub struct ManifestMemoryLoop {
     pub in_frame: f64,
     pub out_frame: f64,
     pub active: bool,
+    /// A memory cue. Older manifests omit this and stay loops.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub point: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ManifestCue {
     pub slot: i64,
     pub frame: f64,
+    /// Loop out of a hot-cue loop. Older manifests omit this and stay single points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_frame: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -180,6 +190,7 @@ fn gather_track(c: &Connection, path: &str) -> rusqlite::Result<ManifestTrack> {
         .map(|x| ManifestCue {
             slot: x.slot,
             frame: x.frame,
+            out_frame: x.out_frame,
         })
         .collect();
     track.loops = state
@@ -200,6 +211,7 @@ fn gather_track(c: &Connection, path: &str) -> rusqlite::Result<ManifestTrack> {
             in_frame: x.in_frame,
             out_frame: x.out_frame,
             active: x.active,
+            point: x.point,
         })
         .collect();
     Ok(track)
@@ -247,7 +259,7 @@ pub fn apply_manifest(
         crate::db::set_gain(c, &t.path, t.gain)?;
 
         for cue in &t.cues {
-            crate::db::set_cue(c, &t.path, cue.slot, cue.frame)?;
+            crate::db::set_cue_range(c, &t.path, cue.slot, cue.frame, cue.out_frame)?;
             summary.cues += 1;
         }
         for lp in &t.loops {
@@ -265,6 +277,7 @@ pub fn apply_manifest(
                         in_frame: row.in_frame,
                         out_frame: row.out_frame,
                         active: row.active,
+                        point: row.point,
                     })
                     .collect::<Vec<_>>(),
             )?;
@@ -509,6 +522,7 @@ mod tests {
                 in_frame: 1_000.0,
                 out_frame: 5_000.0,
                 active: true,
+                point: false,
             }],
         )
         .unwrap();
@@ -584,6 +598,38 @@ mod tests {
         assert_eq!(state.memory_loops.len(), 1);
         assert!(state.memory_loops[0].active);
         assert_eq!(state.memory_loops[0].in_frame, 1_000.0);
+        assert!(!state.memory_loops[0].point);
+        assert!(state.cues.iter().all(|cue| cue.out_frame.is_none()));
+    }
+
+    #[test]
+    fn older_manifests_load_point_cues_and_memory_loops() {
+        let json = r#"{
+            "version": 1,
+            "app": "compas-dj",
+            "name": "Old",
+            "is_playlist": false,
+            "tracks": [{
+                "path": "/old.wav",
+                "title": "Old",
+                "artist": "A",
+                "duration_ms": 1000,
+                "grid_offset_sec": 0.0,
+                "gain": 1.0,
+                "cues": [{ "slot": 0, "frame": 10.0 }],
+                "memory_loops": [{ "slot": 1, "in_frame": 20.0, "out_frame": 40.0, "active": false }]
+            }]
+        }"#;
+        let manifest = from_json(json).unwrap();
+        assert_eq!(manifest.tracks[0].cues[0].out_frame, None);
+        assert!(!manifest.tracks[0].memory_loops[0].point);
+        let dst = mem();
+        apply_manifest(&dst, &manifest, false).unwrap();
+        let state = crate::db::track_state(&dst, "/old.wav").unwrap();
+        assert_eq!(state.cues[0].frame, 10.0);
+        assert_eq!(state.cues[0].out_frame, None);
+        assert!(!state.memory_loops[0].point);
+        assert_eq!(state.memory_loops[0].out_frame, 40.0);
     }
 
     #[test]

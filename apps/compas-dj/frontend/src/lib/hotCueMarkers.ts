@@ -21,3 +21,34 @@ export function hotCueMarkers(cues: readonly (number | null)[], sourceRate: numb
     return [{ slot, x: (seconds - origin) * width / view, color: CUE_COLORS[slot % CUE_COLORS.length] }];
   });
 }
+
+export interface HotCueLoopSpan {
+  slot: number;
+  x: number;
+  width: number;
+  color: string;
+}
+
+/** Loop range stored on a hot cue, in the same stretched axis as the cue marker. */
+export function hotCueLoopSpans(
+  cues: readonly (number | null)[],
+  outs: readonly (number | null)[],
+  sourceRate: number,
+  stretch: number,
+  origin: number,
+  view: number,
+  width: number,
+): HotCueLoopSpan[] {
+  if (![sourceRate, stretch, view, width].every(value => Number.isFinite(value) && value > 0) || !Number.isFinite(origin)) return [];
+  const scale = width / view;
+  return cues.flatMap((frame, slot) => {
+    const out = outs[slot];
+    if (frame == null || out == null || !Number.isFinite(frame) || !Number.isFinite(out) || out <= frame) return [];
+    const start = frame / sourceRate / stretch;
+    const end = out / sourceRate / stretch;
+    const x = (start - origin) * scale;
+    const span = (end - start) * scale;
+    if (x + span <= 0 || x >= width) return [];
+    return [{ slot, x, width: span, color: CUE_COLORS[slot % CUE_COLORS.length] }];
+  });
+}

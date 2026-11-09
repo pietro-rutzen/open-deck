@@ -3,6 +3,7 @@ export interface MemoryLoopPoint {
   in_frame: number;
   out_frame: number;
   active: boolean;
+  point?: boolean;
 }
 
 export interface MemoryLoopSpan {
@@ -58,6 +59,49 @@ export function memoryLoopSpans(
     const span = (end - start) * scale;
     if (x + span <= 0 || x >= width) return [];
     return [{ slot: loop.slot, x, width: span, active: loop.active }];
+  });
+}
+
+export interface MemoryCueMark {
+  slot: number;
+  x: number;
+}
+
+export interface MemoryCueFraction {
+  slot: number;
+  left: number;
+}
+
+export function isMemoryCue(loop: MemoryLoopPoint): boolean {
+  return loop.point === true && Number.isFinite(loop.in_frame);
+}
+
+export function memoryCueMarks(
+  loops: readonly MemoryLoopPoint[],
+  sampleRate: number,
+  stretch: number,
+  origin: number,
+  view: number,
+  width: number,
+): MemoryCueMark[] {
+  if (!(sampleRate > 0) || !(stretch > 0) || !(view > 0) || !(width > 0) || !Number.isFinite(origin)) return [];
+  const scale = width / view;
+  return loops.flatMap((loop) => {
+    if (!isMemoryCue(loop)) return [];
+    const seconds = loop.in_frame / sampleRate / stretch;
+    if (seconds < origin || seconds > origin + view) return [];
+    return [{ slot: loop.slot, x: (seconds - origin) * scale }];
+  });
+}
+
+export function memoryCueFractions(
+  loops: readonly MemoryLoopPoint[],
+  frames: number,
+): MemoryCueFraction[] {
+  if (!(frames > 0)) return [];
+  return loops.flatMap((loop) => {
+    if (!isMemoryCue(loop)) return [];
+    return [{ slot: loop.slot, left: Math.max(0, Math.min(1, loop.in_frame / frames)) }];
   });
 }
 

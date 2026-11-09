@@ -294,6 +294,8 @@ pub(crate) struct PerformanceMirror {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hot_cue_frame: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_cue_out: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub jump_scale: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quantize: Option<bool>,
@@ -310,6 +312,14 @@ pub(crate) struct MemoryPoint {
     pub in_frame: f64,
     pub out_frame: f64,
     pub active: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub point: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HotCue {
+    frame: f64,
+    out_frame: Option<f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -317,6 +327,12 @@ struct MemoryLoop {
     in_frame: f64,
     out_frame: f64,
     active: bool,
+    point: bool,
+}
+
+fn hot_loop_out(cue: HotCue) -> Option<f64> {
+    cue.out_frame
+        .filter(|out| out.is_finite() && *out > cue.frame)
 }
 
 fn is_false(value: &bool) -> bool {
@@ -325,7 +341,7 @@ fn is_false(value: &bool) -> bool {
 
 #[derive(Clone)]
 struct DeckSnapshot {
-    hot_cues: [Option<f64>; HOT_CUES],
+    hot_cues: [Option<HotCue>; HOT_CUES],
     quantize: bool,
     grid_offset: f64,
     grid_interval: f64,
@@ -404,11 +420,27 @@ impl PerformanceState {
     }
 
     pub(crate) fn set_hot_cue(&self, deck: usize, slot: usize, frame: Option<f64>) {
+        self.set_hot_cue_range(deck, slot, frame, None);
+    }
+
+    pub(crate) fn set_hot_cue_range(
+        &self,
+        deck: usize,
+        slot: usize,
+        frame: Option<f64>,
+        out_frame: Option<f64>,
+    ) {
         if slot >= HOT_CUES {
             return;
         }
         let frame = frame.filter(|frame| frame.is_finite());
-        self.with_deck(deck, |snapshot| snapshot.hot_cues[slot] = frame);
+        let out_frame = out_frame.filter(|out| out.is_finite());
+        self.with_deck(deck, |snapshot| {
+            snapshot.hot_cues[slot] = frame.map(|frame| HotCue {
+                frame,
+                out_frame: out_frame.filter(|out| *out > frame),
+            });
+        });
     }
 
     /// Leave or re-enter keyboard mode. Returns the pitch to restore, when a pad was holding one.
@@ -439,10 +471,24 @@ impl PerformanceState {
         })
     }
 
-    pub(crate) fn set_hot_cues(&self, deck: usize, frames: &[Option<f64>]) {
+    pub(crate) fn set_hot_cue_ranges(
+        &self,
+        deck: usize,
+        frames: &[Option<f64>],
+        outs: &[Option<f64>],
+    ) {
         self.with_deck(deck, |snapshot| {
             for (slot, frame) in frames.iter().enumerate().take(HOT_CUES) {
-                snapshot.hot_cues[slot] = frame.filter(|frame| frame.is_finite());
+                let frame = frame.filter(|frame| frame.is_finite());
+                let out = outs
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .filter(|out| out.is_finite());
+                snapshot.hot_cues[slot] = frame.map(|frame| HotCue {
+                    frame,
+                    out_frame: out.filter(|out| *out > frame),
+                });
             }
         });
     }
@@ -542,18 +588,28 @@ impl PerformanceState {
         });
     }
 
-    pub(crate) fn set_memory_loops(&self, deck: usize, loops: &[(u8, f64, f64, bool)]) {
+    pub(crate) fn set_memory_loops(&self, deck: usize, loops: &[(u8, f64, f64, bool, bool)]) {
         self.with_deck(deck, |snapshot| {
             snapshot.memory = [None; MEMORY_LOOPS];
             snapshot.memory_selected = None;
             let mut armed = false;
-            for (slot, in_frame, out_frame, active) in loops.iter().copied().take(MEMORY_LOOPS) {
+            for (slot, in_frame, out_frame, active, point) in
+                loops.iter().copied().take(MEMORY_LOOPS)
+            {
                 let slot = usize::from(slot);
-                if slot >= MEMORY_LOOPS
-                    || !in_frame.is_finite()
-                    || !out_frame.is_finite()
-                    || out_frame <= in_frame
-                {
+                if slot >= MEMORY_LOOPS || !in_frame.is_finite() {
+                    continue;
+                }
+                if point {
+                    snapshot.memory[slot] = Some(MemoryLoop {
+                        in_frame,
+                        out_frame: in_frame,
+                        active: false,
+                        point: true,
+                    });
+                    continue;
+                }
+                if !out_frame.is_finite() || out_frame <= in_frame {
                     continue;
                 }
                 let active = active && !armed;
@@ -564,6 +620,7 @@ impl PerformanceState {
                     in_frame,
                     out_frame,
                     active,
+                    point: false,
                 });
             }
         });
@@ -669,6 +726,7 @@ fn memory_points(snapshot: &DeckSnapshot) -> Vec<MemoryPoint> {
                 in_frame: region.in_frame,
                 out_frame: region.out_frame,
                 active: region.active,
+                point: region.point,
             })
         })
         .collect()
@@ -716,7 +774,23 @@ fn performance_action(
     let loaded = telemetry.is_loaded(deck);
     let tempos = std::array::from_fn(|index| telemetry.tempo_ratio(index));
     let position = captured.or_else(|| capture_position(control, telemetry));
-    apply_performance(deck, name, value, loaded, position, &tempos, performance)
+    let standby = (telemetry.is_at_cue(deck) && !telemetry.is_playing(deck)).then(|| {
+        position
+            .as_ref()
+            .map(|position| position.frame)
+            .filter(|frame| frame.is_finite())
+            .unwrap_or_else(|| telemetry.playhead_frames(deck))
+    });
+    apply_performance(
+        deck,
+        name,
+        value,
+        loaded,
+        position,
+        &tempos,
+        performance,
+        standby,
+    )
 }
 
 fn apply_performance(
@@ -727,6 +801,7 @@ fn apply_performance(
     position: Option<CapturedPosition>,
     tempos: &[f64; NUM_DECKS],
     performance: &PerformanceState,
+    standby: Option<f64>,
 ) -> Option<NativeAction> {
     let pressed = value >= 0.5;
     if name == "quantize" && pressed {
@@ -796,7 +871,12 @@ fn apply_performance(
         "loop.toggle" => toggle_loop(deck, performance),
         "loop.half" => Some(loop_length_or_memory(deck, -1, 0.5, heard, performance)),
         "loop.double" => Some(loop_length_or_memory(deck, 1, 2.0, heard, performance)),
-        "loop.memory_save" => Some(save_memory(deck, performance)),
+        "loop.memory_save" => Some(save_memory(
+            deck,
+            position.as_ref().map(|position| position.frame),
+            standby,
+            performance,
+        )),
         "loop.memory_delete" => Some(delete_memory(deck, heard, performance)),
         "loop.memory_forget" => Some(forget_current_memory(deck, performance)),
         "loop.memory_active" => Some(toggle_active_memory(deck, heard, performance)),
@@ -856,15 +936,13 @@ fn keyboard_select(
         let Some(heard) = heard.filter(|frame| frame.is_finite()) else {
             return single(None, false);
         };
-        snapshot.hot_cues[slot] = Some(heard.max(0.0));
+        store_hot_cue(snapshot, slot, heard);
     }
     snapshot.keyboard_cue = Some(slot);
+    let stored = snapshot.hot_cues[slot];
     let mut action = single(None, true);
     action.mirror_as = Some(format!("deck.{deck}.hotcue.{slot}"));
-    action.performance = Some(PerformanceMirror {
-        hot_cue_frame: snapshot.hot_cues[slot],
-        ..PerformanceMirror::default()
-    });
+    action.performance = Some(hot_cue_mirror(stored));
     action
 }
 
@@ -891,22 +969,17 @@ fn keyboard_play(
     }
     snapshot.keyboard_held |= bit;
     snapshot.keyboard_last = Some(slot as u8);
-    let target = if snapshot.quantize {
-        snapped(stored, snapshot).max(0.0)
-    } else {
-        stored
-    };
-    let mut action = single(
-        Some(EngineMsg::DeckSeek {
+    let mut action = recall_hot_cue(deck, stored, snapshot);
+    let starts_playback = action
+        .messages
+        .iter()
+        .any(|message| matches!(message, EngineMsg::DeckPlaying { .. }));
+    if !starts_playback {
+        action.messages.push(EngineMsg::DeckPlaying {
             deck,
-            frame: target,
-        }),
-        false,
-    );
-    action.messages.push(EngineMsg::DeckPlaying {
-        deck,
-        playing: true,
-    });
+            playing: true,
+        });
+    }
     action.pitch = Some(keyboard_semitone(slot, snapshot.keyboard_transpose));
     action
 }
@@ -962,28 +1035,89 @@ fn hot_cue_action(
     let heard = position?.heard_frame.max(0.0);
     performance.with_deck(deck, |snapshot| {
         if let Some(stored) = snapshot.hot_cues[slot] {
-            let target = if snapshot.quantize {
-                snapped(stored, snapshot).max(0.0)
-            } else {
-                stored
-            };
-            single(
-                Some(EngineMsg::DeckSeek {
-                    deck,
-                    frame: target,
-                }),
-                false,
-            )
+            recall_hot_cue(deck, stored, snapshot)
         } else {
-            snapshot.hot_cues[slot] = Some(heard);
+            let stored = store_hot_cue(snapshot, slot, heard);
             let mut action = single(None, true);
-            action.performance = Some(PerformanceMirror {
-                hot_cue_frame: Some(heard),
-                ..PerformanceMirror::default()
-            });
+            action.performance = Some(hot_cue_mirror(Some(stored)));
             action
         }
     })
+}
+
+fn store_hot_cue(snapshot: &mut DeckSnapshot, slot: usize, heard: f64) -> HotCue {
+    let cue = if snapshot.loop_active && snapshot.loop_out > snapshot.loop_in {
+        HotCue {
+            frame: snapshot.loop_in.max(0.0),
+            out_frame: Some(snapshot.loop_out),
+        }
+    } else {
+        HotCue {
+            frame: heard.max(0.0),
+            out_frame: None,
+        }
+    };
+    snapshot.hot_cues[slot] = Some(cue);
+    cue
+}
+
+fn hot_cue_mirror(cue: Option<HotCue>) -> PerformanceMirror {
+    PerformanceMirror {
+        hot_cue_frame: cue.map(|cue| cue.frame),
+        hot_cue_out: cue.and_then(hot_loop_out),
+        ..PerformanceMirror::default()
+    }
+}
+
+/// A point hot cue seeks. A loop hot cue starts that loop from its in point.
+fn recall_hot_cue(deck: usize, stored: HotCue, snapshot: &mut DeckSnapshot) -> NativeAction {
+    let Some(loop_out) = hot_loop_out(stored) else {
+        let target = if snapshot.quantize {
+            snapped(stored.frame, snapshot).max(0.0)
+        } else {
+            stored.frame
+        };
+        return single(
+            Some(EngineMsg::DeckSeek {
+                deck,
+                frame: target,
+            }),
+            false,
+        );
+    };
+    let out = if snapshot.track_frames == 0 {
+        Some(loop_out)
+    } else {
+        compas_audio::recall_loop_end(stored.frame, loop_out, snapshot.track_frames)
+    };
+    let Some(out) = out else {
+        return single(
+            Some(EngineMsg::DeckSeek {
+                deck,
+                frame: stored.frame.max(0.0),
+            }),
+            false,
+        );
+    };
+    snapshot.loop_in = stored.frame;
+    snapshot.loop_out = out;
+    snapshot.loop_active = true;
+    snapshot.loop_armed = false;
+    snapshot.loop_beats = None;
+    let mut action = single(
+        Some(EngineMsg::RecallLoop {
+            deck,
+            in_frame: stored.frame,
+            out_frame: out,
+        }),
+        true,
+    );
+    action.messages.push(EngineMsg::DeckPlaying {
+        deck,
+        playing: true,
+    });
+    action.performance = Some(loop_mirror(snapshot));
+    action
 }
 
 fn snapped(frame: f64, snapshot: &DeckSnapshot) -> f64 {
@@ -1054,6 +1188,7 @@ pub(crate) fn memory_button(
     frame: f64,
     heard: f64,
     loaded: bool,
+    standby: Option<f64>,
     performance: &PerformanceState,
 ) -> NativeAction {
     let position = (frame.is_finite() && heard.is_finite()).then_some(CapturedPosition {
@@ -1068,6 +1203,7 @@ pub(crate) fn memory_button(
         position,
         &[1.0; NUM_DECKS],
         performance,
+        standby.filter(|frame| frame.is_finite()),
     )
     .unwrap_or_else(|| single(None, false))
 }
@@ -1240,12 +1376,16 @@ fn memory_in(snapshot: &DeckSnapshot, slot: usize) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn nearest_memory(snapshot: &DeckSnapshot, frame: f64) -> Option<usize> {
+fn nearest_memory(snapshot: &DeckSnapshot, frame: f64, loops_only: bool) -> Option<usize> {
     snapshot
         .memory
         .iter()
         .enumerate()
-        .filter_map(|(slot, region)| region.map(|region| (slot, region.in_frame)))
+        .filter_map(|(slot, region)| {
+            region.and_then(|region| {
+                (!loops_only || !region.point).then_some((slot, region.in_frame))
+            })
+        })
         .min_by(|left, right| {
             (left.1 - frame)
                 .abs()
@@ -1285,25 +1425,61 @@ fn clear_memory_slot(snapshot: &mut DeckSnapshot, slot: usize) {
     }
 }
 
-fn save_memory(deck: usize, performance: &PerformanceState) -> NativeAction {
+fn covering_hot_loop(snapshot: &DeckSnapshot, frame: f64) -> Option<(f64, f64)> {
+    snapshot
+        .hot_cues
+        .iter()
+        .flatten()
+        .filter_map(|cue| {
+            let out = hot_loop_out(*cue)?;
+            let covers = frame >= cue.frame - SAME_LOOP_FRAMES && frame <= out + SAME_LOOP_FRAMES;
+            covers.then_some((cue.frame, (cue.frame - frame).abs(), out))
+        })
+        .min_by(|left, right| left.1.total_cmp(&right.1).then(left.0.total_cmp(&right.0)))
+        .map(|(in_frame, _, out_frame)| (in_frame, out_frame))
+}
+
+fn same_saved(region: MemoryLoop, in_frame: f64, out_frame: f64, point: bool) -> bool {
+    if region.point != point {
+        return false;
+    }
+    if point {
+        return (region.in_frame - in_frame).abs() < SAME_LOOP_FRAMES;
+    }
+    same_loop(region.in_frame, region.out_frame, in_frame, out_frame)
+}
+
+fn save_memory(
+    deck: usize,
+    anchor: Option<f64>,
+    standby: Option<f64>,
+    performance: &PerformanceState,
+) -> NativeAction {
     performance
         .with_deck(deck, |snapshot| {
-            if snapshot.loop_out <= snapshot.loop_in {
+            let transport = (snapshot.loop_out > snapshot.loop_in).then_some((
+                snapshot.loop_in,
+                snapshot.loop_out,
+                false,
+            ));
+            let hot = anchor
+                .or(standby)
+                .filter(|frame| frame.is_finite())
+                .and_then(|frame| covering_hot_loop(snapshot, frame))
+                .map(|(in_frame, out_frame)| (in_frame, out_frame, false));
+            let standby_cue = standby
+                .filter(|frame| frame.is_finite())
+                .map(|frame| (frame.max(0.0), frame.max(0.0), true));
+            let Some((in_frame, out_frame, point)) = transport.or(hot).or(standby_cue) else {
                 return single(None, false);
-            }
+            };
             if let Some(slot) = snapshot
                 .memory
                 .iter()
                 .enumerate()
                 .find_map(|(slot, stored)| {
                     (*stored).and_then(|region| {
-                        same_loop(
-                            region.in_frame,
-                            region.out_frame,
-                            snapshot.loop_in,
-                            snapshot.loop_out,
-                        )
-                        .then_some(slot)
+                        same_saved(region, in_frame, out_frame, point).then_some(slot)
                     })
                 })
             {
@@ -1314,9 +1490,10 @@ fn save_memory(deck: usize, performance: &PerformanceState) -> NativeAction {
                 return single(None, false);
             };
             snapshot.memory[slot] = Some(MemoryLoop {
-                in_frame: snapshot.loop_in,
-                out_frame: snapshot.loop_out,
+                in_frame,
+                out_frame: if point { in_frame } else { out_frame },
                 active: false,
+                point,
             });
             snapshot.memory_selected = Some(slot);
             memory_action(snapshot, None)
@@ -1335,7 +1512,7 @@ fn delete_memory(deck: usize, heard: Option<f64>, performance: &PerformanceState
                         .get(*slot)
                         .is_some_and(|region| region.is_some())
                 })
-                .or_else(|| nearest_memory(snapshot, heard.unwrap_or(0.0)));
+                .or_else(|| nearest_memory(snapshot, heard.unwrap_or(0.0), false));
             let Some(slot) = slot else {
                 return single(None, false);
             };
@@ -1379,7 +1556,7 @@ fn toggle_active_memory(
 ) -> NativeAction {
     performance
         .with_deck(deck, |snapshot| {
-            let mut slot = nearest_memory(snapshot, heard.unwrap_or(snapshot.loop_in));
+            let mut slot = nearest_memory(snapshot, heard.unwrap_or(snapshot.loop_in), true);
             if slot.is_none() && snapshot.loop_out > snapshot.loop_in {
                 slot = snapshot.memory.iter().position(|region| region.is_none());
                 if let Some(slot) = slot {
@@ -1387,6 +1564,7 @@ fn toggle_active_memory(
                         in_frame: snapshot.loop_in,
                         out_frame: snapshot.loop_out,
                         active: false,
+                        point: false,
                     });
                 }
             }
@@ -1442,6 +1620,20 @@ fn call_memory(
             return None;
         };
         snapshot.memory_selected = Some(slot);
+        if region.point {
+            let was_looping = snapshot.loop_active;
+            snapshot.loop_active = false;
+            let frame = region.in_frame.max(0.0);
+            let mut action = memory_action(snapshot, Some(EngineMsg::DeckSeek { deck, frame }));
+            action.messages.push(EngineMsg::SetCuePoint { deck, frame });
+            if was_looping {
+                action.messages.push(EngineMsg::LoopActive {
+                    deck,
+                    active: false,
+                });
+            }
+            return Some(action);
+        }
         snapshot.loop_in = region.in_frame;
         snapshot.loop_out = region.out_frame;
         snapshot.loop_active = true;
@@ -1913,7 +2105,16 @@ mod tests {
         position: Option<CapturedPosition>,
         performance: &PerformanceState,
     ) -> Option<NativeAction> {
-        apply_performance(0, name, 1.0, true, position, &[1.0; NUM_DECKS], performance)
+        apply_performance(
+            0,
+            name,
+            1.0,
+            true,
+            position,
+            &[1.0; NUM_DECKS],
+            performance,
+            None,
+        )
     }
 
     #[test]
@@ -1931,6 +2132,100 @@ mod tests {
             Some(EngineMsg::DeckSeek { deck: 0, frame }) if frame == 10_000.0
         ));
         assert!(!jump.mirror);
+    }
+
+    #[test]
+    fn loop_hot_cue_stores_the_playing_loop_and_can_be_saved() {
+        let performance = PerformanceState::new();
+        performance.install_track(0, 0.0, 1_000.0, 48_000.0, 120.0, 200_000);
+        performance.set_loop(0, 1_000.0, 5_000.0, true, false, Some(4.0));
+        let set = perform("hotcue.1", Some(at(3_000.0, 2_500.0)), &performance).expect("set");
+        let mirror = set.performance.expect("mirror");
+        assert_eq!(mirror.hot_cue_frame, Some(1_000.0));
+        assert_eq!(mirror.hot_cue_out, Some(5_000.0));
+        performance.set_loop(0, 0.0, 0.0, false, false, None);
+        let jump = perform("hotcue.1", Some(at(9_000.0, 8_000.0)), &performance).expect("jump");
+        assert!(matches!(
+            jump.message,
+            Some(EngineMsg::RecallLoop { deck: 0, in_frame, out_frame })
+                if in_frame == 1_000.0 && out_frame == 5_000.0
+        ));
+        assert!(jump.messages.iter().any(|message| matches!(
+            message,
+            EngineMsg::DeckPlaying {
+                deck: 0,
+                playing: true
+            }
+        )));
+        performance.set_loop(0, 0.0, 0.0, false, false, None);
+        let saved = perform("loop.memory_save", Some(at(2_000.0, 2_000.0)), &performance).unwrap();
+        let points = memory_points_of(&saved);
+        assert_eq!(points.len(), 1);
+        assert!(!points[0].point);
+        assert_eq!(points[0].in_frame, 1_000.0);
+        assert_eq!(points[0].out_frame, 5_000.0);
+    }
+
+    #[test]
+    fn cue_standby_saves_the_cue_point_without_a_loop() {
+        let performance = PerformanceState::new();
+        let saved = apply_performance(
+            0,
+            "loop.memory_save",
+            1.0,
+            true,
+            Some(at(4_000.0, 4_000.0)),
+            &[1.0; NUM_DECKS],
+            &performance,
+            Some(4_000.0),
+        )
+        .unwrap();
+        let points = memory_points_of(&saved);
+        assert_eq!(points.len(), 1);
+        assert!(points[0].point);
+        assert!(!points[0].active);
+        assert_eq!(points[0].in_frame, 4_000.0);
+        let duplicate = apply_performance(
+            0,
+            "loop.memory_save",
+            1.0,
+            true,
+            Some(at(4_000.4, 4_000.4)),
+            &[1.0; NUM_DECKS],
+            &performance,
+            Some(4_000.4),
+        )
+        .unwrap();
+        assert_eq!(memory_points_of(&duplicate).len(), 1);
+        performance.set_loop(0, 1_000.0, 5_000.0, false, false, None);
+        let loop_instead = apply_performance(
+            0,
+            "loop.memory_save",
+            1.0,
+            true,
+            Some(at(4_000.0, 4_000.0)),
+            &[1.0; NUM_DECKS],
+            &performance,
+            Some(4_000.0),
+        )
+        .unwrap();
+        let stored = memory_points_of(&loop_instead);
+        assert!(stored
+            .iter()
+            .any(|point| !point.point && point.in_frame == 1_000.0));
+        let called = perform("loop.half", Some(at(9_000.0, 8_000.0)), &performance).unwrap();
+        assert!(matches!(
+            called.message,
+            Some(EngineMsg::DeckSeek { deck: 0, frame }) if frame == 4_000.0
+        ));
+        assert!(called.messages.iter().any(|message| matches!(
+            message,
+            EngineMsg::SetCuePoint { deck: 0, frame } if *frame == 4_000.0
+        )));
+        assert!(called
+            .messages
+            .iter()
+            .all(|message| !matches!(message, EngineMsg::RecallLoop { .. })));
     }
 
     #[test]
@@ -2247,7 +2542,9 @@ mod tests {
         performance.install_track(0, 0.0, 0.0, 44_100.0, 0.0, 1_000);
         performance.set_partner(0, Some(1));
         let tempos = [1.0; NUM_DECKS];
-        assert!(apply_performance(0, "sync", 1.0, true, None, &tempos, &performance).is_none());
+        assert!(
+            apply_performance(0, "sync", 1.0, true, None, &tempos, &performance, None).is_none()
+        );
         assert!(!performance
             .with_deck(0, |snapshot| snapshot.synced)
             .unwrap());
@@ -2273,7 +2570,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(bpm, 120.0);
-        assert_eq!(cue, Some(250.0));
+        assert_eq!(cue.map(|cue| cue.frame), Some(250.0));
         assert!(armed);
         assert!(!synced);
         performance.clear_deck(0);
@@ -2292,8 +2589,8 @@ mod tests {
         performance.set_partner(0, Some(1));
         let mut tempos = [1.0; NUM_DECKS];
         tempos[1] = 1.05;
-        let on =
-            apply_performance(0, "sync", 1.0, true, None, &tempos, &performance).expect("sync");
+        let on = apply_performance(0, "sync", 1.0, true, None, &tempos, &performance, None)
+            .expect("sync");
         assert!(on.messages.iter().any(|message| matches!(
             message,
             EngineMsg::DeckTempo { deck: 0, ratio } if (ratio - 1.344).abs() < 1e-9
@@ -2308,8 +2605,8 @@ mod tests {
         assert_eq!(on.extra_mirrors.len(), 1);
         assert_eq!(on.extra_mirrors[0].0, "deck.0.tempo");
         assert!((on.extra_mirrors[0].1 - 34.4).abs() < 1e-9);
-        let off =
-            apply_performance(0, "sync", 1.0, true, None, &tempos, &performance).expect("off");
+        let off = apply_performance(0, "sync", 1.0, true, None, &tempos, &performance, None)
+            .expect("off");
         assert!(matches!(
             off.message,
             Some(EngineMsg::DeckSync {
@@ -2324,7 +2621,8 @@ mod tests {
             true,
             None,
             &tempos,
-            &PerformanceState::new()
+            &PerformanceState::new(),
+            None,
         )
         .is_none());
     }

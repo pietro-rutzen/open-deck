@@ -335,6 +335,8 @@ export interface DbTrack {
 export interface DbCue {
   slot: number;
   frame: number;
+  /** Loop end when this hot cue stores a loop. Absent for a single point. */
+  out_frame?: number | null;
 }
 export interface DbLoop {
   slot: number;
@@ -347,6 +349,8 @@ export interface DbMemoryLoop {
   in_frame: number;
   out_frame: number;
   active: boolean;
+  /** Saved cue point. Older libraries omit this and stay loops. */
+  point?: boolean;
 }
 /** Saved per-track performance state, restored when a track is reloaded onto a deck. */
 export interface DbTrackState {
@@ -414,8 +418,8 @@ export const deleteLibraryFolder = (folder: string) =>
 export const onLibraryPathsMoved = (cb: (moves: PathMove[]) => void): Promise<UnlistenFn> =>
   listen<PathMove[]>("library:paths-moved", (event) => cb(event.payload));
 export const dbTrackState = (path: string) => invoke<DbTrackState>("db_track_state", { path });
-export const dbSetCue = (path: string, slot: number, frame: number) =>
-  invoke("db_set_cue", { path, slot, frame });
+export const dbSetCue = (path: string, slot: number, frame: number, outFrame: number | null = null) =>
+  invoke("db_set_cue", { path, slot, frame, outFrame });
 export const dbClearCue = (path: string, slot: number) => invoke("db_clear_cue", { path, slot });
 export const dbSetLoop = (
   path: string,
@@ -613,6 +617,7 @@ export interface ControllerUpdate {
     loop_beats?: number;
     clear_loop_beats?: boolean;
     hot_cue_frame?: number;
+    hot_cue_out?: number;
     jump_scale?: number;
     quantize?: boolean;
     synced?: boolean;
@@ -754,10 +759,17 @@ export const setSyncLeader = (deck: number, explicit: boolean) =>
 /** Auto-pick the best leader and follow it. */
 export const syncToLeader = (deck: number) => invoke("sync_to_leader", { deck });
 /** Keep controller-thread cue, loop, grid, and sync memory aligned with on-screen edits. */
-export const performanceSetHotCue = (deck: number, slot: number, frame: number | null) =>
-  invoke("performance_set_hot_cue", { deck, slot, frame });
-export const performanceSetHotCues = (deck: number, frames: (number | null)[]) =>
-  invoke("performance_set_hot_cues", { deck, frames });
+export const performanceSetHotCue = (
+  deck: number,
+  slot: number,
+  frame: number | null,
+  outFrame: number | null = null,
+) => invoke("performance_set_hot_cue", { deck, slot, frame, outFrame });
+export const performanceSetHotCues = (
+  deck: number,
+  frames: (number | null)[],
+  outFrames: (number | null)[] = [],
+) => invoke("performance_set_hot_cues", { deck, frames, outFrames });
 export const performanceSetLoop = (
   deck: number,
   inFrame: number,
