@@ -224,6 +224,25 @@ fn select_output_device(host: &cpal::Host, name: Option<&str>) -> Result<cpal::D
     Ok(device)
 }
 
+fn render_output_block<T>(
+    out: &mut [T],
+    channels: usize,
+    cue_pair: Option<u16>,
+    mut next_buses: impl FnMut() -> ((f32, f32), (f32, f32)),
+) where
+    T: SizedSample + FromSample<f32>,
+{
+    let mut frames = out.chunks_exact_mut(channels);
+    for frame in frames.by_ref() {
+        let (master, cue_bus) = next_buses();
+        let cue = cue_pair.map(|first| (usize::from(first), [cue_bus.0, cue_bus.1]));
+        write_output_frame(frame, master, cue);
+    }
+    for sample in frames.into_remainder() {
+        *sample = T::from_sample(0.0);
+    }
+}
+
 fn write_output_frame<T>(frame: &mut [T], master: (f32, f32), cue: Option<(usize, [f32; 2])>)
 where
     T: FromSample<f32> + SizedSample,
@@ -303,15 +322,16 @@ where
                 }
                 mixer.drain_commands();
                 if channels == 0 {
+                    for sample in out.iter_mut() {
+                        *sample = T::from_sample(0.0);
+                    }
                     return;
                 }
                 let cue_pair = embedded_cue.filter(|_| embed_cue_live.load(Ordering::Relaxed));
-                for frame in out.chunks_exact_mut(channels) {
+                render_output_block(out, channels, cue_pair, || {
                     let buses = mixer.next_buses();
-                    let cue =
-                        cue_pair.map(|first| (usize::from(first), [buses.cue.0, buses.cue.1]));
-                    write_output_frame(frame, buses.master, cue);
-                }
+                    (buses.master, buses.cue)
+                });
                 // RT load = time spent in the callback ÷ this block's real-time budget.
                 let block_secs = (out.len() / channels) as f64 / sample_rate;
                 let load = if block_secs > 0.0 {
@@ -388,5 +408,17 @@ mod tests {
         let mut mono = [0.0_f32; 1];
         write_output_frame(&mut mono, (0.4, -0.2), None);
         assert_eq!(mono, [0.1]);
+    }
+
+    #[test]
+    fn a_short_output_block_ends_in_silence_instead_of_stale_samples() {
+        let mut block = [1.0_f32; 5];
+        let mut frames = 0;
+        render_output_block(&mut block, 2, None, || {
+            frames += 1;
+            ((0.5, -0.5), (1.0, 1.0))
+        });
+        assert_eq!(frames, 2);
+        assert_eq!(block, [0.5, -0.5, 0.5, -0.5, 0.0]);
     }
 }

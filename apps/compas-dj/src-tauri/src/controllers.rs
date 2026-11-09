@@ -929,6 +929,10 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                 meter_last = [255; 2];
                 out = name.and_then(|name| open_output(&name));
                 fb_last.clear(); // a fresh port's LED/fader state is unknown
+                if out.is_some() {
+                    next_keep_alive = Instant::now();
+                    next_meter = Instant::now();
+                }
             }
             ControllerMsg::Feedback { control, value } => {
                 if registry.get_str(&control).is_some() && value.is_finite() {

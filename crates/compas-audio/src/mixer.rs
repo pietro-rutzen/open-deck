@@ -4403,6 +4403,140 @@ mod tests {
     }
 
     #[test]
+    fn aux_underrun_is_silence_until_new_samples_arrive() {
+        let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
+        let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);
+        let mut mixer = Mixer::new(48_000.0, crx, rtx, Arc::new(DeckTelemetry::new()));
+        let (mut aux_tx, aux_rx) = rtrb::RingBuffer::<f32>::new(AUX_PRIME_SAMPLES + 8);
+        aux_tx.push(0.5).unwrap();
+        aux_tx.push(-0.25).unwrap();
+        mixer.aux.source = Some(aux_rx);
+        mixer.aux.primed = true;
+        mixer.aux.gain = GainSmoother::new(1.0, 48_000.0, 10.0);
+
+        let first = mixer.next_frame();
+        let underrun = mixer.next_frame();
+        let still_silent = mixer.next_frame();
+        assert!(
+            first.0.abs() > 0.1,
+            "primed aux should be audible: {first:?}"
+        );
+        assert_eq!(
+            (underrun, still_silent),
+            ((0.0, 0.0), (0.0, 0.0)),
+            "an underrun must not repeat the last aux sample"
+        );
+
+        for _ in 0..(AUX_PRIME_SAMPLES / 2) {
+            aux_tx.push(0.2).unwrap();
+            aux_tx.push(0.1).unwrap();
+        }
+        let refilled = mixer.next_frame();
+        assert!(
+            (refilled.0 - first.0).abs() > 0.05,
+            "refill should be the new samples, not the stale frame: {refilled:?} vs {first:?}"
+        );
+    }
+
+    #[test]
+    fn an_overrun_count_does_not_repeat_or_stall_the_playhead() {
+        let (_tx, mut mixer) = mixer_with_commands();
+        mixer.decks[0] = ramp_deck();
+        mixer.decks[0].playing = true;
+        let first = mixer.next_frame();
+        let playhead = mixer.decks[0].playhead;
+        for _ in 0..4 {
+            mixer.publish_rt_load(2.0);
+        }
+        let second = mixer.next_frame();
+        assert!(mixer.telemetry.xruns() >= 1);
+        assert!(mixer.decks[0].playing);
+        assert!(mixer.decks[0].playhead > playhead);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn one_deck_reaching_the_end_does_not_stop_the_other() {
+        let (mut tx, mut mixer) = mixer_with_commands();
+        load_constant(&mut tx, 0, 0.5, 8);
+        load_constant(&mut tx, 1, 0.5, 1_000);
+        for deck in 0..2 {
+            tx.push(AudioCommand::SetDeckPlaying {
+                deck,
+                playing: true,
+            })
+            .unwrap();
+        }
+        mixer.drain_commands();
+        for _ in 0..32 {
+            mixer.next_buses();
+        }
+        assert!(!mixer.decks[0].playing, "the short deck stops at its end");
+        assert!(mixer.decks[1].playing, "the other deck keeps playing");
+        assert!(mixer.decks[1].playhead > mixer.decks[0].playhead);
+    }
+
+    #[test]
+    fn rebuilding_at_a_new_sample_rate_keeps_both_decks_on_the_source_timeline() {
+        let buffer = Arc::new(DeckBuffer::new(vec![0.5_f32; 96_000], 48_000));
+        let play = |device_rate: f32, device_frames: usize| -> [f64; 2] {
+            let (mut commands, consumer) = rtrb::RingBuffer::new(16);
+            let (reclaim, _retired) = rtrb::RingBuffer::new(8);
+            let mut mixer = Mixer::new(
+                device_rate,
+                consumer,
+                reclaim,
+                Arc::new(DeckTelemetry::new()),
+            );
+            for deck in 0..2 {
+                commands
+                    .push(AudioCommand::LoadDeck {
+                        deck,
+                        buffer: Arc::clone(&buffer),
+                        beat_offset: 12.0,
+                        beat_interval: 24_000.0,
+                    })
+                    .unwrap();
+                commands
+                    .push(AudioCommand::SeekDeck {
+                        deck,
+                        frame: 1_000.0,
+                    })
+                    .unwrap();
+                commands
+                    .push(AudioCommand::SetDeckTempo { deck, ratio: 1.0 })
+                    .unwrap();
+                commands
+                    .push(AudioCommand::SetDeckPlaying {
+                        deck,
+                        playing: true,
+                    })
+                    .unwrap();
+            }
+            mixer.drain_commands();
+            for _ in 0..device_frames {
+                mixer.next_buses();
+            }
+            [mixer.decks[0].playhead, mixer.decks[1].playhead]
+        };
+        let fast = play(48_000.0, 4_800);
+        let slow = play(24_000.0, 2_400);
+        assert!(
+            (fast[0] - fast[1]).abs() < 1e-6,
+            "decks drifted at 48 kHz: {fast:?}"
+        );
+        assert!(
+            (slow[0] - slow[1]).abs() < 1e-6,
+            "decks drifted at 24 kHz: {slow:?}"
+        );
+        assert!(
+            (fast[0] - slow[0]).abs() < 1.0,
+            "sample-rate rebuild moved the source playhead: {fast:?} vs {slow:?}"
+        );
+        assert!(fast[0] > 1_000.0);
+    }
+
+    #[test]
     fn record_and_cue_ring_drops_are_counted() {
         let (_ctx, crx) = rtrb::RingBuffer::<AudioCommand>::new(8);
         let (rtx, _rrx) = rtrb::RingBuffer::<RetiredResource>::new(8);

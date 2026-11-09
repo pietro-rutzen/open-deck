@@ -3,10 +3,11 @@
 //! Threading: the real-time audio engine (`compas-audio`) lives on its own thread
 //! because `cpal::Stream` is not `Send`. Tauri commands send coarse [`EngineMsg`]s over
 //! an mpsc channel; the engine thread forwards them as lock-free `AudioCommand`s.
-//! Decoding runs on a shared worker and can publish playback before analysis.
+//! Decoding runs on one worker thread per deck and can publish playback before analysis.
 //! Analysis uses a second one-slot worker and reports back via Tauri events.
 //! A telemetry thread samples lock-free deck position/state and emits it at UI rate.
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -35,6 +36,7 @@ mod deck_loading;
 mod deck_loads;
 mod deck_meters;
 mod deck_prepare;
+mod deck_restore;
 mod library_analysis;
 mod library_scan;
 #[cfg(target_os = "macos")]
@@ -527,24 +529,32 @@ fn spawn_engine() -> EngineHandle {
             let mut jog_applied = [flx4_runtime::INACTIVE; 2];
             let mut next_retry = Instant::now();
             let mut pending_command: Option<AudioCommand> = None;
+            let mut replay: VecDeque<AudioCommand> = VecDeque::new();
+            let mut decks = deck_restore::DeckRestore::default();
+            let mut held: Option<EngineMsg> = None;
 
             loop {
                 let generation = audio_for_thread.route_generation.load(Ordering::Acquire);
                 if generation != applied {
                     pending_command = None; // old route commands cannot target the new mixer
+                    replay.clear(); // a requested speaker change drops the decks on purpose
                     engine = None;
                 }
-                if let Some(active) = engine.as_ref() {
-                    if active.stream_failed() {
-                        let msg = active
+                let stream_error = engine.as_ref().and_then(|active| {
+                    active.stream_failed().then(|| {
+                        active
                             .last_stream_error()
-                            .unwrap_or_else(|| "audio stream error".to_string());
-                        tracing::warn!("audio stream unhealthy; restarting: {msg}");
-                        audio_for_thread.mark_error(msg);
-                        pending_command = None;
-                        engine = None;
-                        next_retry = Instant::now();
-                    }
+                            .unwrap_or_else(|| "audio stream error".to_string())
+                    })
+                });
+                if let Some(msg) = stream_error {
+                    tracing::warn!("audio stream unhealthy; restarting: {msg}");
+                    audio_for_thread.mark_error(msg);
+                    replay.clear();
+                    replay.extend(decks.replay(&telemetry_for_thread));
+                    pending_command = None;
+                    engine = None;
+                    next_retry = Instant::now();
                 }
 
                 let route_changed = generation != applied;
@@ -573,14 +583,20 @@ fn spawn_engine() -> EngineHandle {
 
                 if let Some(active) = engine.as_mut() {
                     active.drain_reclaimed();
+                    if !deck_restore::flush(active, &mut replay) {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
                     // Preserve ownership and FIFO order on pressure. Retry on this control
                     // thread, never blocking or destroying an owned buffer in the callback.
                     if let Some(command) = pending_command.take() {
+                        let remembered = deck_restore::DeckRestore::note(&command);
                         if let Err(command) = active.try_send_command(command) {
                             pending_command = Some(command);
                             thread::sleep(Duration::from_millis(1));
                             continue;
                         }
+                        decks.apply(remembered);
                     }
                     for deck in 0..2 {
                         let bits = jog_for_thread[deck].load(Ordering::Acquire);
@@ -592,10 +608,14 @@ fn spawn_engine() -> EngineHandle {
                     }
                 }
 
-                let msg = match rx.recv_timeout(Duration::from_millis(5)) {
-                    Ok(msg) => msg,
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => break,
+                let msg = if let Some(msg) = held.take() {
+                    msg
+                } else {
+                    match rx.recv_timeout(Duration::from_millis(5)) {
+                        Ok(msg) => msg,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
                 };
 
                 if engine.is_none() {
@@ -625,6 +645,11 @@ fn spawn_engine() -> EngineHandle {
                     tracing::warn!("dropped audio command while output device is offline");
                     continue;
                 };
+                if !deck_restore::flush(engine, &mut replay) {
+                    held = Some(msg);
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
 
                 let cmd = match msg {
                     EngineMsg::LatencyProbe { received } => AudioCommand::LatencyProbe { received },
@@ -902,7 +927,11 @@ fn spawn_engine() -> EngineHandle {
                     }
                     EngineMsg::SamplerGain { gain } => AudioCommand::SetSamplerGain { gain },
                 };
-                pending_command = engine.try_send_command(cmd).err();
+                let remembered = deck_restore::DeckRestore::note(&cmd);
+                match engine.try_send_command(cmd) {
+                    Ok(()) => decks.apply(remembered),
+                    Err(command) => pending_command = Some(command),
+                }
             }
         });
 
