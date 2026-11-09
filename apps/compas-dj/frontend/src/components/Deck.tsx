@@ -1,5 +1,6 @@
 import { DeckMeterStrip, MeterMenu, useMeterSelection } from "./DeckMeters";
-import { nextHotCue, formatCueDistance } from "../lib/cueCountdown";
+import { nextHotCue, SHOW_CUE_COUNTDOWN } from "../lib/cueCountdown";
+import { CueCountdownReadout } from "./CueCountdown";
 import { CUE_COLORS } from "../lib/hotCueMarkers";
 import {
   type CSSProperties,
@@ -242,7 +243,9 @@ export function Deck({
     ? { ['--end-light' as string]: endLight }
     : undefined;
   const beatInterval = meta?.beat_interval_sec ?? 0;
-  const nextCue = nextHotCue(state.hotCues, frame, rate, beatInterval, state.loop);
+  const nextCue = SHOW_CUE_COUNTDOWN
+    ? nextHotCue(state.hotCues, frame, rate, beatInterval, state.loop)
+    : null;
   const beatSynced =
     endWarning &&
     beatInterval > 0 &&
@@ -625,14 +628,7 @@ export function Deck({
           })()}
         </div>
         <DeckClock key={ctrl.deck} deck={ctrl.deck} elapsed={fmt(frame, rate)} remaining={'-' + fmt(audibleLeft, rate)} />
-        {nextCue && (
-          <div className="tile" style={{ color: CUE_COLORS[nextCue.slot] }}>
-            <span className="overline" style={{ color: 'inherit' }}>CUE {nextCue.slot + 1} IN</span>
-            <span className="mono tile-val small" style={{ color: 'inherit' }}>
-              {formatCueDistance(nextCue.beats)}
-            </span>
-          </div>
-        )}
+        <CueCountdownReadout cue={nextCue} color={CUE_COLORS[nextCue?.slot ?? 0]} />
       </div>
 
       {/* full-track overview (rekordbox-style): summary waveform, hot-cue/loop markers,

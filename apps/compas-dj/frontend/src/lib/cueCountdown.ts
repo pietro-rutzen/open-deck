@@ -1,10 +1,15 @@
 type LoopBounds = { active: boolean; inFrame: number; outFrame: number };
 
+export type NextHotCue = { slot: number; beats: number };
+
+/** Deck readout of bars and beats until the next hot cue. Flip to show it again. */
+export const SHOW_CUE_COUNTDOWN = false;
+
 /** Source-frame distances are independent of tempo and beatgrid anchor. */
 export function nextHotCue(
   cues: readonly (number | null)[], frame: number, sourceRate: number,
   beatInterval: number, loop: LoopBounds,
-) {
+): NextHotCue | null {
   if (!Number.isFinite(frame) || frame < 0 || !Number.isFinite(sourceRate) ||
       sourceRate <= 0 || !Number.isFinite(beatInterval) || beatInterval <= 0.05) return null;
   const framesPerBeat = beatInterval * sourceRate;
