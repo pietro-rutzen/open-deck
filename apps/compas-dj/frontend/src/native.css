@@ -203,6 +203,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .inspector-empty { flex: 1; height: auto; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; text-align: center; color: var(--text-tertiary); font-size: 11px; line-height: 1.6; }
 .inspector-empty svg { opacity: .4; }
 .statusbar { height: 25px; font: 10px var(--font-ui); background: #292a2e; color: #9b9da8; border-top: 1px solid #151619; }
+.st-notice { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .app[data-contrast="high"] { --bg-window: #151619; --text-secondary: #d0d1d8; --text-tertiary: #b4b6c0; }
 .app[data-contrast="high"] .tl-artist, .app[data-contrast="high"] .src-group, .app[data-contrast="high"] .inspector-rows dt { color: #c7c9d1; }
 @media (max-width: 1320px) { .titlebar { gap: 12px; } .build-chip { display: none; } }

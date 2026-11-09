@@ -5,7 +5,7 @@
 //! path — it's plain blocking `rusqlite` behind a `Mutex`, called only from Tauri commands.
 //! A track's absolute file path is its identity (matching `DeckLoadedEvent.path`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -127,6 +127,150 @@ pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Db> {
         [],
     );
     Ok(Db(Mutex::new(conn)))
+}
+
+pub struct OpenedLibrary {
+    pub db: Db,
+    /// Shown when the previous file could not be read and was kept under a new name.
+    pub notice: Option<String>,
+}
+
+/// Open the library, or move an unreadable file aside and start an empty one.
+/// A busy, locked, or non-file path is left where it is.
+pub fn open_library(path: impl AsRef<Path>) -> Result<OpenedLibrary, String> {
+    let path = path.as_ref();
+    // SQLite may unlink a sidecar while rejecting the main file. A hard link keeps those bytes.
+    let wal_hold = hold_sidecar(path, "-wal");
+    let shm_hold = hold_sidecar(path, "-shm");
+    match open(path) {
+        Ok(db) => {
+            discard_hold(&wal_hold);
+            discard_hold(&shm_hold);
+            Ok(OpenedLibrary { db, notice: None })
+        }
+        Err(error) if library_file_should_be_kept_aside(&error) && path.is_file() => {
+            let kept = match quarantine_library_file(path) {
+                Ok(kept) => kept,
+                Err(quarantine_error) => {
+                    discard_hold(&wal_hold);
+                    discard_hold(&shm_hold);
+                    return Err(quarantine_error);
+                }
+            };
+            attach_hold(&wal_hold, &path_with_suffix(&kept, "-wal"));
+            attach_hold(&shm_hold, &path_with_suffix(&kept, "-shm"));
+            match open(path) {
+                Ok(db) => Ok(OpenedLibrary {
+                    db,
+                    notice: Some(format!(
+                        "The library database could not be read. It was kept as {} and a new empty library was started.",
+                        kept.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "the saved copy".to_string())
+                    )),
+                }),
+                Err(replacement) => Err(format!(
+                    "The library database could not be read and was kept as {}. A replacement could not be created: {replacement}",
+                    kept.display()
+                )),
+            }
+        }
+        Err(error) => {
+            discard_hold(&wal_hold);
+            discard_hold(&shm_hold);
+            Err(format!(
+                "The library database could not be read ({error}). The existing path was left in place."
+            ))
+        }
+    }
+}
+
+fn hold_sidecar(path: &Path, suffix: &str) -> Option<PathBuf> {
+    let sidecar = path_with_suffix(path, suffix);
+    if !sidecar.is_file() {
+        return None;
+    }
+    let hold = path_with_suffix(&sidecar, &format!(".hold-{}", std::process::id()));
+    std::fs::hard_link(&sidecar, &hold).ok()?;
+    Some(hold)
+}
+
+fn discard_hold(hold: &Option<PathBuf>) {
+    if let Some(hold) = hold {
+        let _ = std::fs::remove_file(hold);
+    }
+}
+
+fn attach_hold(hold: &Option<PathBuf>, destination: &Path) {
+    let Some(hold) = hold else {
+        return;
+    };
+    if destination.exists() {
+        let _ = std::fs::remove_file(hold);
+        return;
+    }
+    let _ = std::fs::rename(hold, destination);
+}
+
+fn library_file_should_be_kept_aside(error: &rusqlite::Error) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(details, _) => matches!(
+            details.code,
+            rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt
+        ),
+        _ => false,
+    }
+}
+
+fn quarantine_library_file(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or("Library database path has no directory")?;
+    let original = path
+        .file_name()
+        .ok_or("Library database path has no file name")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let mut kept = None;
+    for index in 0..1000 {
+        let candidate = parent.join(format!(
+            "{}.unreadable-{}-{}-{index}",
+            original.to_string_lossy(),
+            stamp,
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            kept = Some(candidate);
+            break;
+        }
+    }
+    let kept = kept.ok_or("Could not choose a name for the unreadable library database")?;
+    std::fs::rename(path, &kept).map_err(|error| error.to_string())?;
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = path_with_suffix(path, suffix);
+        if !sidecar.exists() {
+            continue;
+        }
+        let destination = path_with_suffix(&kept, suffix);
+        if let Err(error) = std::fs::rename(&sidecar, &destination) {
+            for (from, to) in moved.into_iter().rev() {
+                let _ = std::fs::rename(from, to);
+            }
+            let _ = std::fs::rename(&kept, path);
+            return Err(error.to_string());
+        }
+        moved.push((destination, sidecar));
+    }
+    Ok(kept)
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 /// Bump when the offline tempo/key estimator changes so existing rows are analyzed again.
@@ -374,8 +518,9 @@ pub fn remove_track(c: &Connection, path: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Drop library rows under `roots` whose files are gone. A root that is not a directory
-/// (unmounted volume, renamed folder) is ignored so a missing disk cannot empty the library.
+/// Drop library rows under `roots` whose files are confirmed gone. A root that is not a
+/// directory (unmounted volume, renamed folder) is ignored so a missing disk cannot empty
+/// the library. A file that cannot be stated is kept.
 pub fn forget_tracks_missing_under(c: &Connection, roots: &[String]) -> rusqlite::Result<usize> {
     let roots: Vec<String> = roots
         .iter()
@@ -397,7 +542,7 @@ pub fn forget_tracks_missing_under(c: &Connection, roots: &[String]) -> rusqlite
                 || path.starts_with(&format!("{root}/"))
                 || path.starts_with(&format!("{root}\\"))
         });
-        if !inside || Path::new(&path).is_file() {
+        if !inside || !crate::library_scan::file_is_confirmed_missing(Path::new(&path)) {
             continue;
         }
         remove_track(c, &path)?;
@@ -1590,6 +1735,209 @@ mod tests {
             0
         );
         assert!(track_exists(&c, kept.to_str().unwrap()).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "opendeck-db-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn startup_library_cold_open_creates_an_empty_database() {
+        let dir = scratch_dir("cold");
+        let path = dir.join("compas.db");
+        let opened = open_library(&path).unwrap();
+        assert!(opened.notice.is_none());
+        let connection = opened.db.0.lock().unwrap();
+        assert!(list_tracks(&connection).unwrap().is_empty());
+        drop(connection);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_library_empty_file_is_a_new_database() {
+        let dir = scratch_dir("empty");
+        let path = dir.join("compas.db");
+        std::fs::write(&path, b"").unwrap();
+        let opened = open_library(&path).unwrap();
+        assert!(opened.notice.is_none());
+        let connection = opened.db.0.lock().unwrap();
+        assert!(list_tracks(&connection).unwrap().is_empty());
+        drop(connection);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_library_keeps_an_old_schema_and_its_tracks() {
+        let dir = scratch_dir("old");
+        let path = dir.join("compas.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tracks (
+                    path TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    artist TEXT NOT NULL,
+                    duration_ms INTEGER NOT NULL,
+                    bpm REAL,
+                    bpm_confidence REAL,
+                    first_beat_sec REAL,
+                    beat_interval_sec REAL,
+                    key_camelot TEXT,
+                    key_name TEXT,
+                    grid_offset_sec REAL NOT NULL DEFAULT 0,
+                    gain REAL NOT NULL DEFAULT 1.0,
+                    added_at INTEGER NOT NULL,
+                    last_played_at INTEGER,
+                    play_count INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE crates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    is_playlist INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tracks (path, title, artist, duration_ms, added_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!["/music/old.mp3", "Old", "Catalog", 1000, 1],
+            )
+            .unwrap();
+        drop(connection);
+        let opened = open_library(&path).unwrap();
+        assert!(opened.notice.is_none());
+        let connection = opened.db.0.lock().unwrap();
+        assert!(track_exists(&connection, "/music/old.mp3").unwrap());
+        assert_eq!(
+            list_unanalyzed(&connection).unwrap(),
+            vec!["/music/old.mp3".to_string()]
+        );
+        drop(connection);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_library_quarantines_a_corrupt_database_without_deleting_it() {
+        let dir = scratch_dir("corrupt");
+        let path = dir.join("compas.db");
+        let original = b"not a sqlite database";
+        std::fs::write(&path, original).unwrap();
+        std::fs::write(dir.join("compas.db-wal"), b"wal-bytes").unwrap();
+        let opened = open_library(&path).unwrap();
+        let notice = opened.notice.expect("corrupt file is reported");
+        assert!(notice.contains("kept as"));
+        let connection = opened.db.0.lock().unwrap();
+        assert!(list_tracks(&connection).unwrap().is_empty());
+        drop(connection);
+        let kept = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".unreadable-"))
+                    && !name_ends_with_sidecar(entry)
+            })
+            .expect("quarantine file");
+        assert_eq!(std::fs::read(&kept).unwrap(), original);
+        assert_eq!(
+            std::fs::read(path_with_suffix(&kept, "-wal")).unwrap(),
+            b"wal-bytes"
+        );
+        if dir.join("compas.db-wal").exists() {
+            assert_ne!(
+                std::fs::read(dir.join("compas.db-wal")).unwrap(),
+                b"wal-bytes"
+            );
+        }
+        assert!(path.is_file());
+        let held = std::fs::read_dir(&dir).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.contains(".hold-"))
+        });
+        assert!(!held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn name_ends_with_sidecar(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("-wal") || name.ends_with("-shm"))
+    }
+
+    #[test]
+    fn startup_library_leaves_a_database_directory_untouched() {
+        let dir = scratch_dir("directory");
+        let path = dir.join("compas.db");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep.txt"), b"keep").unwrap();
+        let error = match open_library(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("a directory is not a library database"),
+        };
+        assert!(error.contains("left in place"));
+        assert_eq!(std::fs::read(path.join("keep.txt")).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_artwork_cache_with_a_short_blob_is_a_miss() {
+        let connection = mem();
+        add_track(&connection, "/music/a.mp3", "A", "Ar", 1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO track_visuals (path, file_size, modified_ms, peaks, band_peaks)
+                 VALUES (?1, 10, 20, ?2, ?3)",
+                params!["/music/a.mp3", vec![1_u8, 2, 3], vec![4_u8, 5, 6, 7]],
+            )
+            .unwrap();
+        assert!(load_track_visual(&connection, "/music/a.mp3", 10, 20)
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_rescan_keeps_a_track_behind_an_unreadable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("unreadable");
+        let hidden = dir.join("hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        let track = hidden.join("song.mp3");
+        std::fs::write(&track, b"ID3").unwrap();
+        let connection = mem();
+        let track_path = track.to_str().unwrap().to_string();
+        add_track(&connection, &track_path, "Hidden", "A", 1).unwrap();
+        let mut permissions = std::fs::metadata(&hidden).unwrap().permissions();
+        permissions.set_mode(0);
+        std::fs::set_permissions(&hidden, permissions.clone()).unwrap();
+        let removed =
+            forget_tracks_missing_under(&connection, &[dir.to_str().unwrap().to_string()]).unwrap();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hidden, permissions).unwrap();
+        assert_eq!(removed, 0);
+        assert!(track_exists(&connection, &track_path).unwrap());
+        std::fs::remove_file(&track).unwrap();
+        assert_eq!(
+            forget_tracks_missing_under(&connection, &[dir.to_str().unwrap().to_string()]).unwrap(),
+            1
+        );
+        assert!(!track_exists(&connection, &track_path).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

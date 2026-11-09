@@ -538,6 +538,7 @@ button.src-row:hover { background: rgba(255, 255, 255, 0.04); }
 
 /* ===== status bar ===== */
 .statusbar { height: 28px; flex: none; display: flex; align-items: center; gap: 8px; padding: 0 14px; background: var(--bg-rail); border-top: 1px solid var(--border-hairline); font-size: 10px; color: var(--text-tertiary); }
+.st-notice { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .st-engine { display: flex; align-items: center; gap: 6px; }
 .st-dot { width: 7px; height: 7px; border-radius: 50%; }
 .st-dot--ok { background: var(--status-ok); animation: compasPulse 2s ease-in-out infinite; }

@@ -36,6 +36,7 @@ mod deck_loads;
 mod deck_meters;
 mod deck_prepare;
 mod library_analysis;
+mod library_scan;
 #[cfg(target_os = "macos")]
 mod macos_drag;
 mod native_controls;
@@ -1043,6 +1044,7 @@ struct EngineStatus {
     audio_restarting: bool,
     audio_restarts: u64,
     audio_error: Option<String>,
+    library_notice: Option<String>,
     master_device: Option<String>,
     master_requested: Option<String>,
     master_fallback: bool,
@@ -1096,8 +1098,11 @@ fn engine_status(
     state: State<'_, EngineHandle>,
     cue: State<'_, CueState>,
     booth: State<'_, BoothState>,
+    library: State<'_, LibraryNotice>,
 ) -> EngineStatus {
-    engine_status_snapshot(&state, &cue, &booth)
+    let mut status = engine_status_snapshot(&state, &cue, &booth);
+    status.library_notice = library.0.lock().ok().and_then(|notice| notice.clone());
+    status
 }
 
 /// Build the engine-status snapshot from the shared handles. Shared by the `engine_status` command
@@ -1130,6 +1135,7 @@ fn engine_status_snapshot(
         audio_restarting: state.audio.restarting.load(Ordering::Relaxed),
         audio_restarts: state.audio.restarts.load(Ordering::Relaxed),
         audio_error: state.audio.last_error(),
+        library_notice: None,
         master_device: master.connected_device,
         master_requested: master.requested_device,
         master_fallback: master.fallback,
@@ -1198,12 +1204,14 @@ fn export_diagnostics(
     state: State<'_, EngineHandle>,
     cue: State<'_, CueState>,
     booth: State<'_, BoothState>,
+    library: State<'_, LibraryNotice>,
     db: State<'_, db::Db>,
     generated_at: String,
     settings: serde_json::Value,
     dest_path: String,
 ) -> Result<(), String> {
-    let engine = engine_status_snapshot(&state, &cue, &booth);
+    let mut engine = engine_status_snapshot(&state, &cue, &booth);
+    engine.library_notice = library.0.lock().ok().and_then(|notice| notice.clone());
     let rt = EngineLoadEvent {
         load: state.telemetry.rt_load(),
         xruns: state.telemetry.xruns(),
@@ -1629,6 +1637,17 @@ struct FolderWatch {
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
+#[derive(Default)]
+struct LibraryNotice(Mutex<Option<String>>);
+
+fn remember_library_notice(app: &tauri::App, notice: String) {
+    if let Some(library) = app.try_state::<LibraryNotice>() {
+        if let Ok(mut slot) = library.0.lock() {
+            *slot = Some(notice);
+        }
+    }
+}
+
 /// File extensions a folder scan imports.
 const AUDIO_EXTS: &[&str] = &[
     "mp3", "flac", "wav", "m4a", "aac", "ogg", "oga", "aiff", "aif",
@@ -1641,35 +1660,22 @@ pub(crate) fn is_audio_file(p: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Recursively import audio files under `folder` that aren't already in the library; returns how
-/// many were newly imported. The DB lock is taken only per-file (probing runs unlocked), and
-/// recursion depth is bounded to avoid symlink loops. Unreadable entries are skipped.
-fn scan_folder(db: &State<'_, db::Db>, folder: &std::path::Path, depth: u32) -> usize {
-    if depth > 16 {
-        return 0;
-    }
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return 0;
-    };
+/// Import audio files under `folder` that aren't already in the library. The directory walk
+/// does not follow symlinks and stops at a fixed depth. The DB lock is taken only per file.
+fn scan_folder(db: &State<'_, db::Db>, folder: &std::path::Path) -> usize {
     let mut added = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            added += scan_folder(db, &path, depth + 1);
-        } else if ft.is_file() && is_audio_file(&path) {
-            let Some(p) = path.to_str() else { continue };
-            if with_db(db, |c| db::track_exists(c, p)).unwrap_or(false) {
-                continue;
-            }
-            use compas_sources::{AudioSource, LocalFileSource};
-            if let Ok(src) = LocalFileSource::open(p) {
-                let m = src.metadata();
-                let (title, artist) = (m.title.clone(), m.artist.clone());
-                let dur = m.duration_ms.unwrap_or(0) as i64;
-                if with_db(db, |c| db::add_track(c, p, &title, &artist, dur)).is_ok() {
-                    added += 1;
-                }
+    for path in library_scan::collect_audio_files(folder) {
+        let Some(p) = path.to_str() else { continue };
+        if with_db(db, |c| db::track_exists(c, p)).unwrap_or(false) {
+            continue;
+        }
+        use compas_sources::{AudioSource, LocalFileSource};
+        if let Ok(src) = LocalFileSource::open(p) {
+            let m = src.metadata();
+            let (title, artist) = (m.title.clone(), m.artist.clone());
+            let dur = m.duration_ms.unwrap_or(0) as i64;
+            if with_db(db, |c| db::add_track(c, p, &title, &artist, dur)).is_ok() {
+                added += 1;
             }
         }
     }
@@ -1692,7 +1698,7 @@ fn rescan_all_watch_folders(db: &State<'_, db::Db>) -> FolderScan {
     let folders = with_db(db, db::list_watch_folders).unwrap_or_default();
     let mut added = 0;
     for folder in &folders {
-        added += scan_folder(db, std::path::Path::new(folder), 0);
+        added += scan_folder(db, std::path::Path::new(folder));
     }
     let removed = with_db(db, |connection| {
         db::forget_tracks_missing_under(connection, &folders)
@@ -1840,7 +1846,7 @@ fn add_watch_folder(
             }
         }
     }
-    let n = scan_folder(&db, std::path::Path::new(&path), 0);
+    let n = scan_folder(&db, std::path::Path::new(&path));
     if n > 0 {
         let _ = app.emit("library:changed", ());
         kick_analysis(&app);
@@ -4247,14 +4253,19 @@ pub fn run() {
             // Controller engine: owns the script runtime + active mapping; emits controller:update.
             app.manage(controllers::ControllerEngine::spawn(app.handle().clone()));
             headphone::initialize(app.handle());
-            // Open the library DB in the app-data dir. If it fails, log and carry on —
-            // DB-backed commands will then error and the frontend degrades gracefully.
+            app.manage(LibraryNotice::default());
+            // Open the library DB in the app-data dir. A corrupt file is kept under a new
+            // name and an empty library is started. If that also fails, commands error and
+            // the status line explains that the original path was left in place.
             match app.path().app_data_dir() {
                 Ok(dir) => {
                     let _ = std::fs::create_dir_all(&dir);
-                    match db::open(dir.join("compas.db")) {
-                        Ok(database) => {
-                            app.manage(database);
+                    match db::open_library(dir.join("compas.db")) {
+                        Ok(opened) => {
+                            if let Some(notice) = opened.notice {
+                                remember_library_notice(app, notice);
+                            }
+                            app.manage(opened.db);
                             // Re-scan watched folders on launch to pick up files added while
                             // closed, off the main thread; the UI refreshes on `library:changed`.
                             let handle = app.handle().clone();
@@ -4274,10 +4285,17 @@ pub fn run() {
                             // auto-import without a manual rescan.
                             init_folder_watch(app.handle());
                         }
-                        Err(e) => tracing::error!("library DB open failed: {e}"),
+                        Err(error) => {
+                            tracing::error!("{error}");
+                            remember_library_notice(app, error);
+                        }
                     }
                 }
-                Err(e) => tracing::error!("no app-data dir for library DB: {e}"),
+                Err(error) => {
+                    let message = format!("The library database could not be opened ({error}).");
+                    tracing::error!("{message}");
+                    remember_library_notice(app, message);
+                }
             }
             spawn_controller_autoconnect(app.handle().clone());
             Ok(())

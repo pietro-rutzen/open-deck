@@ -46,7 +46,7 @@ export function App() {
   const decks = [deckA, deckB, deckC, deckD];
 
   const [sampleRate, setSampleRate] = useState<number | null>(null);
-  const [audioStatus, setAudioStatus] = useState<Pick<EngineStatus, "audio_online" | "audio_restarting" | "audio_restarts" | "audio_error" | "master_device" | "master_fallback" | "master_embedded_headphones" | "cue_device_latency_secs" | "cue_prime_latency_secs" | "booth_device_latency_secs" | "booth_prime_latency_secs"> | null>(null);
+  const [audioStatus, setAudioStatus] = useState<Pick<EngineStatus, "audio_online" | "audio_restarting" | "audio_restarts" | "audio_error" | "library_notice" | "master_device" | "master_fallback" | "master_embedded_headphones" | "cue_device_latency_secs" | "cue_prime_latency_secs" | "booth_device_latency_secs" | "booth_prime_latency_secs"> | null>(null);
   const [xfade, setXfade] = useState(0.5);
   const [showKeys, setShowKeys] = useState(false);
   const [showMap, setShowMap] = useState(false);
@@ -139,6 +139,7 @@ export function App() {
             audio_restarting: s.audio_restarting,
             audio_restarts: s.audio_restarts,
             audio_error: s.audio_error,
+            library_notice: s.library_notice,
             master_device: s.master_device,
             master_fallback: s.master_fallback,
             master_embedded_headphones: s.master_embedded_headphones,
@@ -156,6 +157,7 @@ export function App() {
             audio_restarting: false,
             audio_restarts: 0,
             audio_error: "engine status unavailable",
+            library_notice: null,
             master_device: null,
             master_fallback: false,
             master_embedded_headphones: false,

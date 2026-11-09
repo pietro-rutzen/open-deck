@@ -187,6 +187,7 @@ export interface EngineStatus {
   command_queue_high_water: number;
   audio_restarts: number;
   audio_error: string | null;
+  library_notice: string | null;
   master_device: string | null;
   master_requested: string | null;
   master_fallback: boolean;

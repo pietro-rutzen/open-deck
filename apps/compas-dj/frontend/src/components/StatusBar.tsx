@@ -3,6 +3,7 @@ type AudioStatus = {
   audio_restarting: boolean;
   audio_restarts: number;
   audio_error: string | null;
+  library_notice: string | null;
   master_device: string | null;
   master_fallback: boolean;
   master_embedded_headphones: boolean;
@@ -35,6 +36,12 @@ export function StatusBar({ sampleRate, audioStatus, beatFxLabel }: { sampleRate
       <span>{ok ? `${(sampleRate / 1000).toFixed(1)} kHz` : "— kHz"}</span>
       <span className="st-sep">·</span>
       <span className="st-rt" title={title}>{output}</span>
+      {audioStatus?.library_notice && (
+        <>
+          <span className="st-sep">·</span>
+          <span className="st-notice" title={audioStatus.library_notice}>{audioStatus.library_notice}</span>
+        </>
+      )}
       {beatFxLabel && (
         <>
           <span className="st-sep">·</span>
