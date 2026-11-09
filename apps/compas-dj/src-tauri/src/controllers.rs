@@ -18,6 +18,18 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
+fn flx4_replaced_default(saved: &str, bundled: &str) -> bool {
+    matches!(
+        (saved, bundled),
+        ("deck.0.jump.forward", "deck.0.loop.memory_save")
+            | ("deck.0.jump.back", "deck.0.loop.memory_delete")
+            | ("deck.0.loop.reloop_stop", "deck.0.loop.memory_active")
+            | ("deck.1.jump.forward", "deck.1.loop.memory_save")
+            | ("deck.1.jump.back", "deck.1.loop.memory_delete")
+            | ("deck.1.loop.reloop_stop", "deck.1.loop.memory_active")
+    )
+}
+
 /// Extend the original built-in snapshot without replacing user-remapped addresses.
 pub(crate) fn upgrade_flx4_profile(mut profile: ControllerProfile) -> ControllerProfile {
     if profile.id == "pioneer-ddj-flx4" && profile.script.is_none() {
@@ -33,6 +45,9 @@ pub(crate) fn upgrade_flx4_profile(mut profile: ControllerProfile) -> Controller
                     if old.control.as_str().starts_with("sampler.")
                         && binding.control.as_str().starts_with("sampler.")
                         && old.control.as_str() != binding.control.as_str()
+                    {
+                        old.control = binding.control;
+                    } else if flx4_replaced_default(old.control.as_str(), binding.control.as_str())
                     {
                         old.control = binding.control;
                     }
@@ -770,6 +785,7 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
     let mut loop_in_holds: [Option<LoopInHold>; 2] = [None, None];
     let mut pad_mode: [Option<u8>; 2] = [None, None];
     let blink_epoch = Instant::now();
+    let mut engine_loop_seen = [false; compas_audio::NUM_DECKS];
     loop {
         let now = Instant::now();
         if flx4_profile && flx4_port && now >= next_keep_alive {
@@ -889,6 +905,43 @@ fn run(app: AppHandle, rx: mpsc::Receiver<ControllerMsg>) {
                             f64::from(nudge_out),
                         ),
                     );
+                }
+            }
+            let jumps = app
+                .state::<crate::flx4_runtime::JogRuntime>()
+                .take_bar_jumps();
+            let performance = app.state::<crate::native_controls::PerformanceState>();
+            let engine = app.state::<crate::EngineHandle>();
+            for (deck, bars) in jumps.into_iter().enumerate() {
+                if bars == 0 {
+                    continue;
+                }
+                let Some(action) = crate::native_controls::bar_jump(
+                    deck,
+                    bars,
+                    telemetry.playhead_frames(deck),
+                    &performance,
+                ) else {
+                    continue;
+                };
+                for message in action.message.into_iter().chain(action.messages) {
+                    if let Err(error) = engine.send(message) {
+                        tracing::warn!("Bar jump could not reach the engine: {error}");
+                    }
+                }
+            }
+        }
+        for deck in 0..compas_audio::NUM_DECKS {
+            let (active, in_frame, out_frame) = telemetry.loop_region(deck);
+            let was = engine_loop_seen[deck];
+            engine_loop_seen[deck] = active;
+            if active && !was {
+                let performance = app.state::<crate::native_controls::PerformanceState>();
+                if let Some(mirror) = performance.adopt_engaged_loop(deck, in_frame, out_frame) {
+                    let mut update =
+                        ControllerUpdateEvent::new(format!("deck.{deck}.loop.memory_active"), 1.0);
+                    update.performance = Some(mirror);
+                    router.batch.mirror.push(update);
                 }
             }
         }
@@ -1810,6 +1863,41 @@ mod tests {
             binding.channel == 7
                 && binding.input == InputKind::Note { note: 48 }
                 && binding.control.as_str() == "sampler.0.trigger"
+        }));
+    }
+    #[test]
+    fn saved_flx4_shift_call_upgrades_only_the_old_defaults() {
+        let bundled: ControllerProfile = serde_json::from_str(include_str!(
+            "../resources/controllers/pioneer-ddj-flx4.json"
+        ))
+        .unwrap();
+        let mut saved = bundled.clone();
+        for binding in saved.bindings.iter_mut() {
+            if binding.channel == 0 && binding.input == (InputKind::Note { note: 61 }) {
+                binding.control = compas_core::ControlId::new("deck.0.jump.forward");
+            }
+            if binding.channel == 0 && binding.input == (InputKind::Note { note: 62 }) {
+                binding.control = compas_core::ControlId::new("deck.0.gain");
+            }
+            if binding.channel == 0 && binding.input == (InputKind::Note { note: 80 }) {
+                binding.control = compas_core::ControlId::new("deck.0.loop.reloop_stop");
+            }
+        }
+        let upgraded = upgrade_flx4_profile(saved);
+        assert!(upgraded.bindings.iter().any(|binding| {
+            binding.channel == 0
+                && binding.input == InputKind::Note { note: 61 }
+                && binding.control.as_str() == "deck.0.loop.memory_save"
+        }));
+        assert!(upgraded.bindings.iter().any(|binding| {
+            binding.channel == 0
+                && binding.input == InputKind::Note { note: 62 }
+                && binding.control.as_str() == "deck.0.gain"
+        }));
+        assert!(upgraded.bindings.iter().any(|binding| {
+            binding.channel == 0
+                && binding.input == InputKind::Note { note: 80 }
+                && binding.control.as_str() == "deck.0.loop.memory_active"
         }));
     }
     #[test]

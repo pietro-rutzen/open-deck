@@ -354,6 +354,14 @@ pub enum AudioCommand {
         deck: usize,
         active: bool,
     },
+    /// Arm a saved loop so playback engages it on the next forward crossing of `in_frame`.
+    /// Disabling it leaves a loop that is already running alone.
+    SetArmedLoop {
+        deck: usize,
+        in_frame: f64,
+        out_frame: f64,
+        enabled: bool,
+    },
     /// Scale the active loop's length by `factor` (0.5 = halve, 2.0 = double), anchored at the
     /// loop-in; the play-head is wrapped to stay inside.
     ScaleLoop {
@@ -525,6 +533,9 @@ pub struct DeckTelemetry {
     tempo_only: [AtomicBool; NUM_DECKS],
     /// True when the deck is parked on its cue point, or previewing from it.
     at_cue: [AtomicBool; NUM_DECKS],
+    loop_active: [AtomicBool; NUM_DECKS],
+    loop_in_bits: [AtomicU64; NUM_DECKS],
+    loop_out_bits: [AtomicU64; NUM_DECKS],
     /// Measured output (DAC) latency in seconds, so the UI can offset the visual play-head to match
     /// what's actually being heard.
     output_latency_bits: AtomicU64,
@@ -556,6 +567,9 @@ impl DeckTelemetry {
             tempo_only: std::array::from_fn(|_| AtomicBool::new(false)),
             tempo_bits: std::array::from_fn(|_| AtomicU64::new(1.0_f64.to_bits())),
             at_cue: std::array::from_fn(|_| AtomicBool::new(false)),
+            loop_active: std::array::from_fn(|_| AtomicBool::new(false)),
+            loop_in_bits: std::array::from_fn(|_| AtomicU64::new(0)),
+            loop_out_bits: std::array::from_fn(|_| AtomicU64::new(0)),
             output_latency_bits: AtomicU64::new(0),
             sampler_playing: AtomicU64::new(0),
         }
@@ -717,6 +731,25 @@ impl DeckTelemetry {
             .get(deck)
             .map(|flag| flag.load(Ordering::Relaxed))
             .unwrap_or(false)
+    }
+
+    /// Transport loop currently wrapping in the engine, with its source-frame bounds.
+    pub fn loop_region(&self, deck: usize) -> (bool, f64, f64) {
+        let active = self
+            .loop_active
+            .get(deck)
+            .is_some_and(|flag| flag.load(Ordering::Relaxed));
+        let in_frame = self
+            .loop_in_bits
+            .get(deck)
+            .map(|bits| f64::from_bits(bits.load(Ordering::Relaxed)))
+            .unwrap_or(0.0);
+        let out_frame = self
+            .loop_out_bits
+            .get(deck)
+            .map(|bits| f64::from_bits(bits.load(Ordering::Relaxed)))
+            .unwrap_or(0.0);
+        (active, in_frame, out_frame)
     }
 }
 
@@ -1011,6 +1044,10 @@ struct DeckPlayer {
     loop_active: bool,
     loop_in: f64,
     loop_out: f64,
+    /// Saved loop that engages itself the next time playback crosses `armed_in`.
+    armed_loop: bool,
+    armed_in: f64,
+    armed_out: f64,
     /// Loop-roll (momentary loop with slip): while active, `slip_playhead` advances at the
     /// normal play rate without looping; releasing the roll snaps `playhead` to it.
     roll_active: bool,
@@ -1072,6 +1109,9 @@ impl DeckPlayer {
             loop_active: false,
             loop_in: 0.0,
             loop_out: 0.0,
+            armed_loop: false,
+            armed_in: 0.0,
+            armed_out: 0.0,
             roll_active: false,
             slip_playhead: 0.0,
             beat_offset: 0.0,
@@ -1097,6 +1137,9 @@ impl DeckPlayer {
         self.loop_in = 0.0;
         self.loop_out = 0.0;
         self.loop_active = false;
+        self.armed_loop = false;
+        self.armed_in = 0.0;
+        self.armed_out = 0.0;
         self.roll_active = false;
         self.slip_playhead = 0.0;
     }
@@ -1429,11 +1472,23 @@ impl DeckPlayer {
             // Sync (when engaged) overrides the user tempo with the PLL's read rate.
             let rate = self.sync_tempo.unwrap_or(self.tempo) * self.jog_bend;
             let advance = self.base_ratio * rate;
+            let previous = self.playhead;
             self.playhead += advance;
             // Loop-roll slip: the shadow play-head advances unlooped, so a release lands exactly
             // where the track would be had the roll never happened.
             if self.roll_active {
                 self.slip_playhead += advance;
+            }
+            if self.armed_loop
+                && !self.loop_active
+                && !self.roll_active
+                && self.armed_out > self.armed_in
+                && previous < self.armed_in
+                && self.playhead >= self.armed_in
+            {
+                self.loop_in = self.armed_in;
+                self.loop_out = self.armed_out;
+                self.loop_active = true;
             }
             // Beat loop: wrap the play-head back to loop-in once it passes loop-out.
             if self.loop_active && self.loop_out > self.loop_in {
@@ -2406,6 +2461,26 @@ impl Mixer {
                         d.loop_active = active && d.loop_out > d.loop_in;
                     }
                 }
+                AudioCommand::SetArmedLoop {
+                    deck,
+                    in_frame,
+                    out_frame,
+                    enabled,
+                } => {
+                    if let Some(d) = self.decks.get_mut(deck) {
+                        if enabled
+                            && in_frame.is_finite()
+                            && out_frame.is_finite()
+                            && out_frame > in_frame
+                        {
+                            d.armed_loop = true;
+                            d.armed_in = in_frame.max(0.0);
+                            d.armed_out = out_frame.max(0.0);
+                        } else {
+                            d.armed_loop = false;
+                        }
+                    }
+                }
                 AudioCommand::ScaleLoop { deck, factor } => {
                     if let Some(d) = self.decks.get_mut(deck) {
                         d.scale_loop(factor);
@@ -2728,6 +2803,9 @@ impl Mixer {
                 && (d.cue_previewing
                     || (!d.playing && !d.censoring && (d.playhead - d.cue_point).abs() < 1.0));
             self.telemetry.at_cue[i].store(at_cue, Ordering::Relaxed);
+            self.telemetry.loop_active[i].store(d.loop_active, Ordering::Relaxed);
+            self.telemetry.loop_in_bits[i].store(d.loop_in.to_bits(), Ordering::Relaxed);
+            self.telemetry.loop_out_bits[i].store(d.loop_out.to_bits(), Ordering::Relaxed);
         }
         self.telemetry
             .master_l_bits
@@ -3186,6 +3264,81 @@ mod tests {
             "wrapped to loop_in + overshoot: {}",
             d.playhead
         );
+    }
+
+    #[test]
+    fn armed_loop_engages_only_on_a_forward_crossing() {
+        let (_tx, mut mixer) = mixer_with_commands();
+        let deck = &mut mixer.decks[0];
+        deck.base_ratio = 1.0;
+        deck.tempo = 1.0;
+        deck.armed_loop = true;
+        deck.armed_in = 100.0;
+        deck.armed_out = 110.0;
+        deck.playhead = 90.0;
+        deck.advance_playhead(10_000.0);
+        assert!(!deck.loop_active);
+        deck.tempo = 15.0;
+        deck.playhead = 99.5;
+        deck.advance_playhead(10_000.0);
+        assert!(deck.loop_active);
+        assert!((deck.playhead - 104.5).abs() < 1e-9);
+        deck.loop_active = false;
+        deck.playhead = 104.5;
+        deck.advance_playhead(10_000.0);
+        assert!(
+            !deck.loop_active,
+            "exiting inside the region waits for the next pass"
+        );
+        deck.playhead = 99.0;
+        deck.advance_playhead(10_000.0);
+        assert!(deck.loop_active);
+        deck.loop_active = false;
+        deck.loop_in = 10.0;
+        deck.loop_out = 20.0;
+        deck.loop_active = true;
+        deck.playhead = 99.0;
+        deck.advance_playhead(10_000.0);
+        assert!((deck.loop_in - 10.0).abs() < 1e-9);
+        assert!((deck.loop_out - 20.0).abs() < 1e-9);
+        deck.scratching = true;
+        deck.scratch_rate = 20.0;
+        deck.loop_active = false;
+        deck.playhead = 90.0;
+        deck.advance_playhead(10_000.0);
+        assert!(!deck.loop_active);
+        mixer.publish_telemetry();
+        assert!(!mixer.telemetry.loop_region(0).0);
+    }
+
+    #[test]
+    fn seek_into_an_armed_loop_does_not_engage_it() {
+        let (mut tx, mut mixer) = mixer_with_commands();
+        tx.push(AudioCommand::SetArmedLoop {
+            deck: 0,
+            in_frame: 100.0,
+            out_frame: 140.0,
+            enabled: true,
+        })
+        .unwrap();
+        tx.push(AudioCommand::SeekDeck {
+            deck: 0,
+            frame: 120.0,
+        })
+        .unwrap();
+        mixer.drain_commands();
+        assert!(mixer.decks[0].armed_loop);
+        assert!(!mixer.decks[0].loop_active);
+        assert!((mixer.decks[0].playhead - 120.0).abs() < 1e-9);
+        tx.push(AudioCommand::SetArmedLoop {
+            deck: 0,
+            in_frame: 0.0,
+            out_frame: 0.0,
+            enabled: false,
+        })
+        .unwrap();
+        mixer.drain_commands();
+        assert!(!mixer.decks[0].armed_loop);
     }
 
     #[test]

@@ -69,6 +69,16 @@ pub struct ManifestTrack {
     pub cues: Vec<ManifestCue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loops: Vec<ManifestLoop>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_loops: Vec<ManifestMemoryLoop>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ManifestMemoryLoop {
+    pub slot: i64,
+    pub in_frame: f64,
+    pub out_frame: f64,
+    pub active: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -151,6 +161,7 @@ fn gather_track(c: &Connection, path: &str) -> rusqlite::Result<ManifestTrack> {
                 tags: Vec::new(),
                 cues: Vec::new(),
                 loops: Vec::new(),
+                memory_loops: Vec::new(),
             })
         },
     )?;
@@ -179,6 +190,16 @@ fn gather_track(c: &Connection, path: &str) -> rusqlite::Result<ManifestTrack> {
             in_frame: x.in_frame,
             out_frame: x.out_frame,
             beats: x.beats,
+        })
+        .collect();
+    track.memory_loops = state
+        .memory_loops
+        .iter()
+        .map(|x| ManifestMemoryLoop {
+            slot: x.slot,
+            in_frame: x.in_frame,
+            out_frame: x.out_frame,
+            active: x.active,
         })
         .collect();
     Ok(track)
@@ -232,6 +253,21 @@ pub fn apply_manifest(
         for lp in &t.loops {
             crate::db::set_loop(c, &t.path, lp.slot, lp.in_frame, lp.out_frame, lp.beats)?;
             summary.loops += 1;
+        }
+        if !t.memory_loops.is_empty() {
+            crate::db::replace_memory_loops(
+                c,
+                &t.path,
+                &t.memory_loops
+                    .iter()
+                    .map(|row| crate::db::MemoryLoopRow {
+                        slot: row.slot,
+                        in_frame: row.in_frame,
+                        out_frame: row.out_frame,
+                        active: row.active,
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
         }
         for tag in &t.tags {
             crate::db::add_tag(c, &t.path, tag)?;
@@ -465,6 +501,17 @@ mod tests {
         crate::db::set_cue(c, path, 0, 44_100.0).unwrap();
         crate::db::set_cue(c, path, 1, 88_200.0).unwrap();
         crate::db::set_loop(c, path, 0, 100.0, 200.0, Some(4.0)).unwrap();
+        crate::db::replace_memory_loops(
+            c,
+            path,
+            &[crate::db::MemoryLoopRow {
+                slot: 0,
+                in_frame: 1_000.0,
+                out_frame: 5_000.0,
+                active: true,
+            }],
+        )
+        .unwrap();
         crate::db::add_tag(c, path, "banger").unwrap();
         crate::db::add_tag(c, path, "peak-time").unwrap();
     }
@@ -521,6 +568,8 @@ mod tests {
         assert_eq!(t.cues.len(), 2);
         assert_eq!(t.loops.len(), 1);
         assert_eq!(t.loops[0].beats, Some(4.0));
+        assert_eq!(t.memory_loops.len(), 1);
+        assert!(t.memory_loops[0].active);
         assert_eq!(t.tags, vec!["banger".to_string(), "peak-time".to_string()]);
 
         // Apply without recreating a crate: tracks/state land but no crate is made.
@@ -532,6 +581,9 @@ mod tests {
         assert_eq!(state.gain, 0.8);
         assert_eq!(state.cues.len(), 2);
         assert_eq!(state.loops.len(), 1);
+        assert_eq!(state.memory_loops.len(), 1);
+        assert!(state.memory_loops[0].active);
+        assert_eq!(state.memory_loops[0].in_frame, 1_000.0);
     }
 
     #[test]

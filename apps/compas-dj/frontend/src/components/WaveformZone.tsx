@@ -1,6 +1,7 @@
 import "./phaseMeter.css";
 import { phaseInBar } from "../lib/phaseMeter";
 import { hotCueMarkers } from "../lib/hotCueMarkers";
+import { memoryLoopColor, memoryLoopSpans } from "../lib/memoryLoops";
 import { type CSSProperties, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { useElementSize } from "../hooks/useElementSize";
 import type { DeckState } from "../hooks/useDeck";
@@ -416,6 +417,22 @@ const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; vi
         <div ref={scrollRef} className="wf-scroll">
           <svg className="wf-svg" viewBox={`0 0 ${Math.max(1, VW * WAVE_SPAN)} ${VH}`} preserveAspectRatio="none">
             <WaveGraphic peaks={peaks} bands={bands} origin={origin} binSec={binSec} view={view} width={VW} height={VH} beatInterval={beatInterval} beatOffset={beatOffset} stretch={stretch} />
+            {memoryLoopSpans(state.memoryLoops, sr, stretch, origin, view, VW * WAVE_SPAN).map((span) => (
+              <rect
+                key={`memory-${span.slot}`}
+                x={span.x}
+                y={0}
+                width={span.width}
+                height={VH}
+                fill={memoryLoopColor(span.active)}
+                fillOpacity={span.active ? 0.22 : 0.14}
+                stroke={memoryLoopColor(span.active)}
+                strokeWidth={span.active ? 1.5 : 1}
+                vectorEffect="non-scaling-stroke"
+              >
+                <title>{span.active ? "Active loop" : "Memory loop"}</title>
+              </rect>
+            ))}
             {state.loop.active && state.loop.outFrame > state.loop.inFrame && (
               <rect
                 x={(state.loop.inFrame / sr / stretch - origin) * (VW / Math.max(view, 0.001))}

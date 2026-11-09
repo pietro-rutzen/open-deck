@@ -2,6 +2,7 @@ import { DeckMeterStrip, MeterMenu, useMeterSelection } from "./DeckMeters";
 import { nextHotCue, SHOW_CUE_COUNTDOWN } from "../lib/cueCountdown";
 import { CueCountdownReadout } from "./CueCountdown";
 import { CUE_COLORS } from "../lib/hotCueMarkers";
+import { memoryLoopColor, memoryLoopFractions, memoryMatchesLoop } from "../lib/memoryLoops";
 import {
   type CSSProperties,
   memo,
@@ -641,6 +642,8 @@ export function Deck({
         onSeek={actions.seekFrac}
         ending={endWarning}
         beat={beatSynced}
+        onStoreMemory={actions.storeMemoryLoop}
+        onToggleActive={actions.toggleActiveLoop}
       />
 
       <div className="deck-body">
@@ -1252,18 +1255,57 @@ const OverviewWave = memo(function OverviewWave({
   );
 });
 
+function OverviewMarks({
+  state,
+  onStoreMemory,
+  onToggleActive,
+}: {
+  state: DeckState;
+  onStoreMemory: () => void;
+  onToggleActive: () => void;
+}) {
+  const meta = state.meta;
+  const stored = memoryMatchesLoop(state.memoryLoops, state.loop.inFrame, state.loop.outFrame);
+  const active = state.memoryLoops.some((loop) => loop.active);
+  const region = state.loop.outFrame > state.loop.inFrame;
+  return (
+    <div className="ov-marks" onPointerDown={(event) => event.stopPropagation()}>
+      <button
+        type="button"
+        className={`sq-check${stored ? " sq-check--on" : ""}`}
+        title="Memory loop"
+        aria-pressed={stored}
+        disabled={!meta || !region}
+        onClick={onStoreMemory}
+      />
+      <button
+        type="button"
+        className={`sq-check sq-check--active${active ? " sq-check--on" : ""}`}
+        title="Active loop"
+        aria-pressed={active}
+        disabled={!meta || (state.memoryLoops.length === 0 && !region)}
+        onClick={onToggleActive}
+      />
+    </div>
+  );
+}
+
 function OverviewBar({
   state,
   color,
   onSeek,
   ending,
   beat,
+  onStoreMemory,
+  onToggleActive,
 }: {
   state: DeckState;
   color: string;
   onSeek: (frac: number) => void;
   ending: boolean;
   beat: boolean;
+  onStoreMemory: () => void;
+  onToggleActive: () => void;
 }) {
   const meta = state.meta;
   const frames = meta?.frames ?? 0;
@@ -1271,7 +1313,11 @@ function OverviewBar({
   const dragging = useRef(false);
 
   if (!meta || peaks.length === 0 || frames <= 0) {
-    return <div className="overview overview--empty" />;
+    return (
+      <div className="overview overview--empty">
+        <OverviewMarks state={state} onStoreMemory={onStoreMemory} onToggleActive={onToggleActive} />
+      </div>
+    );
   }
 
   const seekAt = (clientX: number, el: HTMLElement) => {
@@ -1308,6 +1354,18 @@ function OverviewBar({
     >
       <OverviewWave peaks={peaks} bands={meta.band_peaks ?? []} />
       <OverviewPlayhead state={state} color={color} />
+      {memoryLoopFractions(state.memoryLoops, frames).map((span) => (
+        <div
+          key={`memory-${span.slot}`}
+          className="ov-memory"
+          style={{
+            left: `${span.left * 100}%`,
+            width: `${span.width * 100}%`,
+            background: `${memoryLoopColor(span.active)}33`,
+            borderColor: memoryLoopColor(span.active),
+          }}
+        />
+      ))}
       {loop.active && loopRight > loopLeft && (
         <div
           className="ov-loop"
@@ -1331,6 +1389,7 @@ function OverviewBar({
           />
         ),
       )}
+      <OverviewMarks state={state} onStoreMemory={onStoreMemory} onToggleActive={onToggleActive} />
     </div>
   );
 }

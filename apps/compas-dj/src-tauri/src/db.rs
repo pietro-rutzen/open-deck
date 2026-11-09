@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Managed Tauri state: the single long-lived connection behind a mutex.
 pub struct Db(pub Mutex<Connection>);
@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS loops (
     in_frame   REAL NOT NULL,
     out_frame  REAL NOT NULL,
     beats      REAL,
+    PRIMARY KEY (track_path, slot)
+);
+
+CREATE TABLE IF NOT EXISTS memory_loops (
+    track_path TEXT NOT NULL REFERENCES tracks(path) ON DELETE CASCADE,
+    slot       INTEGER NOT NULL,
+    in_frame   REAL NOT NULL,
+    out_frame  REAL NOT NULL,
+    active     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (track_path, slot)
 );
 
@@ -316,6 +325,14 @@ pub struct LoopRow {
     pub beats: Option<f64>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct MemoryLoopRow {
+    pub slot: i64,
+    pub in_frame: f64,
+    pub out_frame: f64,
+    pub active: bool,
+}
+
 /// Everything needed to restore a deck when a track is reloaded.
 #[derive(Serialize)]
 pub struct TrackState {
@@ -323,6 +340,7 @@ pub struct TrackState {
     pub gain: f64,
     pub cues: Vec<CueRow>,
     pub loops: Vec<LoopRow>,
+    pub memory_loops: Vec<MemoryLoopRow>,
 }
 
 #[derive(Serialize)]
@@ -580,6 +598,7 @@ fn point_track(c: &Connection, from: &str, to: &str) -> rusqlite::Result<()> {
     for statement in [
         "UPDATE cues SET track_path = ?2 WHERE track_path = ?1",
         "UPDATE loops SET track_path = ?2 WHERE track_path = ?1",
+        "UPDATE memory_loops SET track_path = ?2 WHERE track_path = ?1",
         "UPDATE history SET track_path = ?2 WHERE track_path = ?1",
         "UPDATE crate_tracks SET track_path = ?2 WHERE track_path = ?1",
         "UPDATE track_tags SET track_path = ?2 WHERE track_path = ?1",
@@ -676,11 +695,26 @@ pub fn track_state(c: &Connection, path: &str) -> rusqlite::Result<TrackState> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let mut memory_stmt = c.prepare(
+        "SELECT slot, in_frame, out_frame, active FROM memory_loops WHERE track_path = ?1 ORDER BY slot",
+    )?;
+    let memory_loops = memory_stmt
+        .query_map(params![path], |r| {
+            Ok(MemoryLoopRow {
+                slot: r.get(0)?,
+                in_frame: r.get(1)?,
+                out_frame: r.get(2)?,
+                active: r.get::<_, i64>(3)? != 0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
     Ok(TrackState {
         grid_offset_sec,
         gain,
         cues,
         loops,
+        memory_loops,
     })
 }
 
@@ -716,6 +750,39 @@ pub fn set_loop(
         params![path, slot, in_frame, out_frame, beats],
     )?;
     Ok(())
+}
+
+pub fn replace_memory_loops(
+    c: &Connection,
+    path: &str,
+    loops: &[MemoryLoopRow],
+) -> rusqlite::Result<()> {
+    let tx = c.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM memory_loops WHERE track_path = ?1",
+        params![path],
+    )?;
+    let mut armed = false;
+    for row in loops.iter().take(8) {
+        if row.slot < 0
+            || row.slot >= 8
+            || !row.in_frame.is_finite()
+            || !row.out_frame.is_finite()
+            || row.out_frame <= row.in_frame
+        {
+            continue;
+        }
+        let active = row.active && !armed;
+        if active {
+            armed = true;
+        }
+        tx.execute(
+            "INSERT INTO memory_loops (track_path, slot, in_frame, out_frame, active)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![path, row.slot, row.in_frame, row.out_frame, active as i64],
+        )?;
+    }
+    tx.commit()
 }
 
 pub fn clear_loop(c: &Connection, path: &str, slot: i64) -> rusqlite::Result<()> {
@@ -1304,6 +1371,55 @@ mod tests {
         let c = Connection::open_in_memory().unwrap();
         c.execute_batch(SCHEMA).unwrap();
         c
+    }
+
+    #[test]
+    fn memory_loops_replace_and_move_with_the_file() {
+        let c = mem();
+        add_track(&c, "/a.wav", "A", "Artist", 1000).unwrap();
+        replace_memory_loops(
+            &c,
+            "/a.wav",
+            &[
+                MemoryLoopRow {
+                    slot: 0,
+                    in_frame: 10.0,
+                    out_frame: 20.0,
+                    active: true,
+                },
+                MemoryLoopRow {
+                    slot: 1,
+                    in_frame: 30.0,
+                    out_frame: 40.0,
+                    active: true,
+                },
+            ],
+        )
+        .unwrap();
+        let stored = track_state(&c, "/a.wav").unwrap();
+        assert_eq!(stored.memory_loops.len(), 2);
+        assert!(stored.memory_loops[0].active);
+        assert!(!stored.memory_loops[1].active);
+        replace_memory_loops(
+            &c,
+            "/a.wav",
+            &[MemoryLoopRow {
+                slot: 3,
+                in_frame: 50.0,
+                out_frame: 80.0,
+                active: false,
+            }],
+        )
+        .unwrap();
+        let replaced = track_state(&c, "/a.wav").unwrap();
+        assert_eq!(replaced.memory_loops.len(), 1);
+        assert_eq!(replaced.memory_loops[0].slot, 3);
+        relocate_tracks(&c, &[("/a.wav".to_string(), "/b.wav".to_string())]).unwrap();
+        assert!(track_state(&c, "/a.wav").unwrap().memory_loops.is_empty());
+        assert_eq!(
+            track_state(&c, "/b.wav").unwrap().memory_loops[0].in_frame,
+            50.0
+        );
     }
 
     #[test]

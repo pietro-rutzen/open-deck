@@ -19,6 +19,8 @@ pub(crate) struct JogAction {
     pub bend: bool,
     /// Non-zero while a loop-edge adjust is held: raw platter counts, not a playback rate.
     pub nudge: i16,
+    /// SHIFT+platter (CC 41). One count is one bar; zero for every other gesture.
+    pub bars: i16,
 }
 #[derive(Clone, Copy, Default)]
 enum Mode {
@@ -73,6 +75,7 @@ impl JogState {
                 active: false,
                 speed: 0.0,
                 nudge: 0,
+                bars: 0,
             });
         }
         None
@@ -96,7 +99,10 @@ impl JogState {
         }
         let s = &mut self.decks[deck];
         let kind = status & 0xf0;
-        if matches!(kind, 0x80 | 0x90) && matches!(d1, 54 | 103) {
+        if matches!(kind, 0x80 | 0x90) && d1 == 103 {
+            return None;
+        }
+        if matches!(kind, 0x80 | 0x90) && d1 == 54 {
             let pressed = kind == 0x90 && d2 != 0;
             s.touched = pressed;
             s.last_motion = None;
@@ -110,6 +116,7 @@ impl JogState {
                         active: false,
                         speed: 0.0,
                         nudge: 0,
+                        bars: 0,
                     });
                 }
                 return None;
@@ -122,6 +129,7 @@ impl JogState {
                     active: true,
                     speed: 0.0,
                     nudge: 0,
+                    bars: 0,
                 });
             }
             if !pressed && !matches!(s.mode, Mode::Idle) {
@@ -132,6 +140,7 @@ impl JogState {
                     active: false,
                     speed: 0.0,
                     nudge: 0,
+                    bars: 0,
                 });
             }
             return None;
@@ -142,6 +151,19 @@ impl JogState {
         let delta = i16::from(d2) - 64;
         if delta == 0 {
             return None;
+        }
+        if d1 == 41 {
+            s.mode = Mode::Idle;
+            s.moving = false;
+            s.last_motion = None;
+            return Some(JogAction {
+                deck,
+                bend: false,
+                active: false,
+                speed: 0.0,
+                nudge: 0,
+                bars: delta,
+            });
         }
         if d1 == 34 {
             s.vinyl = true;
@@ -163,9 +185,10 @@ impl JogState {
                 active: false,
                 speed: 0.0,
                 nudge: delta,
+                bars: 0,
             });
         }
-        if s.touched && s.vinyl && matches!(d1, 34 | 41) {
+        if s.touched && s.vinyl && d1 == 34 {
             s.mode = Mode::Hold;
             s.moving = true;
             return Some(JogAction {
@@ -174,6 +197,7 @@ impl JogState {
                 active: true,
                 speed: (f64::from(delta) * SECONDS_PER_COUNT / dt).clamp(-16.0, 16.0),
                 nudge: 0,
+                bars: 0,
             });
         }
         // Side/non-vinyl movement bends a running deck only. Never make a paused deck audible.
@@ -187,6 +211,7 @@ impl JogState {
                 active: true,
                 speed: 1.0 + bend,
                 nudge: 0,
+                bars: 0,
             });
         }
         // A paused non-vinyl/side event must also clear any previous scratch override.
@@ -199,6 +224,7 @@ impl JogState {
                 active: false,
                 speed: 0.0,
                 nudge: 0,
+                bars: 0,
             });
         }
         None
@@ -223,6 +249,7 @@ impl JogState {
                 active: true,
                 speed: 0.0,
                 nudge: 0,
+                bars: 0,
             })
         } else {
             s.mode = Mode::Idle;
@@ -232,6 +259,7 @@ impl JogState {
                 active: false,
                 speed: 0.0,
                 nudge: 0,
+                bars: 0,
             })
         }
     }
@@ -247,6 +275,7 @@ impl JogState {
             active: false,
             speed: 0.0,
             nudge: 0,
+            bars: 0,
         })
     }
 }
@@ -279,6 +308,7 @@ mod tests {
                 active: true,
                 speed: 0.0,
                 nudge: 0,
+                bars: 0,
             })
         );
         assert!(s.tick(0, now + Duration::from_secs(2)).is_none());
@@ -298,16 +328,40 @@ mod tests {
         let now = Instant::now();
         let mut s = JogState::default();
         assert!(event(&mut s, 0x92, 54, 127, now, true).is_none());
-        event(&mut s, 0x91, 103, 127, now, false);
-        assert_eq!(
-            event(&mut s, 0xb1, 41, 127, now, false).unwrap().speed,
-            16.0
-        );
+        assert!(event(&mut s, 0x91, 103, 127, now, false).is_none());
+        assert!(event(&mut s, 0x81, 103, 0, now, false).is_none());
+        event(&mut s, 0x90, 54, 127, now, true);
+        assert_eq!(event(&mut s, 0xb0, 34, 127, now, true).unwrap().speed, 16.0);
+        let released = event(&mut s, 0xb0, 41, 65, now, true).unwrap();
+        assert_eq!(released.bars, 1);
+        assert!(!released.active);
         assert!(s.reset(0).is_none());
-        assert!(!event(&mut s, 0x81, 103, 127, now, false).unwrap().active);
-        assert!(s.reset(1).is_none());
         event(&mut s, 0x90, 54, 127, now, true);
         assert!(!s.reset(0).unwrap().active);
+    }
+
+    #[test]
+    fn shift_platter_counts_bars_without_scratch_or_bend() {
+        let now = Instant::now();
+        let mut paused = JogState::default();
+        let back = event(&mut paused, 0xb0, 41, 63, now, false).unwrap();
+        assert_eq!(
+            (back.deck, back.bars, back.active, back.nudge),
+            (0, -1, false, 0)
+        );
+        assert!(event(&mut paused, 0xb0, 33, 65, now, false).is_none());
+        let mut playing = JogState::default();
+        event(&mut playing, 0x90, 54, 127, now, true);
+        let forward = event(&mut playing, 0xb1, 41, 66, now, true).unwrap();
+        assert_eq!(
+            (forward.deck, forward.bars, forward.active, forward.bend),
+            (1, 2, false, false)
+        );
+        assert!(event(&mut playing, 0xb0, 33, 65, now, true).unwrap().bend);
+        playing.set_adjust(0, 1);
+        let during_trim = event(&mut playing, 0xb0, 41, 65, now, true).unwrap();
+        assert_eq!(during_trim.bars, 1);
+        assert_eq!(during_trim.nudge, 0);
     }
     #[test]
     fn ignores_unrelated_center_and_invalid_and_sanitizes_tempo() {

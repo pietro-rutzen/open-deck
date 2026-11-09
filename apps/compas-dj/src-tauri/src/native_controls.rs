@@ -273,6 +273,8 @@ const BEAT_JUMP_BEATS: [f64; HOT_CUES] = [-1.0, 1.0, -2.0, 2.0, -4.0, 4.0, -8.0,
 const JUMP_SCALE_MIN: f64 = 1.0 / 16.0;
 const JUMP_SCALE_MAX: f64 = 16.0;
 const LOOP_MIN_FRAMES: f64 = 8.0;
+const MEMORY_LOOPS: usize = 8;
+const SAME_LOOP_FRAMES: f64 = 1.0;
 
 /// Display state for a controller action the engine has already applied.
 #[derive(Serialize, Clone, Default)]
@@ -297,6 +299,24 @@ pub(crate) struct PerformanceMirror {
     pub quantize: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub synced: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<Vec<MemoryPoint>>,
+}
+
+/// One saved loop on a track. Slot 0 of the transport `loops` table is not used for these.
+#[derive(Serialize, Clone, Copy)]
+pub(crate) struct MemoryPoint {
+    pub slot: u8,
+    pub in_frame: f64,
+    pub out_frame: f64,
+    pub active: bool,
+}
+
+#[derive(Clone, Copy)]
+struct MemoryLoop {
+    in_frame: f64,
+    out_frame: f64,
+    active: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -325,6 +345,8 @@ struct DeckSnapshot {
     keyboard_restore: Option<f64>,
     keyboard_held: u8,
     keyboard_last: Option<u8>,
+    memory: [Option<MemoryLoop>; MEMORY_LOOPS],
+    memory_selected: Option<usize>,
 }
 
 impl Default for DeckSnapshot {
@@ -350,6 +372,8 @@ impl Default for DeckSnapshot {
             keyboard_restore: None,
             keyboard_held: 0,
             keyboard_last: None,
+            memory: [None; MEMORY_LOOPS],
+            memory_selected: None,
         }
     }
 }
@@ -513,7 +537,70 @@ impl PerformanceState {
             snapshot.keyboard_restore = None;
             snapshot.keyboard_held = 0;
             snapshot.keyboard_last = None;
+            snapshot.memory = [None; MEMORY_LOOPS];
+            snapshot.memory_selected = None;
         });
+    }
+
+    pub(crate) fn set_memory_loops(&self, deck: usize, loops: &[(u8, f64, f64, bool)]) {
+        self.with_deck(deck, |snapshot| {
+            snapshot.memory = [None; MEMORY_LOOPS];
+            snapshot.memory_selected = None;
+            let mut armed = false;
+            for (slot, in_frame, out_frame, active) in loops.iter().copied().take(MEMORY_LOOPS) {
+                let slot = usize::from(slot);
+                if slot >= MEMORY_LOOPS
+                    || !in_frame.is_finite()
+                    || !out_frame.is_finite()
+                    || out_frame <= in_frame
+                {
+                    continue;
+                }
+                let active = active && !armed;
+                if active {
+                    armed = true;
+                }
+                snapshot.memory[slot] = Some(MemoryLoop {
+                    in_frame,
+                    out_frame,
+                    active,
+                });
+            }
+        });
+    }
+
+    pub(crate) fn active_memory(&self, deck: usize) -> Option<(f64, f64)> {
+        self.with_deck(deck, |snapshot| {
+            snapshot
+                .memory
+                .iter()
+                .flatten()
+                .find(|region| region.active)
+                .map(|region| (region.in_frame, region.out_frame))
+        })?
+    }
+
+    /// The engine engaged the armed loop. Mirror it when the published bounds are that loop.
+    pub(crate) fn adopt_engaged_loop(
+        &self,
+        deck: usize,
+        in_frame: f64,
+        out_frame: f64,
+    ) -> Option<PerformanceMirror> {
+        self.with_deck(deck, |snapshot| {
+            if snapshot.loop_active {
+                return None;
+            }
+            let matched = snapshot.memory.iter().flatten().find(|region| {
+                region.active && same_loop(region.in_frame, region.out_frame, in_frame, out_frame)
+            })?;
+            snapshot.loop_in = matched.in_frame;
+            snapshot.loop_out = matched.out_frame;
+            snapshot.loop_active = true;
+            snapshot.loop_armed = false;
+            snapshot.loop_beats = None;
+            Some(memory_performance(snapshot))
+        })?
     }
 
     pub(crate) fn recall_end(&self, deck: usize, start: f64, end: f64) -> Option<f64> {
@@ -564,6 +651,39 @@ fn snap_beat(frame: f64, offset: f64, interval: f64) -> f64 {
 fn beat_loop_bounds(heard: f64, beats: f64, offset: f64, interval: f64) -> (f64, f64) {
     let in_frame = (offset + ((heard - offset) / interval).round() * interval).max(0.0);
     (in_frame, in_frame + beats * interval)
+}
+
+fn same_loop(in_frame: f64, out_frame: f64, other_in: f64, other_out: f64) -> bool {
+    (in_frame - other_in).abs() < SAME_LOOP_FRAMES
+        && (out_frame - other_out).abs() < SAME_LOOP_FRAMES
+}
+
+fn memory_points(snapshot: &DeckSnapshot) -> Vec<MemoryPoint> {
+    snapshot
+        .memory
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, region)| {
+            region.map(|region| MemoryPoint {
+                slot: slot as u8,
+                in_frame: region.in_frame,
+                out_frame: region.out_frame,
+                active: region.active,
+            })
+        })
+        .collect()
+}
+
+fn memory_performance(snapshot: &DeckSnapshot) -> PerformanceMirror {
+    let mut mirror = loop_mirror(snapshot);
+    mirror.memory = Some(memory_points(snapshot));
+    mirror
+}
+
+fn memory_action(snapshot: &DeckSnapshot, message: Option<EngineMsg>) -> NativeAction {
+    let mut action = single(message, true);
+    action.performance = Some(memory_performance(snapshot));
+    action
 }
 
 fn loop_mirror(snapshot: &DeckSnapshot) -> PerformanceMirror {
@@ -674,8 +794,12 @@ fn apply_performance(
         "loop.in" => arm_loop(deck, heard?, performance),
         "loop.out" => finish_loop(deck, heard?, performance),
         "loop.toggle" => toggle_loop(deck, performance),
-        "loop.half" => scale_loop_action(deck, 0.5, performance),
-        "loop.double" => scale_loop_action(deck, 2.0, performance),
+        "loop.half" => Some(loop_length_or_memory(deck, -1, 0.5, heard, performance)),
+        "loop.double" => Some(loop_length_or_memory(deck, 1, 2.0, heard, performance)),
+        "loop.memory_save" => Some(save_memory(deck, performance)),
+        "loop.memory_delete" => Some(delete_memory(deck, heard, performance)),
+        "loop.memory_forget" => Some(forget_current_memory(deck, performance)),
+        "loop.memory_active" => Some(toggle_active_memory(deck, heard, performance)),
         "loop.reloop_stop" => reloop_stop(deck, performance),
         "jump.back" => beat_jump_action(deck, -4.0, frame?, performance),
         "jump.forward" => beat_jump_action(deck, 4.0, frame?, performance),
@@ -896,6 +1020,58 @@ fn beat_jump_action(
     })?
 }
 
+/// SHIFT+platter. One detent is one bar (4 beats) times the beat-jump scale.
+/// The origin always snaps to the beat grid. The seek does not change play or pause.
+pub(crate) fn bar_jump(
+    deck: usize,
+    bars: i32,
+    from_frame: f64,
+    performance: &PerformanceState,
+) -> Option<NativeAction> {
+    if bars == 0 || !from_frame.is_finite() {
+        return None;
+    }
+    performance.with_deck(deck, |snapshot| {
+        if snapshot.grid_interval <= 0.0 {
+            return None;
+        }
+        let base = snap_beat(from_frame, snapshot.grid_offset, snapshot.grid_interval).max(0.0);
+        let beats = f64::from(bars) * 4.0 * snapshot.jump_scale;
+        let target = (base + beats * snapshot.grid_interval).max(0.0);
+        Some(single(
+            Some(EngineMsg::DeckSeek {
+                deck,
+                frame: target,
+            }),
+            false,
+        ))
+    })?
+}
+
+pub(crate) fn memory_button(
+    deck: usize,
+    name: &str,
+    frame: f64,
+    heard: f64,
+    loaded: bool,
+    performance: &PerformanceState,
+) -> NativeAction {
+    let position = (frame.is_finite() && heard.is_finite()).then_some(CapturedPosition {
+        frame,
+        heard_frame: heard,
+    });
+    apply_performance(
+        deck,
+        name,
+        1.0,
+        loaded,
+        position,
+        &[1.0; NUM_DECKS],
+        performance,
+    )
+    .unwrap_or_else(|| single(None, false))
+}
+
 fn beat_loop_action(
     deck: usize,
     beats: f64,
@@ -1018,6 +1194,268 @@ fn scale_loop_action(
         }
         action
     })
+}
+
+fn loop_length_or_memory(
+    deck: usize,
+    direction: i32,
+    factor: f64,
+    heard: Option<f64>,
+    performance: &PerformanceState,
+) -> NativeAction {
+    let looping = performance
+        .with_deck(deck, |snapshot| snapshot.loop_active)
+        .unwrap_or(false);
+    if looping {
+        scale_loop_action(deck, factor, performance).unwrap_or_else(|| single(None, false))
+    } else {
+        call_memory(deck, direction, heard, performance).unwrap_or_else(|| single(None, false))
+    }
+}
+
+fn ordered_memory(snapshot: &DeckSnapshot) -> Vec<usize> {
+    let mut slots = Vec::new();
+    for (slot, region) in snapshot.memory.iter().enumerate() {
+        if region.is_some() {
+            slots.push(slot);
+        }
+    }
+    slots.sort_by(|&left, &right| {
+        let left_in = snapshot.memory[left]
+            .map(|region| region.in_frame)
+            .unwrap_or(0.0);
+        let right_in = snapshot.memory[right]
+            .map(|region| region.in_frame)
+            .unwrap_or(0.0);
+        left_in.total_cmp(&right_in).then(left.cmp(&right))
+    });
+    slots
+}
+
+fn memory_in(snapshot: &DeckSnapshot, slot: usize) -> f64 {
+    snapshot
+        .memory
+        .get(slot)
+        .and_then(|region| region.map(|region| region.in_frame))
+        .unwrap_or(0.0)
+}
+
+fn nearest_memory(snapshot: &DeckSnapshot, frame: f64) -> Option<usize> {
+    snapshot
+        .memory
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, region)| region.map(|region| (slot, region.in_frame)))
+        .min_by(|left, right| {
+            (left.1 - frame)
+                .abs()
+                .total_cmp(&(right.1 - frame).abs())
+                .then(left.0.cmp(&right.0))
+        })
+        .map(|(slot, _)| slot)
+}
+
+fn arm_message(deck: usize, snapshot: &DeckSnapshot) -> EngineMsg {
+    if let Some(region) = snapshot
+        .memory
+        .iter()
+        .flatten()
+        .find(|region| region.active)
+    {
+        EngineMsg::ArmLoop {
+            deck,
+            in_frame: region.in_frame,
+            out_frame: region.out_frame,
+            enabled: true,
+        }
+    } else {
+        EngineMsg::ArmLoop {
+            deck,
+            in_frame: 0.0,
+            out_frame: 0.0,
+            enabled: false,
+        }
+    }
+}
+
+fn clear_memory_slot(snapshot: &mut DeckSnapshot, slot: usize) {
+    snapshot.memory[slot] = None;
+    if snapshot.memory_selected == Some(slot) {
+        snapshot.memory_selected = None;
+    }
+}
+
+fn save_memory(deck: usize, performance: &PerformanceState) -> NativeAction {
+    performance
+        .with_deck(deck, |snapshot| {
+            if snapshot.loop_out <= snapshot.loop_in {
+                return single(None, false);
+            }
+            if let Some(slot) = snapshot
+                .memory
+                .iter()
+                .enumerate()
+                .find_map(|(slot, stored)| {
+                    (*stored).and_then(|region| {
+                        same_loop(
+                            region.in_frame,
+                            region.out_frame,
+                            snapshot.loop_in,
+                            snapshot.loop_out,
+                        )
+                        .then_some(slot)
+                    })
+                })
+            {
+                snapshot.memory_selected = Some(slot);
+                return memory_action(snapshot, None);
+            }
+            let Some(slot) = snapshot.memory.iter().position(|region| region.is_none()) else {
+                return single(None, false);
+            };
+            snapshot.memory[slot] = Some(MemoryLoop {
+                in_frame: snapshot.loop_in,
+                out_frame: snapshot.loop_out,
+                active: false,
+            });
+            snapshot.memory_selected = Some(slot);
+            memory_action(snapshot, None)
+        })
+        .unwrap_or_else(|| single(None, false))
+}
+
+fn delete_memory(deck: usize, heard: Option<f64>, performance: &PerformanceState) -> NativeAction {
+    performance
+        .with_deck(deck, |snapshot| {
+            let slot = snapshot
+                .memory_selected
+                .filter(|slot| {
+                    snapshot
+                        .memory
+                        .get(*slot)
+                        .is_some_and(|region| region.is_some())
+                })
+                .or_else(|| nearest_memory(snapshot, heard.unwrap_or(0.0)));
+            let Some(slot) = slot else {
+                return single(None, false);
+            };
+            clear_memory_slot(snapshot, slot);
+            memory_action(snapshot, Some(arm_message(deck, snapshot)))
+        })
+        .unwrap_or_else(|| single(None, false))
+}
+
+fn forget_current_memory(deck: usize, performance: &PerformanceState) -> NativeAction {
+    performance
+        .with_deck(deck, |snapshot| {
+            let Some(slot) = snapshot
+                .memory
+                .iter()
+                .enumerate()
+                .find_map(|(slot, region)| {
+                    (*region).and_then(|region| {
+                        same_loop(
+                            region.in_frame,
+                            region.out_frame,
+                            snapshot.loop_in,
+                            snapshot.loop_out,
+                        )
+                        .then_some(slot)
+                    })
+                })
+            else {
+                return single(None, false);
+            };
+            clear_memory_slot(snapshot, slot);
+            memory_action(snapshot, Some(arm_message(deck, snapshot)))
+        })
+        .unwrap_or_else(|| single(None, false))
+}
+
+fn toggle_active_memory(
+    deck: usize,
+    heard: Option<f64>,
+    performance: &PerformanceState,
+) -> NativeAction {
+    performance
+        .with_deck(deck, |snapshot| {
+            let mut slot = nearest_memory(snapshot, heard.unwrap_or(snapshot.loop_in));
+            if slot.is_none() && snapshot.loop_out > snapshot.loop_in {
+                slot = snapshot.memory.iter().position(|region| region.is_none());
+                if let Some(slot) = slot {
+                    snapshot.memory[slot] = Some(MemoryLoop {
+                        in_frame: snapshot.loop_in,
+                        out_frame: snapshot.loop_out,
+                        active: false,
+                    });
+                }
+            }
+            let Some(slot) = slot else {
+                return single(None, false);
+            };
+            let was_active = snapshot
+                .memory
+                .get(slot)
+                .and_then(|region| *region)
+                .is_some_and(|region| region.active);
+            for (index, region) in snapshot.memory.iter_mut().enumerate() {
+                if let Some(region) = region {
+                    region.active = !was_active && index == slot;
+                }
+            }
+            snapshot.memory_selected = Some(slot);
+            memory_action(snapshot, Some(arm_message(deck, snapshot)))
+        })
+        .unwrap_or_else(|| single(None, false))
+}
+
+fn call_memory(
+    deck: usize,
+    direction: i32,
+    heard: Option<f64>,
+    performance: &PerformanceState,
+) -> Option<NativeAction> {
+    performance.with_deck(deck, |snapshot| {
+        let ordered = ordered_memory(snapshot);
+        if ordered.is_empty() {
+            return None;
+        }
+        let index = if let Some(current) = snapshot
+            .memory_selected
+            .and_then(|selected| ordered.iter().position(|slot| *slot == selected))
+        {
+            (current as i32 + direction).rem_euclid(ordered.len() as i32) as usize
+        } else {
+            let heard = heard.unwrap_or(0.0);
+            let at_or_before = ordered
+                .iter()
+                .rposition(|slot| memory_in(snapshot, *slot) <= heard);
+            match (direction.signum(), at_or_before) {
+                (1, Some(index)) => (index + 1) % ordered.len(),
+                (-1, Some(index)) => index,
+                (1, None) => 0,
+                _ => ordered.len() - 1,
+            }
+        };
+        let slot = ordered[index];
+        let Some(region) = snapshot.memory[slot] else {
+            return None;
+        };
+        snapshot.memory_selected = Some(slot);
+        snapshot.loop_in = region.in_frame;
+        snapshot.loop_out = region.out_frame;
+        snapshot.loop_active = true;
+        snapshot.loop_armed = false;
+        snapshot.loop_beats = None;
+        Some(memory_action(
+            snapshot,
+            Some(EngineMsg::RecallLoop {
+                deck,
+                in_frame: region.in_frame,
+                out_frame: region.out_frame,
+            }),
+        ))
+    })?
 }
 
 fn reloop_stop(deck: usize, performance: &PerformanceState) -> Option<NativeAction> {
@@ -1630,6 +2068,109 @@ mod tests {
             quantized.message,
             Some(EngineMsg::DeckSeek { deck: 0, frame }) if (frame - 198_450.0).abs() < 1e-6
         ));
+    }
+
+    #[test]
+    fn bar_jump_snaps_to_the_grid_for_one_bar_per_detent() {
+        let performance = PerformanceState::new();
+        performance.set_grid(0, 0.0, 22_050.0);
+        let forward = bar_jump(0, 1, 30_000.0, &performance).expect("forward");
+        assert!(matches!(
+            forward.message,
+            Some(EngineMsg::DeckSeek { deck: 0, frame }) if (frame - 110_250.0).abs() < 1e-6
+        ));
+        assert!(forward.messages.is_empty());
+        let back = bar_jump(0, -1, 110_250.0, &performance).expect("back");
+        assert!(matches!(
+            back.message,
+            Some(EngineMsg::DeckSeek { deck: 0, frame }) if (frame - 22_050.0).abs() < 1e-6
+        ));
+        performance.set_jump_scale(0, 2.0);
+        let scaled = bar_jump(0, 1, 30_000.0, &performance).expect("scaled");
+        assert!(matches!(
+            scaled.message,
+            Some(EngineMsg::DeckSeek { deck: 0, frame }) if (frame - 198_450.0).abs() < 1e-6
+        ));
+        performance.set_quantize(0, false);
+        let still_snapped = bar_jump(0, 1, 30_000.0, &performance).expect("grid");
+        assert!(matches!(
+            still_snapped.message,
+            Some(EngineMsg::DeckSeek { deck: 0, frame }) if (frame - 198_450.0).abs() < 1e-6
+        ));
+        performance.set_grid(0, 0.0, 0.0);
+        assert!(bar_jump(0, 1, 30_000.0, &performance).is_none());
+        assert!(bar_jump(0, 0, 30_000.0, &performance).is_none());
+    }
+
+    fn memory_points_of(action: &NativeAction) -> Vec<MemoryPoint> {
+        action
+            .performance
+            .as_ref()
+            .and_then(|mirror| mirror.memory.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn memory_loop_saves_calls_and_keeps_a_single_active_loop() {
+        let performance = PerformanceState::new();
+        performance.install_track(0, 0.0, 1_000.0, 48_000.0, 120.0, 20_000);
+        performance.set_loop(0, 1_000.0, 5_000.0, true, false, Some(4.0));
+        let saved = perform("loop.memory_save", Some(at(2_000.0, 1_500.0)), &performance).unwrap();
+        let points = memory_points_of(&saved);
+        assert_eq!(points.len(), 1);
+        assert!(!points[0].active);
+        assert!(saved.message.is_none());
+        let duplicate =
+            perform("loop.memory_save", Some(at(2_000.0, 1_500.0)), &performance).unwrap();
+        assert_eq!(memory_points_of(&duplicate).len(), 1);
+        performance.set_loop(0, 1_000.0, 5_000.0, false, false, Some(4.0));
+        let called = perform("loop.half", Some(at(8_000.0, 7_000.0)), &performance).unwrap();
+        assert!(matches!(
+            called.message,
+            Some(EngineMsg::RecallLoop { deck: 0, in_frame, out_frame })
+                if in_frame == 1_000.0 && out_frame == 5_000.0
+        ));
+        performance.set_loop(0, 1_000.0, 5_000.0, true, false, Some(4.0));
+        let scaled = perform("loop.half", Some(at(2_000.0, 1_500.0)), &performance).unwrap();
+        assert!(
+            matches!(scaled.message, Some(EngineMsg::ScaleLoop { deck: 0, factor }) if factor == 0.5)
+        );
+        performance.set_loop(0, 6_000.0, 9_000.0, false, false, None);
+        perform("loop.memory_save", Some(at(7_000.0, 6_500.0)), &performance).unwrap();
+        let active = perform(
+            "loop.memory_active",
+            Some(at(6_200.0, 6_100.0)),
+            &performance,
+        )
+        .unwrap();
+        let armed = memory_points_of(&active);
+        assert_eq!(armed.iter().filter(|point| point.active).count(), 1);
+        assert!(matches!(
+            active.message,
+            Some(EngineMsg::ArmLoop { deck: 0, enabled: true, in_frame, .. }) if in_frame == 6_000.0
+        ));
+        let cleared = perform(
+            "loop.memory_active",
+            Some(at(6_200.0, 6_100.0)),
+            &performance,
+        )
+        .unwrap();
+        assert!(memory_points_of(&cleared).iter().all(|point| !point.active));
+        assert!(matches!(
+            cleared.message,
+            Some(EngineMsg::ArmLoop {
+                deck: 0,
+                enabled: false,
+                ..
+            })
+        ));
+        let removed = perform(
+            "loop.memory_delete",
+            Some(at(6_200.0, 6_100.0)),
+            &performance,
+        )
+        .unwrap();
+        assert_eq!(memory_points_of(&removed).len(), 1);
     }
 
     #[test]

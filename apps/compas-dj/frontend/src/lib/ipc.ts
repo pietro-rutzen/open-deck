@@ -342,12 +342,19 @@ export interface DbLoop {
   out_frame: number;
   beats: number | null;
 }
+export interface DbMemoryLoop {
+  slot: number;
+  in_frame: number;
+  out_frame: number;
+  active: boolean;
+}
 /** Saved per-track performance state, restored when a track is reloaded onto a deck. */
 export interface DbTrackState {
   grid_offset_sec: number;
   gain: number;
   cues: DbCue[];
   loops: DbLoop[];
+  memory_loops: DbMemoryLoop[];
 }
 export interface DbHistory {
   track_path: string;
@@ -418,6 +425,8 @@ export const dbSetLoop = (
   beats: number | null,
 ) => invoke("db_set_loop", { path, slot, inFrame, outFrame, beats });
 export const dbClearLoop = (path: string, slot: number) => invoke("db_clear_loop", { path, slot });
+export const dbReplaceMemoryLoops = (path: string, loops: DbMemoryLoop[]) =>
+  invoke("db_replace_memory_loops", { path, loops });
 export const dbSetGridOffset = (path: string, sec: number) =>
   invoke("db_set_grid_offset", { path, sec });
 export const dbSetGain = (path: string, gain: number) => invoke("db_set_gain", { path, gain });
@@ -607,6 +616,7 @@ export interface ControllerUpdate {
     jump_scale?: number;
     quantize?: boolean;
     synced?: boolean;
+    memory?: DbMemoryLoop[];
   };
 }
 export const onControllerUpdate = (cb: (u: ControllerUpdate) => void): Promise<UnlistenFn> =>
@@ -756,6 +766,10 @@ export const performanceSetLoop = (
   armed: boolean,
   beats: number | null,
 ) => invoke("performance_set_loop", { deck, inFrame, outFrame, active, armed, beats });
+export const performanceSetMemoryLoops = (deck: number, loops: DbMemoryLoop[]) =>
+  invoke("performance_set_memory_loops", { deck, loops });
+export const deckMemory = (deck: number, action: string) =>
+  invoke<ControllerUpdate["performance"]>("deck_memory", { deck, action });
 export const performanceSetQuantize = (deck: number, enabled: boolean) =>
   invoke("performance_set_quantize", { deck, enabled });
 export const performanceSetJumpScale = (deck: number, scale: number) =>

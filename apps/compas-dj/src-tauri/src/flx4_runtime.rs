@@ -44,6 +44,7 @@ pub(crate) struct JogRuntime {
     adjust: Arc<[AtomicU8; 2]>,
     nudge_in: Arc<[AtomicI32; 2]>,
     nudge_out: Arc<[AtomicI32; 2]>,
+    bars: Arc<[AtomicI32; 2]>,
 }
 impl JogRuntime {
     pub fn spawn(output: JogOutput, telemetry: Arc<DeckTelemetry>) -> Self {
@@ -56,11 +57,13 @@ impl JogRuntime {
             adjust: Arc::new([AtomicU8::new(0), AtomicU8::new(0)]),
             nudge_in: Arc::new([AtomicI32::new(0), AtomicI32::new(0)]),
             nudge_out: Arc::new([AtomicI32::new(0), AtomicI32::new(0)]),
+            bars: Arc::new([AtomicI32::new(0), AtomicI32::new(0)]),
         };
         let state = this.clone();
         let adjust = this.adjust.clone();
         let nudge_in = this.nudge_in.clone();
         let nudge_out = this.nudge_out.clone();
+        let bars = this.bars.clone();
         std::thread::spawn(move || {
             let mut jog = JogState::default();
             let mut epoch = 0;
@@ -123,6 +126,11 @@ impl JogRuntime {
                                 telemetry.is_playing(d),
                                 telemetry.tempo_ratio(d),
                             ) {
+                                if a.bars != 0 {
+                                    if let Some(slot) = bars.get(a.deck) {
+                                        slot.fetch_add(i32::from(a.bars), Ordering::AcqRel);
+                                    }
+                                }
                                 if a.nudge != 0 {
                                     let counts = if edge == 1 { &nudge_in } else { &nudge_out };
                                     if matches!(edge, 1 | 2) {
@@ -159,6 +167,9 @@ impl JogRuntime {
     }
     pub fn reset(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
+        for slot in self.bars.iter() {
+            slot.store(0, Ordering::Release);
+        }
     }
     pub fn set_profile(&self, enabled: bool) {
         self.profile.store(enabled, Ordering::Release);
@@ -173,6 +184,10 @@ impl JogRuntime {
         if let Some(slot) = self.adjust.get(deck) {
             slot.store(edge, Ordering::Release);
         }
+    }
+    /// SHIFT+platter bar counts since the last take. One count is one bar.
+    pub fn take_bar_jumps(&self) -> [i32; 2] {
+        std::array::from_fn(|deck| self.bars[deck].swap(0, Ordering::AcqRel))
     }
     /// Accumulated platter counts since the last take, as `(loop in, loop out)` per deck.
     pub fn take_loop_nudges(&self) -> [(i32, i32); 2] {
@@ -222,9 +237,22 @@ mod tests {
                 adjust: Arc::new([AtomicU8::new(0), AtomicU8::new(0)]),
                 nudge_in: Arc::new([AtomicI32::new(0), AtomicI32::new(0)]),
                 nudge_out: Arc::new([AtomicI32::new(0), AtomicI32::new(0)]),
+                bars: Arc::new([AtomicI32::new(0), AtomicI32::new(0)]),
             },
             rx,
         )
+    }
+
+    #[test]
+    fn bar_counts_are_taken_once_and_cleared_on_reset() {
+        let (jog, _rx) = input(1);
+        jog.bars[0].store(3, Ordering::Release);
+        jog.bars[1].store(-2, Ordering::Release);
+        assert_eq!(jog.take_bar_jumps(), [3, -2]);
+        assert_eq!(jog.take_bar_jumps(), [0, 0]);
+        jog.bars[0].store(4, Ordering::Release);
+        jog.reset();
+        assert_eq!(jog.take_bar_jumps(), [0, 0]);
     }
 
     #[test]

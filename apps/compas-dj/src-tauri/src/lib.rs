@@ -226,6 +226,12 @@ enum EngineMsg {
         deck: usize,
         active: bool,
     },
+    ArmLoop {
+        deck: usize,
+        in_frame: f64,
+        out_frame: f64,
+        enabled: bool,
+    },
     LoopRoll {
         deck: usize,
         in_frame: f64,
@@ -837,6 +843,17 @@ fn spawn_engine() -> EngineHandle {
                     EngineMsg::LoopActive { deck, active } => {
                         AudioCommand::SetLoopActive { deck, active }
                     }
+                    EngineMsg::ArmLoop {
+                        deck,
+                        in_frame,
+                        out_frame,
+                        enabled,
+                    } => AudioCommand::SetArmedLoop {
+                        deck,
+                        in_frame,
+                        out_frame,
+                        enabled,
+                    },
                     EngineMsg::LoopRoll {
                         deck,
                         in_frame,
@@ -2402,6 +2419,15 @@ fn db_clear_loop(db: State<'_, db::Db>, path: String, slot: i64) -> Result<(), S
 }
 
 #[tauri::command]
+fn db_replace_memory_loops(
+    db: State<'_, db::Db>,
+    path: String,
+    loops: Vec<db::MemoryLoopRow>,
+) -> Result<(), String> {
+    with_db(&db, |c| db::replace_memory_loops(c, &path, &loops))
+}
+
+#[tauri::command]
 fn db_set_grid_offset(db: State<'_, db::Db>, path: String, sec: f64) -> Result<(), String> {
     with_db(&db, |c| db::set_grid_offset(c, &path, sec))
 }
@@ -2679,6 +2705,67 @@ fn performance_set_loop(
     beats: Option<f64>,
 ) {
     performance.set_loop(deck, in_frame, out_frame, active, armed, beats);
+}
+
+#[tauri::command]
+fn performance_set_memory_loops(
+    state: State<'_, EngineHandle>,
+    performance: State<'_, native_controls::PerformanceState>,
+    deck: usize,
+    loops: Vec<db::MemoryLoopRow>,
+) -> Result<(), String> {
+    let stored: Vec<(u8, f64, f64, bool)> = loops
+        .iter()
+        .filter_map(|row| {
+            u8::try_from(row.slot)
+                .ok()
+                .map(|slot| (slot, row.in_frame, row.out_frame, row.active))
+        })
+        .collect();
+    performance.set_memory_loops(deck, &stored);
+    let (in_frame, out_frame, enabled) = performance
+        .active_memory(deck)
+        .map(|(in_frame, out_frame)| (in_frame, out_frame, true))
+        .unwrap_or((0.0, 0.0, false));
+    state.send(EngineMsg::ArmLoop {
+        deck,
+        in_frame,
+        out_frame,
+        enabled,
+    })
+}
+
+#[tauri::command]
+fn deck_memory(
+    state: State<'_, EngineHandle>,
+    performance: State<'_, native_controls::PerformanceState>,
+    deck: usize,
+    action: String,
+) -> Result<native_controls::PerformanceMirror, String> {
+    if deck >= compas_audio::NUM_DECKS
+        || !matches!(
+            action.as_str(),
+            "loop.memory_save" | "loop.memory_forget" | "loop.memory_active" | "loop.memory_delete"
+        )
+    {
+        return Err("Unknown memory action".into());
+    }
+    let frame = state.telemetry.playhead_frames(deck);
+    let heard = (frame
+        - state.telemetry.deck_rate(deck) * f64::from(state.telemetry.output_latency_secs()))
+    .max(0.0);
+    let action = native_controls::memory_button(
+        deck,
+        &action,
+        frame,
+        heard,
+        state.telemetry.is_loaded(deck),
+        &performance,
+    );
+    for message in action.message.into_iter().chain(action.messages) {
+        state.send(message)?;
+    }
+    Ok(action.performance.unwrap_or_default())
 }
 
 #[tauri::command]
@@ -4362,6 +4449,7 @@ pub fn run() {
             db_clear_cue,
             db_set_loop,
             db_clear_loop,
+            db_replace_memory_loops,
             db_set_grid_offset,
             db_set_gain,
             db_record_play,
@@ -4396,6 +4484,8 @@ pub fn run() {
             performance_set_hot_cue,
             performance_set_hot_cues,
             performance_set_loop,
+            performance_set_memory_loops,
+            deck_memory,
             performance_set_quantize,
             performance_set_jump_scale,
             performance_set_synced,

@@ -48,6 +48,8 @@ import {
   performanceSetHotCues,
   performanceSetJumpScale,
   performanceSetLoop,
+  performanceSetMemoryLoops,
+  deckMemory,
   performanceSetQuantize,
   performanceSetSynced,
   dbClearCue,
@@ -57,6 +59,7 @@ import {
   dbSetGain,
   dbSetGridOffset,
   dbSetLoop,
+  dbReplaceMemoryLoops,
   dbTrackState,
   dbUpsertAnalysis,
   type ControllerUpdate,
@@ -71,6 +74,7 @@ import {
 import { listeningModeActive } from "../lib/listeningMode";
 import { firstAudibleFrame } from "../lib/silence";
 import { TRIM_MAX } from "../lib/trim";
+import { memoryMatchesLoop, type MemoryLoopPoint } from "../lib/memoryLoops";
 
 export interface LoopState {
   active: boolean;
@@ -96,7 +100,7 @@ export const isNativeDeckControl = (control: string): control is NativeDeckContr
   (NATIVE_DECK_CONTROLS as readonly string[]).includes(control);
 
 const NATIVE_PERFORMANCE_CONTROL =
-  /^(?:hotcue|clear_hotcue|beatloop|beatjump)\.\d$|^(?:loop\.(?:in|out|toggle|half|double|reloop_stop|nudge_in|nudge_out)|jump\.(?:back|forward)|beatjump\.scale_(?:down|up)|quantize|sync)$/;
+  /^(?:hotcue|clear_hotcue|beatloop|beatjump)\.\d$|^(?:loop\.(?:in|out|toggle|half|double|reloop_stop|nudge_in|nudge_out|memory_save|memory_delete|memory_forget|memory_active)|jump\.(?:back|forward)|beatjump\.scale_(?:down|up)|quantize|sync)$/;
 
 /** Cue, loop, jump, quantize, and sync actions the controller thread applies itself. */
 export const isNativePerformanceControl = (control: string): boolean =>
@@ -200,6 +204,7 @@ export interface DeckState {
   volume: number;
   hotCues: (number | null)[];
   loop: LoopState;
+  memoryLoops: MemoryLoopPoint[];
   echo: EchoState;
   reverb: ReverbState;
   flanger: FlangerState;
@@ -258,6 +263,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
   const gainLoadRef = useRef(0);
   const [hotCues, setHotCues] = useState<(number | null)[]>(Array(8).fill(null));
   const [loop, setLoopState] = useState<LoopState>({ active: false, beats: null, inFrame: 0, outFrame: 0 });
+  const [memoryLoops, setMemoryLoops] = useState<MemoryLoopPoint[]>([]);
   const [echo, setEchoState] = useState<EchoState>({ active: false, beats: 0.5, depth: 0.5 });
   const [reverb, setReverbState] = useState<ReverbState>({ active: false, size: 0.6, mix: 0.3 });
   const [flanger, setFlangerState] = useState<FlangerState>({ active: false, beats: 4, depth: 0.6 });
@@ -275,6 +281,8 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
   gridOffsetRef.current = gridOffset;
   const loopRef = useRef(loop);
   loopRef.current = loop;
+  const memoryLoopsRef = useRef(memoryLoops);
+  memoryLoopsRef.current = memoryLoops;
   const echoRef = useRef(echo);
   echoRef.current = echo;
   const reverbRef = useRef(reverb);
@@ -401,6 +409,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         setDeckSyncInternal(deck, false).catch(() => {});
         setHotCues(Array(8).fill(null));
         setLoopState({ active: false, beats: null, inFrame: 0, outFrame: 0 });
+        setMemoryLoops([]);
         // Engine resets FX on load; mirror that (keep the user's param settings).
         setEchoState((e) => ({ ...e, active: false }));
         setReverbState((r) => ({ ...r, active: false }));
@@ -458,6 +467,9 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
                 setLoopState(restored);
                 performanceSetLoop(deck, restored.inFrame, restored.outFrame, false, false, restored.beats).catch(() => {});
               }
+              const memories = st.memory_loops ?? [];
+              setMemoryLoops(memories);
+              performanceSetMemoryLoops(deck, memories).catch(() => {});
             })
             .catch(() => {
               if (pathRef.current !== e.path || gainLoadRef.current !== gainLoad) return;
@@ -851,6 +863,10 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
             setSyncModeState(0);
           }
         }
+        if (mirror?.memory) {
+          setMemoryLoops(mirror.memory);
+          if (canPersist) dbReplaceMemoryLoops(path as string, mirror.memory).catch(swallow);
+        }
         if (mirror?.loop_in == null || mirror.loop_out == null) return;
         const next: LoopState = {
           inFrame: mirror.loop_in,
@@ -943,6 +959,26 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
         publishLoop(next);
       },
       // Pioneer SHIFT+RELOOP: return to the stored loop, engage it and stop on its in-point.
+      storeMemoryLoop: () => {
+        const current = loopRef.current;
+        const stored = memoryMatchesLoop(memoryLoopsRef.current, current.inFrame, current.outFrame);
+        deckMemory(deck, stored ? "loop.memory_forget" : "loop.memory_save")
+          .then((mirror) => {
+            if (!mirror?.memory) return;
+            setMemoryLoops(mirror.memory);
+            if (canPersist) dbReplaceMemoryLoops(path as string, mirror.memory).catch(swallow);
+          })
+          .catch(swallow);
+      },
+      toggleActiveLoop: () => {
+        deckMemory(deck, "loop.memory_active")
+          .then((mirror) => {
+            if (!mirror?.memory) return;
+            setMemoryLoops(mirror.memory);
+            if (canPersist) dbReplaceMemoryLoops(path as string, mirror.memory).catch(swallow);
+          })
+          .catch(swallow);
+      },
       reloopAndStop: () => {
         const l = loopRef.current;
         if (l.outFrame <= l.inFrame) return;
@@ -1147,7 +1183,7 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
     };
   }, [deck, playing, tempo, meta, isLeader, syncLive, syncInternal, applyEcho, applyFlanger]);
 
-  const state: DeckState = useMemo(() => ({ meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, keyPad, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, echo, reverb, flanger, crusher, error, loading, dsp }), [meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, keyPad, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, echo, reverb, flanger, crusher, error, loading, dsp]);
+  const state: DeckState = useMemo(() => ({ meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, keyPad, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, memoryLoops, echo, reverb, flanger, crusher, error, loading, dsp }), [meta, frame, playing, level, rate, latencySecs, frameAt, tempo, tempoRange, beatJumpScale, keylock, pitchShift, keyPad, gridOffset, synced, syncLive, syncInternal, quantize, cueMode, syncMode, isLeader, xfaderAssign, eq, filter, gain, trim, volume, hotCues, loop, memoryLoops, echo, reverb, flanger, crusher, error, loading, dsp]);
   return useMemo(() => ({ state, actions, deck }), [state, actions, deck]);
 }
 
