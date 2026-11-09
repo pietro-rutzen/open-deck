@@ -82,4 +82,43 @@ mod tests {
     fn missing_track_is_an_error() {
         assert!(decode_window(Path::new("/nonexistent-opendeck-fixture.wav")).is_err());
     }
+
+    #[test]
+    fn empty_corrupt_and_odd_rate_files_do_not_panic() {
+        let dir = std::env::temp_dir().join(format!(
+            "opendeck-analysis-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.wav");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(analyze_file(&empty).is_err());
+        let corrupt = dir.join("corrupt.flac");
+        std::fs::write(&corrupt, b"fLaC not a stream").unwrap();
+        assert!(analyze_file(&corrupt).is_err());
+        let slow = dir.join("slow.wav");
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&40u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&1u32.to_le_bytes());
+        wav.extend_from_slice(&4u32.to_le_bytes());
+        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&4u32.to_le_bytes());
+        wav.extend_from_slice(&1_000i16.to_le_bytes());
+        wav.extend_from_slice(&(-1_000i16).to_le_bytes());
+        std::fs::write(&slow, wav).unwrap();
+        let analyzed = analyze_file(&slow);
+        assert!(analyzed.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -183,4 +183,147 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 42);
         assert!(worker.submit(NUM_DECKS, Box::new(|| {})).is_err());
     }
+
+    fn tiny_wav(name: &str, rate: u32) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "opendeck-worker-{name}-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&40u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&(rate * 4).to_le_bytes());
+        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&4u32.to_le_bytes());
+        wav.extend_from_slice(&1_000i16.to_le_bytes());
+        wav.extend_from_slice(&(-1_000i16).to_le_bytes());
+        std::fs::write(&path, wav).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_bad_load_does_not_block_the_other_deck_or_keep_the_old_generation() {
+        let worker = DecodeWorker::new().unwrap();
+        let loads = Arc::new(crate::deck_loads::DeckLoads::default());
+        let good = tiny_wav("good", 48_000);
+        let replacement = tiny_wav("next", 22_050);
+        let missing = std::env::temp_dir().join(format!(
+            "opendeck-worker-missing-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        worker
+            .submit(
+                0,
+                Box::new(move || {
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                }),
+            )
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let installed = Arc::new(Mutex::new(Vec::new()));
+        let first = loads.begin(0, |_| {}).unwrap();
+        let second = loads.begin(0, |_| {}).unwrap();
+        let other = loads.begin(1, |_| {}).unwrap();
+        let submit = |deck, ticket, path: std::path::PathBuf| {
+            let job_loads = loads.clone();
+            let installed = installed.clone();
+            loads
+                .commit(deck, ticket, || {
+                    let current = job_loads.clone();
+                    worker.submit(
+                        deck,
+                        Box::new(move || {
+                            if !current.current(deck, ticket).unwrap_or(false) {
+                                return;
+                            }
+                            if let Ok(Some((buffer, metadata))) =
+                                crate::deck_loading::decode(&path, || {
+                                    current.current(deck, ticket).unwrap_or(false)
+                                })
+                            {
+                                if current.current(deck, ticket).unwrap_or(false) {
+                                    installed.lock().unwrap().push((
+                                        deck,
+                                        metadata.provider_id,
+                                        buffer.frames(),
+                                    ));
+                                }
+                            }
+                        }),
+                    )
+                })
+                .unwrap()
+        };
+        submit(0, first, missing);
+        submit(0, second, replacement.clone());
+        submit(1, other, good.clone());
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while installed.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut got = installed.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (0, replacement.display().to_string(), 1),
+                (1, good.display().to_string(), 1),
+            ]
+        );
+        let _ = std::fs::remove_file(good);
+        let _ = std::fs::remove_file(replacement);
+    }
+
+    #[test]
+    fn a_load_finishes_while_analysis_is_still_running() {
+        let analysis = DecodeWorker::new().unwrap();
+        let decoder = DecodeWorker::new().unwrap();
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        analysis
+            .submit(
+                0,
+                Box::new(move || {
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                }),
+            )
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let path = tiny_wav("during-analysis", 48_000);
+        let (done, finished) = mpsc::channel();
+        let decode_path = path.clone();
+        decoder
+            .submit(
+                1,
+                Box::new(move || {
+                    let decoded = crate::deck_loading::decode(&decode_path, || true);
+                    done.send(decoded.unwrap().unwrap().0.frames()).unwrap();
+                }),
+            )
+            .unwrap();
+        assert_eq!(finished.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        release.send(()).unwrap();
+        let _ = std::fs::remove_file(path);
+    }
 }

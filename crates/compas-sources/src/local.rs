@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use compas_core::{CompasError, MusicProvider, Result, SourceCapabilities, TrackMetadata};
@@ -20,102 +21,164 @@ pub struct LocalFileSource {
     track_id: u32,
     sample_rate: u32,
     channels: u16,
+    declared_frames: Option<u64>,
+    consecutive_packet_errors: u32,
+    skipped_packets: u32,
 }
 
 impl LocalFileSource {
     /// Open and probe a file, preparing a decoder for its default audio track.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path: PathBuf = path.as_ref().to_path_buf();
-        let file = File::open(&path)?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
-
-        let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
+        let path = path.as_ref().to_path_buf();
+        if wav_sample_rate(&path) == Some(0) {
+            return Err(CompasError::Decode("The file has no sample rate".into()));
         }
-
-        let mut probed = symphonia::default::get_probe()
-            .format(
-                &hint,
-                mss,
-                &FormatOptions {
-                    enable_gapless: true,
-                    ..Default::default()
-                },
-                &MetadataOptions {
-                    limit_metadata_bytes: Limit::Maximum(64 * 1024),
-                    limit_visual_bytes: Limit::Maximum(2 * 1024 * 1024),
-                },
-            )
-            .map_err(|e| CompasError::UnsupportedFormat(e.to_string()))?;
-
-        let mut tags = TextTags::default();
-        if let Some(metadata) = probed.metadata.get() {
-            if let Some(revision) = metadata.current() {
-                tags.absorb(revision);
-            }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open_probed(path))) {
+            Ok(result) => result,
+            Err(_) => Err(CompasError::Decode("The file could not be opened".into())),
         }
-        let mut format = probed.format;
-        if let Some(revision) = format.metadata().current() {
+    }
+}
+
+fn wav_sample_rate(path: &Path) -> Option<u32> {
+    let mut file = File::open(path).ok()?;
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return None;
+    }
+    let file_len = file.metadata().ok()?.len();
+    let mut offset = 12u64;
+    while offset.saturating_add(8) <= file_len {
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut chunk = [0u8; 8];
+        file.read_exact(&mut chunk).ok()?;
+        let size = u32::from_le_bytes(chunk[4..8].try_into().ok()?) as u64;
+        if &chunk[0..4] == b"fmt " && size >= 8 {
+            let mut fmt = [0u8; 8];
+            file.read_exact(&mut fmt).ok()?;
+            return Some(u32::from_le_bytes(fmt[4..8].try_into().ok()?));
+        }
+        if size == 0 {
+            break;
+        }
+        offset = offset.saturating_add(8).saturating_add(size + (size & 1));
+    }
+    None
+}
+
+fn open_probed(path: PathBuf) -> Result<LocalFileSource> {
+    let file = File::open(&path)?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let mut probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions {
+                enable_gapless: true,
+                ..Default::default()
+            },
+            &MetadataOptions {
+                limit_metadata_bytes: Limit::Maximum(64 * 1024),
+                limit_visual_bytes: Limit::Maximum(2 * 1024 * 1024),
+            },
+        )
+        .map_err(|e| CompasError::UnsupportedFormat(e.to_string()))?;
+
+    let mut tags = TextTags::default();
+    if let Some(metadata) = probed.metadata.get() {
+        if let Some(revision) = metadata.current() {
             tags.absorb(revision);
         }
-        let track = format
-            .tracks()
-            .iter()
-            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-            .ok_or_else(|| CompasError::Decode("no decodable audio track".into()))?;
+    }
+    let mut format = probed.format;
+    if let Some(revision) = format.metadata().current() {
+        tags.absorb(revision);
+    }
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| CompasError::Decode("no decodable audio track".into()))?;
 
-        let track_id = track.id;
-        let sample_rate = track
-            .codec_params
-            .sample_rate
-            .ok_or_else(|| CompasError::Decode("unknown sample rate".into()))?;
-        let channels = track
-            .codec_params
-            .channels
-            .map(|c| c.count() as u16)
-            .unwrap_or(2);
+    let track_id = track.id;
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| CompasError::Decode("unknown sample rate".into()))?;
+    let channels = track
+        .codec_params
+        .channels
+        .map(|c| c.count() as u16)
+        .unwrap_or(2);
 
-        let duration_ms = match (track.codec_params.n_frames, sample_rate) {
-            (Some(frames), sr) if sr > 0 => Some(frames * 1000 / sr as u64),
-            _ => None,
-        };
+    let declared_frames = track.codec_params.n_frames.filter(|frames| *frames > 0);
+    let duration_ms = match (declared_frames, sample_rate) {
+        (Some(frames), sr) if sr > 0 => Some(frames * 1000 / sr as u64),
+        _ => None,
+    };
 
-        let decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
-            .map_err(|e| CompasError::Decode(e.to_string()))?;
+    let decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| CompasError::Decode(e.to_string()))?;
 
-        let fallback_title = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Unknown")
-            .to_string();
+    let fallback_title = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Unknown")
+        .to_string();
 
-        let metadata = TrackMetadata {
-            id: fallback_title.clone(), // Preserve the existing source identity.
-            // TODO(P1): assign a real UUID at import time.
-            provider: MusicProvider::Local,
-            provider_id: path.to_string_lossy().into_owned(),
-            title: tags.title.unwrap_or(fallback_title),
-            artist: tags
-                .artist
-                .or(tags.album_artist)
-                .unwrap_or_else(|| "Unknown".to_string()),
-            album: tags.album,
-            artwork_url: None,
-            duration_ms,
-            bpm: None,
-            musical_key: None,
-        };
+    let metadata = TrackMetadata {
+        id: fallback_title.clone(), // Preserve the existing source identity.
+        // TODO(P1): assign a real UUID at import time.
+        provider: MusicProvider::Local,
+        provider_id: path.to_string_lossy().into_owned(),
+        title: tags.title.unwrap_or(fallback_title),
+        artist: tags
+            .artist
+            .or(tags.album_artist)
+            .unwrap_or_else(|| "Unknown".to_string()),
+        album: tags.album,
+        artwork_url: None,
+        duration_ms,
+        bpm: None,
+        musical_key: None,
+    };
 
-        Ok(LocalFileSource {
-            metadata,
-            format,
-            decoder,
-            track_id,
-            sample_rate,
-            channels,
-        })
+    Ok(LocalFileSource {
+        metadata,
+        format,
+        decoder,
+        track_id,
+        sample_rate,
+        channels,
+        declared_frames,
+        consecutive_packet_errors: 0,
+        skipped_packets: 0,
+    })
+}
+
+impl LocalFileSource {
+    /// Frames the container header claimed, when it made a claim.
+    pub fn declared_frames(&self) -> Option<u64> {
+        self.declared_frames
+    }
+
+    fn note_bad_packet(&mut self) -> Result<()> {
+        self.consecutive_packet_errors = self.consecutive_packet_errors.saturating_add(1);
+        self.skipped_packets = self.skipped_packets.saturating_add(1);
+        if self.consecutive_packet_errors > 32 || self.skipped_packets > 4_096 {
+            return Err(CompasError::Decode(
+                "The file has too many undecodable audio packets".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -164,11 +227,17 @@ impl PcmSource for LocalFileSource {
                     buf.copy_interleaved_ref(decoded);
                     let src_channels = spec.channels.count();
                     let interleaved = to_stereo(buf.samples(), src_channels);
+                    if interleaved.is_empty() {
+                        self.note_bad_packet()?;
+                        continue;
+                    }
+                    self.consecutive_packet_errors = 0;
                     return Ok(Some(interleaved));
                 }
-                // Recoverable decode errors: skip this packet, keep going.
-                Err(SymphoniaError::DecodeError(msg)) => {
-                    tracing::warn!("recoverable decode error: {msg}");
+                // Recoverable decode errors: skip this packet, keep going, until the file
+                // is clearly not making progress.
+                Err(SymphoniaError::DecodeError(_)) => {
+                    self.note_bad_packet()?;
                     continue;
                 }
                 Err(e) => return Err(CompasError::Decode(e.to_string())),
@@ -355,5 +424,40 @@ mod tests {
     #[test]
     fn open_missing_file_errors() {
         assert!(LocalFileSource::open("does-not-exist.wav").is_err());
+    }
+
+    #[test]
+    fn deleting_or_replacing_an_open_file_does_not_panic() {
+        let path = tagged_flac(&["TITLE=Stay"]);
+        let mut source = LocalFileSource::open(&path).unwrap();
+        let replacement = tagged_flac(&["TITLE=Next"]);
+        std::fs::rename(&replacement, &path).unwrap();
+        let first = source.next_chunk().unwrap().expect("already open file");
+        assert_eq!(first.len(), 32);
+        std::fs::remove_file(&path).unwrap();
+        let rest = source.next_chunk();
+        assert!(rest.is_ok());
+    }
+
+    #[test]
+    fn a_broken_frame_stops_instead_of_spinning() {
+        let path = tagged_flac(&[]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let opened = LocalFileSource::open(&path);
+        if let Ok(mut source) = opened {
+            let mut steps = 0;
+            loop {
+                steps += 1;
+                assert!(steps < 8, "corrupt frame kept producing packets");
+                match source.next_chunk() {
+                    Ok(None) | Err(_) => break,
+                    Ok(Some(samples)) => assert!(samples.iter().all(|sample| sample.is_finite())),
+                }
+            }
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

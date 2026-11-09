@@ -31,13 +31,35 @@ pub fn decode_full(path: impl AsRef<Path>) -> compas_core::Result<(DeckBuffer, T
     let mut source = LocalFileSource::open(path)?;
     let metadata = source.metadata().clone();
     let source_rate = source.sample_rate();
-
-    // Pre-size from the known frame count when available to avoid reallocation churn.
-    let mut samples: Vec<f32> = match metadata.duration_ms {
-        Some(ms) => Vec::with_capacity((ms as usize * source_rate as usize / 1000) * 2),
-        None => Vec::new(),
-    };
+    const MAX_SAMPLES: usize = 512 * 1024 * 1024 / size_of::<f32>();
+    if let Some(frames) = source.declared_frames() {
+        if frames.saturating_mul(2) > MAX_SAMPLES as u64 {
+            return Err(compas_core::CompasError::Decode(
+                "Track exceeds the 512 MiB decoded-audio limit; use a shorter track or a lower sample rate"
+                    .into(),
+            ));
+        }
+    }
+    let reserve = metadata.duration_ms.and_then(|ms| {
+        let samples = (ms as u128)
+            .checked_mul(u128::from(source_rate))?
+            .checked_div(1000)?
+            .checked_mul(2)?;
+        usize::try_from(samples)
+            .ok()
+            .filter(|count| *count <= MAX_SAMPLES)
+    });
+    let mut samples = Vec::new();
+    if let Some(reserve) = reserve {
+        let _ = samples.try_reserve_exact(reserve);
+    }
     while let Some(chunk) = source.next_chunk()? {
+        if samples.len().saturating_add(chunk.len()) > MAX_SAMPLES {
+            return Err(compas_core::CompasError::Decode(
+                "Track exceeds the 512 MiB decoded-audio limit; use a shorter track or a lower sample rate"
+                    .into(),
+            ));
+        }
         samples.extend_from_slice(&chunk);
     }
     Ok((DeckBuffer::new(samples, source_rate), metadata))

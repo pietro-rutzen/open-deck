@@ -60,13 +60,29 @@ pub(crate) fn decode(
         return Err("Deck playback supports sample rates up to 192 kHz".into());
     }
     let metadata = source.metadata().clone();
+    let declared = source.declared_frames();
+    let max_samples = MAX_PCM_BYTES / size_of::<f32>();
+    if let Some(frames) = declared {
+        if frames.saturating_mul(2) > max_samples as u64 {
+            return Err(LIMIT_MESSAGE.into());
+        }
+    }
     // Duration headers are not allocation instructions. Bound actual decoded stereo samples.
     let samples = collect(
         || source.next_chunk().map_err(|e| e.to_string()),
         current,
-        MAX_PCM_BYTES / size_of::<f32>(),
+        max_samples,
     )?;
-    Ok(samples.map(|samples| (DeckBuffer::new(samples, rate), metadata)))
+    let Some(samples) = samples else {
+        return Ok(None);
+    };
+    if let Some(expected) = declared {
+        let got = (samples.len() / 2) as u64;
+        if got < expected {
+            return Err("The file ended before its audio was complete".into());
+        }
+    }
+    Ok(Some((DeckBuffer::new(samples, rate), metadata)))
 }
 
 #[cfg(test)]
@@ -166,5 +182,169 @@ mod tests {
         .unwrap();
         assert!(result.is_none());
         assert_eq!(reads.get(), 1);
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "opendeck-load-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn pcm_wav(rate: u32, channels: u16, interleaved: &[i16], declared_data_bytes: u32) -> Vec<u8> {
+        let bits = 16u16;
+        let block = (channels.max(1) as u32) * u32::from(bits / 8);
+        let byte_rate = rate.saturating_mul(block);
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36u32.saturating_add(declared_data_bytes)).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&channels.to_le_bytes());
+        wav.extend_from_slice(&rate.to_le_bytes());
+        wav.extend_from_slice(&byte_rate.to_le_bytes());
+        wav.extend_from_slice(&(block as u16).to_le_bytes());
+        wav.extend_from_slice(&bits.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&declared_data_bytes.to_le_bytes());
+        for sample in interleaved {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    fn write_case(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn bad_files_fail_without_replacing_a_loaded_track() {
+        let dir = scratch("bad");
+        let stereo = pcm_wav(48_000, 2, &[1000, -1000, 2000, -2000], 8);
+        let previous = write_case(&dir, "previous.wav", &stereo);
+        let loaded = decode(&previous, || true)
+            .unwrap()
+            .expect("playable fixture");
+        let installed = vec![loaded.0.frames()];
+
+        let header_only = {
+            let mut bytes = stereo.clone();
+            bytes.truncate(44);
+            bytes
+        };
+        let truncated = pcm_wav(48_000, 2, &[1000, -1000], 8_000);
+        let cases = [
+            ("empty.wav", Vec::new()),
+            ("zero.wav", pcm_wav(48_000, 2, &[], 0)),
+            ("header.wav", header_only),
+            ("truncated.wav", truncated),
+            ("corrupt.wav", b"not audio".to_vec()),
+            ("notes.wav", b"hello".to_vec()),
+            ("random.bin", vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            ("fast.wav", pcm_wav(192_001, 2, &[1, -1], 4)),
+            ("silent-rate.wav", pcm_wav(0, 2, &[1, -1], 4)),
+            ("no-channels.wav", pcm_wav(48_000, 0, &[], 0)),
+            (
+                "claimed-long.wav",
+                pcm_wav(48_000, 2, &[1, -1, 2, -2], 0x7fff_0000),
+            ),
+        ];
+        for (name, bytes) in cases {
+            let path = write_case(&dir, name, &bytes);
+            let started = std::time::Instant::now();
+            let result = decode(&path, || true);
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{name} took {:?}",
+                started.elapsed()
+            );
+            let error = result.expect_err(name);
+            assert!(!error.is_empty(), "{name}");
+            let step = crate::deck_prepare::prepare_step(1, 512, || true, || Err(error.clone()));
+            assert!(matches!(step, crate::deck_prepare::PrepareStep::Failed(_)));
+            assert_eq!(installed, vec![2], "{name} replaced the previous track");
+        }
+
+        let renamed = dir.join("renamed-away.wav");
+        std::fs::write(&renamed, &stereo).unwrap();
+        std::fs::rename(&renamed, dir.join("renamed-here.wav")).unwrap();
+        assert!(decode(&renamed, || true).is_err());
+
+        let removed = write_case(&dir, "removed.wav", &stereo);
+        std::fs::remove_file(&removed).unwrap();
+        assert!(decode(&removed, || true).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn odd_layouts_and_a_mislabeled_wav_decode_or_fail_cleanly() {
+        let dir = scratch("odd");
+        let playable = [
+            (
+                "mono.wav",
+                pcm_wav(48_000, 1, &[1000, -1000, 500], 6),
+                3usize,
+            ),
+            ("three.wav", pcm_wav(44_100, 3, &[1, 2, 9, 3, 4, 9], 12), 2),
+            ("slow.wav", pcm_wav(1, 2, &[1000, -1000, 500, -500], 8), 2),
+            ("seven.wav", pcm_wav(7, 2, &[1000, -1000], 4), 1),
+            ("cd.wav", pcm_wav(22_050, 2, &[1000, -1000], 4), 1),
+            ("high.wav", pcm_wav(192_000, 2, &[1000, -1000], 4), 1),
+        ];
+        for (name, bytes, frames) in playable {
+            let path = write_case(&dir, name, &bytes);
+            let decoded = decode(&path, || true).unwrap().expect(name);
+            assert_eq!(decoded.0.frames(), frames, "{name}");
+            assert_eq!(decoded.0.samples.len() % 2, 0, "{name}");
+            let step = crate::deck_prepare::prepare_step(
+                3,
+                512,
+                || true,
+                || {
+                    Ok(Some(crate::deck_prepare::decoded_from(
+                        decoded.0.clone(),
+                        decoded.1.clone(),
+                    )))
+                },
+            );
+            assert!(
+                matches!(step, crate::deck_prepare::PrepareStep::Ready(_)),
+                "{name}"
+            );
+            let _ = crate::deck_prepare::measure_analysis(&decoded.0);
+        }
+        let mislabeled = write_case(
+            &dir,
+            "song.mp3",
+            &pcm_wav(48_000, 2, &[1000, -1000, 2000, -2000], 8),
+        );
+        let sniffed = decode(&mislabeled, || true);
+        if let Ok(Some((buffer, _))) = sniffed {
+            assert_eq!(buffer.frames(), 2);
+        }
+        let checks = Cell::new(0);
+        let long = write_case(
+            &dir,
+            "cancel.wav",
+            &pcm_wav(48_000, 2, &[1, -1, 2, -2, 3, -3, 4, -4], 16),
+        );
+        assert!(decode(&long, || {
+            let seen = checks.get();
+            checks.set(seen + 1);
+            seen < 2
+        })
+        .unwrap()
+        .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
