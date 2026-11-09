@@ -404,6 +404,20 @@ mod tests {
     }
 
     #[test]
+    fn startup_without_audio_devices_or_flx4_uses_the_system_output() {
+        let fresh = plan_master(SavedMaster::Unset, &[]);
+        assert_eq!(fresh.open_device, None);
+        assert_eq!(fresh.fallback_from, None);
+        assert_eq!(fresh.embedded_cue_channel, None);
+        let remembered = plan_master(SavedMaster::Device("DDJ-FLX4".into()), &[]);
+        assert_eq!(remembered.open_device, None);
+        assert_eq!(remembered.preferred_device.as_deref(), Some("DDJ-FLX4"));
+        assert_eq!(remembered.fallback_from.as_deref(), Some("DDJ-FLX4"));
+        assert_eq!(remembered.embedded_cue_channel, None);
+        assert_eq!(remembered.remember, None);
+    }
+
+    #[test]
     fn a_missing_saved_controller_falls_back_without_forgetting_it() {
         let plan = plan_master(SavedMaster::Device("DDJ-FLX4".into()), &[laptop()]);
         assert_eq!(plan.open_device, None);

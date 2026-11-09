@@ -148,8 +148,41 @@ pub fn save_profile(dir: &Path, profile: &ControllerProfile) -> Result<PathBuf, 
     };
     let path = dir.join(format!("{id}.json"));
     let json = serde_json::to_string_pretty(profile).map_err(|e| e.to_string())?;
-    fs::write(&path, json).map_err(|e| e.to_string())?;
+    replace_file(&path, json.as_bytes())?;
     Ok(path)
+}
+
+/// Write `bytes` via a temporary file and rename it into place, so a crash cannot
+/// leave a truncated profile where a complete one used to be.
+fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or("Controller profile path has no directory")?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("profile");
+    let temporary = parent.join(format!(".{file_name}-{}-{nonce}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    let result = (|| {
+        use std::io::Write;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|error: std::io::Error| error.to_string())
 }
 
 // ---------------------------------------------------------------------------------
@@ -1914,6 +1947,50 @@ mod tests {
         fs::write(tmp.join("broken.json"), "{ not json").unwrap();
         assert_eq!(list_profiles(&tmp).len(), 1);
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_profile_replace_keeps_the_previous_file_when_the_new_write_cannot_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!(
+            "compas-ctrl-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let mut profile = ControllerProfile {
+            id: "desk".into(),
+            name: "Desk".into(),
+            ..Default::default()
+        };
+        save_profile(&tmp, &profile).unwrap();
+        let saved = fs::read(tmp.join("desk.json")).unwrap();
+        let mut permissions = fs::metadata(&tmp).unwrap().permissions();
+        permissions.set_mode(0o555);
+        fs::set_permissions(&tmp, permissions.clone()).unwrap();
+        profile.name = "Replaced".into();
+        let failed = save_profile(&tmp, &profile);
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmp, permissions).unwrap();
+        assert!(failed.is_err());
+        assert_eq!(fs::read(tmp.join("desk.json")).unwrap(), saved);
+        profile.name = "Replaced".into();
+        save_profile(&tmp, &profile).unwrap();
+        assert_eq!(list_profiles(&tmp)[0].name, "Replaced");
+        let leftovers = fs::read_dir(&tmp).unwrap().flatten().any(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("tmp")
+        });
+        assert!(!leftovers);
         let _ = fs::remove_dir_all(&tmp);
     }
 

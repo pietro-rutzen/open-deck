@@ -208,6 +208,15 @@ mod tests {
         assert_eq!(found.1, "DDJ-FLX4 #2");
     }
     #[test]
+    fn startup_without_a_controller_selects_nothing() {
+        assert!(choose_profile(&[bundled()], &[], &SessionPreference::default()).is_none());
+        let remembered = SessionPreference {
+            profile: Some(bundled()),
+            port: Some("DDJ-FLX4".into()),
+        };
+        assert!(choose_profile(&[bundled()], &[], &remembered).is_none());
+    }
+    #[test]
     fn ambiguous_devices_or_profiles_do_not_connect() {
         assert!(choose_profile(
             &[bundled()],
