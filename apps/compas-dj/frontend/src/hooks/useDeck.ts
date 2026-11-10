@@ -998,7 +998,29 @@ export function useDeck(deck: number, dsp = true, clock?: { active: boolean; bpm
           .catch(swallow);
       },
       toggleActiveLoop: () => {
-        deckMemory(deck, "loop.memory_active")
+        const selected = memoryLoopsRef.current.find(
+          (loop) => loop.picked === true && loop.point !== true && loop.out_frame > loop.in_frame,
+        );
+        if (!selected) return;
+        deckMemory(deck, "loop.memory_active_picked")
+          .then((mirror) => {
+            if (!mirror?.memory) return;
+            setMemoryLoops(mirror.memory);
+            if (canPersist) dbReplaceMemoryLoops(path as string, mirror.memory).catch(swallow);
+          })
+          .catch(swallow);
+      },
+      selectMemoryLoop: (slot: number) => {
+        deckMemory(deck, "loop.memory_pick", slot)
+          .then((mirror) => {
+            if (!mirror?.memory) return;
+            setMemoryLoops(mirror.memory);
+            if (canPersist) dbReplaceMemoryLoops(path as string, mirror.memory).catch(swallow);
+          })
+          .catch(swallow);
+      },
+      toggleMemoryLoop: (slot: number) => {
+        deckMemory(deck, "loop.memory_active_slot", slot)
           .then((mirror) => {
             if (!mirror?.memory) return;
             setMemoryLoops(mirror.memory);

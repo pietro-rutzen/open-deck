@@ -273,7 +273,6 @@ const BEAT_JUMP_BEATS: [f64; HOT_CUES] = [-1.0, 1.0, -2.0, 2.0, -4.0, 4.0, -8.0,
 const JUMP_SCALE_MIN: f64 = 1.0 / 16.0;
 const JUMP_SCALE_MAX: f64 = 16.0;
 const LOOP_MIN_FRAMES: f64 = 8.0;
-const MEMORY_LOOPS: usize = 8;
 const SAME_LOOP_FRAMES: f64 = 1.0;
 
 /// Display state for a controller action the engine has already applied.
@@ -308,12 +307,15 @@ pub(crate) struct PerformanceMirror {
 /// One saved loop on a track. Slot 0 of the transport `loops` table is not used for these.
 #[derive(Serialize, Clone, Copy)]
 pub(crate) struct MemoryPoint {
-    pub slot: u8,
+    pub slot: u32,
     pub in_frame: f64,
     pub out_frame: f64,
     pub active: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub point: bool,
+    /// Session selection for the Active button. Not stored in the library.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub picked: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -328,6 +330,14 @@ struct MemoryLoop {
     out_frame: f64,
     active: bool,
     point: bool,
+}
+
+/// One memory cue or loop. The list lives on the controller thread and grows with the track.
+/// The audio callback only ever receives the single armed loop.
+#[derive(Clone, Copy)]
+struct StoredMemory {
+    slot: u32,
+    region: MemoryLoop,
 }
 
 fn hot_loop_out(cue: HotCue) -> Option<f64> {
@@ -361,8 +371,11 @@ struct DeckSnapshot {
     keyboard_restore: Option<f64>,
     keyboard_held: u8,
     keyboard_last: Option<u8>,
-    memory: [Option<MemoryLoop>; MEMORY_LOOPS],
+    memory: Vec<StoredMemory>,
+    /// Call/save cursor. Distinct from the span the user clicked for Active.
     memory_selected: Option<usize>,
+    /// Loop the user left-clicked. The Active button toggles only this slot.
+    memory_picked: Option<usize>,
 }
 
 impl Default for DeckSnapshot {
@@ -388,8 +401,9 @@ impl Default for DeckSnapshot {
             keyboard_restore: None,
             keyboard_held: 0,
             keyboard_last: None,
-            memory: [None; MEMORY_LOOPS],
+            memory: Vec::new(),
             memory_selected: None,
+            memory_picked: None,
         }
     }
 }
@@ -583,29 +597,31 @@ impl PerformanceState {
             snapshot.keyboard_restore = None;
             snapshot.keyboard_held = 0;
             snapshot.keyboard_last = None;
-            snapshot.memory = [None; MEMORY_LOOPS];
+            snapshot.memory.clear();
             snapshot.memory_selected = None;
+            snapshot.memory_picked = None;
         });
     }
 
-    pub(crate) fn set_memory_loops(&self, deck: usize, loops: &[(u8, f64, f64, bool, bool)]) {
+    pub(crate) fn set_memory_loops(&self, deck: usize, loops: &[(u32, f64, f64, bool, bool)]) {
         self.with_deck(deck, |snapshot| {
-            snapshot.memory = [None; MEMORY_LOOPS];
+            snapshot.memory.clear();
             snapshot.memory_selected = None;
+            snapshot.memory_picked = None;
             let mut armed = false;
-            for (slot, in_frame, out_frame, active, point) in
-                loops.iter().copied().take(MEMORY_LOOPS)
-            {
-                let slot = usize::from(slot);
-                if slot >= MEMORY_LOOPS || !in_frame.is_finite() {
+            for &(slot, in_frame, out_frame, active, point) in loops {
+                if !in_frame.is_finite() || snapshot.memory.iter().any(|row| row.slot == slot) {
                     continue;
                 }
                 if point {
-                    snapshot.memory[slot] = Some(MemoryLoop {
-                        in_frame,
-                        out_frame: in_frame,
-                        active: false,
-                        point: true,
+                    snapshot.memory.push(StoredMemory {
+                        slot,
+                        region: MemoryLoop {
+                            in_frame,
+                            out_frame: in_frame,
+                            active: false,
+                            point: true,
+                        },
                     });
                     continue;
                 }
@@ -616,11 +632,14 @@ impl PerformanceState {
                 if active {
                     armed = true;
                 }
-                snapshot.memory[slot] = Some(MemoryLoop {
-                    in_frame,
-                    out_frame,
-                    active,
-                    point: false,
+                snapshot.memory.push(StoredMemory {
+                    slot,
+                    region: MemoryLoop {
+                        in_frame,
+                        out_frame,
+                        active,
+                        point: false,
+                    },
                 });
             }
         });
@@ -631,9 +650,8 @@ impl PerformanceState {
             snapshot
                 .memory
                 .iter()
-                .flatten()
-                .find(|region| region.active)
-                .map(|region| (region.in_frame, region.out_frame))
+                .find(|row| row.region.active)
+                .map(|row| (row.region.in_frame, row.region.out_frame))
         })?
     }
 
@@ -648,11 +666,18 @@ impl PerformanceState {
             if snapshot.loop_active {
                 return None;
             }
-            let matched = snapshot.memory.iter().flatten().find(|region| {
-                region.active && same_loop(region.in_frame, region.out_frame, in_frame, out_frame)
+            let matched = snapshot.memory.iter().find_map(|row| {
+                (row.region.active
+                    && same_loop(
+                        row.region.in_frame,
+                        row.region.out_frame,
+                        in_frame,
+                        out_frame,
+                    ))
+                .then_some((row.region.in_frame, row.region.out_frame))
             })?;
-            snapshot.loop_in = matched.in_frame;
-            snapshot.loop_out = matched.out_frame;
+            snapshot.loop_in = matched.0;
+            snapshot.loop_out = matched.1;
             snapshot.loop_active = true;
             snapshot.loop_armed = false;
             snapshot.loop_beats = None;
@@ -719,15 +744,13 @@ fn memory_points(snapshot: &DeckSnapshot) -> Vec<MemoryPoint> {
     snapshot
         .memory
         .iter()
-        .enumerate()
-        .filter_map(|(slot, region)| {
-            region.map(|region| MemoryPoint {
-                slot: slot as u8,
-                in_frame: region.in_frame,
-                out_frame: region.out_frame,
-                active: region.active,
-                point: region.point,
-            })
+        .map(|row| MemoryPoint {
+            slot: row.slot,
+            in_frame: row.region.in_frame,
+            out_frame: row.region.out_frame,
+            active: row.region.active,
+            point: row.region.point,
+            picked: snapshot.memory_picked == Some(row.slot as usize) && !row.region.point,
         })
         .collect()
 }
@@ -879,7 +902,7 @@ fn apply_performance(
         )),
         "loop.memory_delete" => Some(delete_memory(deck, heard, performance)),
         "loop.memory_forget" => Some(forget_current_memory(deck, performance)),
-        "loop.memory_active" => Some(toggle_active_memory(deck, heard, performance)),
+        "loop.memory_active" => Some(toggle_active_memory(deck, frame, performance)),
         "loop.reloop_stop" => reloop_stop(deck, performance),
         "jump.back" => beat_jump_action(deck, -4.0, frame?, performance),
         "jump.forward" => beat_jump_action(deck, 4.0, frame?, performance),
@@ -1190,7 +1213,14 @@ pub(crate) fn memory_button(
     loaded: bool,
     standby: Option<f64>,
     performance: &PerformanceState,
+    slot: Option<u32>,
 ) -> NativeAction {
+    match name {
+        "loop.memory_pick" => return pick_memory_loop(deck, slot, performance),
+        "loop.memory_active_slot" => return toggle_memory_slot(deck, slot, performance),
+        "loop.memory_active_picked" => return toggle_picked_memory(deck, performance),
+        _ => {}
+    }
     let position = (frame.is_finite() && heard.is_finite()).then_some(CapturedPosition {
         frame,
         heard_frame: heard,
@@ -1350,57 +1380,91 @@ fn loop_length_or_memory(
 }
 
 fn ordered_memory(snapshot: &DeckSnapshot) -> Vec<usize> {
-    let mut slots = Vec::new();
-    for (slot, region) in snapshot.memory.iter().enumerate() {
-        if region.is_some() {
-            slots.push(slot);
-        }
-    }
+    let mut slots: Vec<usize> = snapshot
+        .memory
+        .iter()
+        .map(|row| row.slot as usize)
+        .collect();
     slots.sort_by(|&left, &right| {
-        let left_in = snapshot.memory[left]
-            .map(|region| region.in_frame)
-            .unwrap_or(0.0);
-        let right_in = snapshot.memory[right]
-            .map(|region| region.in_frame)
-            .unwrap_or(0.0);
-        left_in.total_cmp(&right_in).then(left.cmp(&right))
+        memory_in(snapshot, left)
+            .total_cmp(&memory_in(snapshot, right))
+            .then(left.cmp(&right))
     });
     slots
 }
 
-fn memory_in(snapshot: &DeckSnapshot, slot: usize) -> f64 {
+fn memory_region(snapshot: &DeckSnapshot, slot: usize) -> Option<MemoryLoop> {
+    let slot = u32::try_from(slot).ok()?;
     snapshot
         .memory
-        .get(slot)
-        .and_then(|region| region.map(|region| region.in_frame))
+        .iter()
+        .find(|row| row.slot == slot)
+        .map(|row| row.region)
+}
+
+fn memory_in(snapshot: &DeckSnapshot, slot: usize) -> f64 {
+    memory_region(snapshot, slot)
+        .map(|region| region.in_frame)
         .unwrap_or(0.0)
+}
+
+fn is_memory_loop(region: MemoryLoop) -> bool {
+    !region.point && region.out_frame > region.in_frame
 }
 
 fn nearest_memory(snapshot: &DeckSnapshot, frame: f64, loops_only: bool) -> Option<usize> {
     snapshot
         .memory
         .iter()
-        .enumerate()
-        .filter_map(|(slot, region)| {
-            region.and_then(|region| {
-                (!loops_only || !region.point).then_some((slot, region.in_frame))
-            })
-        })
+        .filter(|row| !loops_only || !row.region.point)
         .min_by(|left, right| {
-            (left.1 - frame)
+            (left.region.in_frame - frame)
                 .abs()
-                .total_cmp(&(right.1 - frame).abs())
-                .then(left.0.cmp(&right.0))
+                .total_cmp(&(right.region.in_frame - frame).abs())
+                .then(left.slot.cmp(&right.slot))
         })
-        .map(|(slot, _)| slot)
+        .map(|row| row.slot as usize)
+}
+
+fn containing_memory_loop(snapshot: &DeckSnapshot, frame: f64) -> Option<usize> {
+    snapshot
+        .memory
+        .iter()
+        .filter(|row| is_memory_loop(row.region))
+        .filter(|row| frame >= row.region.in_frame && frame < row.region.out_frame)
+        .min_by(|left, right| {
+            let left_span = left.region.out_frame - left.region.in_frame;
+            let right_span = right.region.out_frame - right.region.in_frame;
+            left_span
+                .total_cmp(&right_span)
+                .then(left.slot.cmp(&right.slot))
+        })
+        .map(|row| row.slot as usize)
+}
+
+fn picked_loop(snapshot: &DeckSnapshot) -> Option<usize> {
+    snapshot
+        .memory_picked
+        .filter(|slot| memory_region(snapshot, *slot).is_some_and(is_memory_loop))
+}
+
+fn next_memory_slot(snapshot: &DeckSnapshot) -> u32 {
+    let mut slot = 0u32;
+    while snapshot.memory.iter().any(|row| row.slot == slot) {
+        if slot == u32::MAX {
+            return slot;
+        }
+        slot += 1;
+    }
+    slot
 }
 
 fn arm_message(deck: usize, snapshot: &DeckSnapshot) -> EngineMsg {
     if let Some(region) = snapshot
         .memory
         .iter()
-        .flatten()
-        .find(|region| region.active)
+        .find(|row| row.region.active)
+        .map(|row| row.region)
     {
         EngineMsg::ArmLoop {
             deck,
@@ -1419,10 +1483,37 @@ fn arm_message(deck: usize, snapshot: &DeckSnapshot) -> EngineMsg {
 }
 
 fn clear_memory_slot(snapshot: &mut DeckSnapshot, slot: usize) {
-    snapshot.memory[slot] = None;
-    if snapshot.memory_selected == Some(slot) {
+    let Some(slot) = u32::try_from(slot).ok() else {
+        return;
+    };
+    snapshot.memory.retain(|row| row.slot != slot);
+    if snapshot.memory_selected == Some(slot as usize) {
         snapshot.memory_selected = None;
     }
+    if snapshot.memory_picked == Some(slot as usize) {
+        snapshot.memory_picked = None;
+    }
+}
+
+fn activate_memory_slot(snapshot: &mut DeckSnapshot, slot: usize) -> bool {
+    let Some(region) = memory_region(snapshot, slot) else {
+        return false;
+    };
+    if !is_memory_loop(region) {
+        return false;
+    }
+    let Some(slot) = u32::try_from(slot).ok() else {
+        return false;
+    };
+    let turning_on = !region.active;
+    for row in &mut snapshot.memory {
+        if row.region.point {
+            row.region.active = false;
+        } else {
+            row.region.active = turning_on && row.slot == slot;
+        }
+    }
+    true
 }
 
 fn covering_hot_loop(snapshot: &DeckSnapshot, frame: f64) -> Option<(f64, f64)> {
@@ -1473,29 +1564,23 @@ fn save_memory(
             let Some((in_frame, out_frame, point)) = transport.or(hot).or(standby_cue) else {
                 return single(None, false);
             };
-            if let Some(slot) = snapshot
-                .memory
-                .iter()
-                .enumerate()
-                .find_map(|(slot, stored)| {
-                    (*stored).and_then(|region| {
-                        same_saved(region, in_frame, out_frame, point).then_some(slot)
-                    })
-                })
-            {
-                snapshot.memory_selected = Some(slot);
+            if let Some(slot) = snapshot.memory.iter().find_map(|row| {
+                same_saved(row.region, in_frame, out_frame, point).then_some(row.slot)
+            }) {
+                snapshot.memory_selected = Some(slot as usize);
                 return memory_action(snapshot, None);
             }
-            let Some(slot) = snapshot.memory.iter().position(|region| region.is_none()) else {
-                return single(None, false);
-            };
-            snapshot.memory[slot] = Some(MemoryLoop {
-                in_frame,
-                out_frame: if point { in_frame } else { out_frame },
-                active: false,
-                point,
+            let slot = next_memory_slot(snapshot);
+            snapshot.memory.push(StoredMemory {
+                slot,
+                region: MemoryLoop {
+                    in_frame,
+                    out_frame: if point { in_frame } else { out_frame },
+                    active: false,
+                    point,
+                },
             });
-            snapshot.memory_selected = Some(slot);
+            snapshot.memory_selected = Some(slot as usize);
             memory_action(snapshot, None)
         })
         .unwrap_or_else(|| single(None, false))
@@ -1506,12 +1591,7 @@ fn delete_memory(deck: usize, heard: Option<f64>, performance: &PerformanceState
         .with_deck(deck, |snapshot| {
             let slot = snapshot
                 .memory_selected
-                .filter(|slot| {
-                    snapshot
-                        .memory
-                        .get(*slot)
-                        .is_some_and(|region| region.is_some())
-                })
+                .filter(|slot| memory_region(snapshot, *slot).is_some())
                 .or_else(|| nearest_memory(snapshot, heard.unwrap_or(0.0), false));
             let Some(slot) = slot else {
                 return single(None, false);
@@ -1525,22 +1605,15 @@ fn delete_memory(deck: usize, heard: Option<f64>, performance: &PerformanceState
 fn forget_current_memory(deck: usize, performance: &PerformanceState) -> NativeAction {
     performance
         .with_deck(deck, |snapshot| {
-            let Some(slot) = snapshot
-                .memory
-                .iter()
-                .enumerate()
-                .find_map(|(slot, region)| {
-                    (*region).and_then(|region| {
-                        same_loop(
-                            region.in_frame,
-                            region.out_frame,
-                            snapshot.loop_in,
-                            snapshot.loop_out,
-                        )
-                        .then_some(slot)
-                    })
-                })
-            else {
+            let Some(slot) = snapshot.memory.iter().find_map(|row| {
+                same_loop(
+                    row.region.in_frame,
+                    row.region.out_frame,
+                    snapshot.loop_in,
+                    snapshot.loop_out,
+                )
+                .then_some(row.slot as usize)
+            }) else {
                 return single(None, false);
             };
             clear_memory_slot(snapshot, slot);
@@ -1549,40 +1622,78 @@ fn forget_current_memory(deck: usize, performance: &PerformanceState) -> NativeA
         .unwrap_or_else(|| single(None, false))
 }
 
+fn finish_active_toggle(deck: usize, snapshot: &mut DeckSnapshot, slot: usize) -> NativeAction {
+    if !activate_memory_slot(snapshot, slot) {
+        return single(None, false);
+    }
+    memory_action(snapshot, Some(arm_message(deck, snapshot)))
+}
+
+fn pick_memory_loop(
+    deck: usize,
+    slot: Option<u32>,
+    performance: &PerformanceState,
+) -> NativeAction {
+    let Some(slot) = slot else {
+        return single(None, false);
+    };
+    performance
+        .with_deck(deck, |snapshot| {
+            let index = slot as usize;
+            if memory_region(snapshot, index).is_none_or(|region| !is_memory_loop(region)) {
+                return single(None, false);
+            }
+            snapshot.memory_picked = if snapshot.memory_picked == Some(index) {
+                None
+            } else {
+                Some(index)
+            };
+            memory_action(snapshot, None)
+        })
+        .unwrap_or_else(|| single(None, false))
+}
+
+fn toggle_memory_slot(
+    deck: usize,
+    slot: Option<u32>,
+    performance: &PerformanceState,
+) -> NativeAction {
+    let Some(slot) = slot else {
+        return single(None, false);
+    };
+    performance
+        .with_deck(deck, |snapshot| {
+            finish_active_toggle(deck, snapshot, slot as usize)
+        })
+        .unwrap_or_else(|| single(None, false))
+}
+
+fn toggle_picked_memory(deck: usize, performance: &PerformanceState) -> NativeAction {
+    performance
+        .with_deck(deck, |snapshot| {
+            let Some(slot) = picked_loop(snapshot) else {
+                return single(None, false);
+            };
+            finish_active_toggle(deck, snapshot, slot)
+        })
+        .unwrap_or_else(|| single(None, false))
+}
+
 fn toggle_active_memory(
     deck: usize,
-    heard: Option<f64>,
+    playhead: Option<f64>,
     performance: &PerformanceState,
 ) -> NativeAction {
     performance
         .with_deck(deck, |snapshot| {
-            let mut slot = nearest_memory(snapshot, heard.unwrap_or(snapshot.loop_in), true);
-            if slot.is_none() && snapshot.loop_out > snapshot.loop_in {
-                slot = snapshot.memory.iter().position(|region| region.is_none());
-                if let Some(slot) = slot {
-                    snapshot.memory[slot] = Some(MemoryLoop {
-                        in_frame: snapshot.loop_in,
-                        out_frame: snapshot.loop_out,
-                        active: false,
-                        point: false,
-                    });
-                }
-            }
+            let slot = picked_loop(snapshot).or_else(|| {
+                let frame = playhead.filter(|frame| frame.is_finite())?;
+                containing_memory_loop(snapshot, frame)
+            });
             let Some(slot) = slot else {
                 return single(None, false);
             };
-            let was_active = snapshot
-                .memory
-                .get(slot)
-                .and_then(|region| *region)
-                .is_some_and(|region| region.active);
-            for (index, region) in snapshot.memory.iter_mut().enumerate() {
-                if let Some(region) = region {
-                    region.active = !was_active && index == slot;
-                }
-            }
-            snapshot.memory_selected = Some(slot);
-            memory_action(snapshot, Some(arm_message(deck, snapshot)))
+            finish_active_toggle(deck, snapshot, slot)
         })
         .unwrap_or_else(|| single(None, false))
 }
@@ -1616,7 +1727,7 @@ fn call_memory(
             }
         };
         let slot = ordered[index];
-        let Some(region) = snapshot.memory[slot] else {
+        let Some(region) = memory_region(snapshot, slot) else {
             return None;
         };
         snapshot.memory_selected = Some(slot);
@@ -2466,6 +2577,225 @@ mod tests {
         )
         .unwrap();
         assert_eq!(memory_points_of(&removed).len(), 1);
+    }
+
+    fn press_memory(
+        name: &str,
+        frame: f64,
+        slot: Option<u32>,
+        performance: &PerformanceState,
+    ) -> NativeAction {
+        memory_button(0, name, frame, frame, true, None, performance, slot)
+    }
+
+    fn saved_loop(
+        performance: &PerformanceState,
+        in_frame: f64,
+        out_frame: f64,
+    ) -> Vec<MemoryPoint> {
+        performance.set_loop(0, in_frame, out_frame, false, false, None);
+        memory_points_of(
+            &perform(
+                "loop.memory_save",
+                Some(at(in_frame, in_frame)),
+                performance,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn selecting_the_end_loop_arms_that_loop_and_clears_the_start() {
+        let performance = PerformanceState::new();
+        performance.install_track(0, 0.0, 1_000.0, 48_000.0, 120.0, 200_000);
+        let start = saved_loop(&performance, 0.0, 4_000.0);
+        assert_eq!(start.len(), 1);
+        assert!(!start[0].active);
+        let both = saved_loop(&performance, 180_000.0, 190_000.0);
+        assert_eq!(both.len(), 2);
+        assert!(both.iter().all(|point| !point.active));
+        let end_slot = both
+            .iter()
+            .find(|point| point.in_frame == 180_000.0)
+            .expect("end loop")
+            .slot;
+        let start_slot = both
+            .iter()
+            .find(|point| point.in_frame == 0.0)
+            .expect("start loop")
+            .slot;
+
+        let ignored = press_memory("loop.memory_active_picked", 0.0, None, &performance);
+        assert!(ignored.message.is_none());
+        assert!(ignored.performance.is_none());
+
+        let outside = perform(
+            "loop.memory_active",
+            Some(at(50_000.0, 50_000.0)),
+            &performance,
+        )
+        .unwrap();
+        assert!(outside.message.is_none());
+
+        let picked = press_memory("loop.memory_pick", 0.0, Some(end_slot), &performance);
+        assert!(memory_points_of(&picked)
+            .iter()
+            .any(|point| point.slot == end_slot && point.picked));
+        assert!(memory_points_of(&picked)
+            .iter()
+            .all(|point| point.slot == end_slot || !point.picked));
+
+        let active = press_memory("loop.memory_active_picked", 0.0, None, &performance);
+        let armed = memory_points_of(&active);
+        assert!(armed
+            .iter()
+            .any(|point| point.slot == end_slot && point.active));
+        assert!(armed
+            .iter()
+            .any(|point| point.slot == start_slot && !point.active));
+        assert!(matches!(
+            active.message,
+            Some(EngineMsg::ArmLoop { deck: 0, enabled: true, in_frame, .. }) if in_frame == 180_000.0
+        ));
+
+        let switched = press_memory(
+            "loop.memory_active_slot",
+            0.0,
+            Some(start_slot),
+            &performance,
+        );
+        let switched_points = memory_points_of(&switched);
+        assert!(switched_points
+            .iter()
+            .any(|point| point.slot == start_slot && point.active));
+        assert!(switched_points
+            .iter()
+            .all(|point| point.slot == start_slot || !point.active));
+        assert!(switched_points
+            .iter()
+            .any(|point| point.slot == end_slot && point.picked));
+
+        let cleared = press_memory(
+            "loop.memory_active_slot",
+            0.0,
+            Some(start_slot),
+            &performance,
+        );
+        assert!(memory_points_of(&cleared).iter().all(|point| !point.active));
+        assert!(matches!(
+            cleared.message,
+            Some(EngineMsg::ArmLoop {
+                deck: 0,
+                enabled: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn flx4_active_uses_the_picked_loop_or_the_loop_under_the_playhead() {
+        let performance = PerformanceState::new();
+        performance.install_track(0, 0.0, 1_000.0, 48_000.0, 120.0, 200_000);
+        saved_loop(&performance, 0.0, 4_000.0);
+        let both = saved_loop(&performance, 180_000.0, 190_000.0);
+        let end_slot = both
+            .iter()
+            .find(|point| point.in_frame == 180_000.0)
+            .expect("end loop")
+            .slot;
+        let start_slot = both
+            .iter()
+            .find(|point| point.in_frame == 0.0)
+            .expect("start loop")
+            .slot;
+
+        let missed = perform(
+            "loop.memory_active",
+            Some(at(50_000.0, 50_000.0)),
+            &performance,
+        )
+        .unwrap();
+        assert!(missed.message.is_none());
+
+        let inside = perform(
+            "loop.memory_active",
+            Some(at(185_000.0, 185_000.0)),
+            &performance,
+        )
+        .unwrap();
+        assert!(memory_points_of(&inside)
+            .iter()
+            .any(|point| point.slot == end_slot && point.active));
+        assert!(memory_points_of(&inside)
+            .iter()
+            .any(|point| point.slot == start_slot && !point.active));
+
+        press_memory("loop.memory_pick", 100.0, Some(start_slot), &performance);
+        let chosen = perform(
+            "loop.memory_active",
+            Some(at(185_000.0, 185_000.0)),
+            &performance,
+        )
+        .unwrap();
+        let chosen_points = memory_points_of(&chosen);
+        assert!(chosen_points
+            .iter()
+            .any(|point| point.slot == start_slot && point.active));
+        assert!(chosen_points
+            .iter()
+            .all(|point| point.slot == start_slot || !point.active));
+    }
+
+    #[test]
+    fn more_than_eight_memory_loops_save_and_reload() {
+        let performance = PerformanceState::new();
+        performance.install_track(0, 0.0, 1_000.0, 48_000.0, 120.0, 2_000_000);
+        let stored: Vec<(u32, f64, f64, bool, bool)> = (0..9)
+            .map(|slot| {
+                let in_frame = f64::from(slot) * 10_000.0;
+                (slot, in_frame, in_frame + 2_000.0, slot == 8, false)
+            })
+            .collect();
+        performance.set_memory_loops(0, &stored);
+        let loaded = press_memory("loop.memory_pick", 0.0, Some(8), &performance);
+        let points = memory_points_of(&loaded);
+        assert_eq!(points.len(), 9);
+        assert!(points
+            .iter()
+            .any(|point| point.slot == 8 && point.active && point.picked));
+        assert_eq!(points.iter().filter(|point| point.active).count(), 1);
+
+        performance.set_loop(0, 100_000.0, 104_000.0, false, false, None);
+        let saved = perform(
+            "loop.memory_save",
+            Some(at(100_000.0, 100_000.0)),
+            &performance,
+        )
+        .unwrap();
+        assert_eq!(memory_points_of(&saved).len(), 10);
+
+        let reloaded: Vec<(u32, f64, f64, bool, bool)> = memory_points_of(&saved)
+            .iter()
+            .map(|point| {
+                (
+                    point.slot,
+                    point.in_frame,
+                    point.out_frame,
+                    point.active,
+                    point.point,
+                )
+            })
+            .collect();
+        performance.set_memory_loops(0, &reloaded);
+        let again = press_memory("loop.memory_pick", 0.0, Some(8), &performance);
+        let again_points = memory_points_of(&again);
+        assert_eq!(again_points.len(), 10);
+        assert!(again_points
+            .iter()
+            .any(|point| point.slot == 8 && point.active && point.picked));
+        assert!(again_points
+            .iter()
+            .any(|point| (point.in_frame - 100_000.0).abs() < 1.0 && !point.active));
     }
 
     #[test]

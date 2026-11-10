@@ -54,6 +54,8 @@ interface Lane {
   onSeek: (frac: number) => void;
   onNudgeGrid?: (deltaSec: number) => void;
   onResetGrid?: () => void;
+  onSelectMemory?: (slot: number) => void;
+  onToggleMemory?: (slot: number) => void;
 }
 
 function PhaseMeter({ lanes }: { lanes: Lane[] }) {
@@ -281,7 +283,7 @@ const WaveGraphic = memo(function WaveGraphic({
 });
 
 const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; view: number; zoomBy: (factor: number) => void }) {
-  const { state, color, letter, onSeek, onNudgeGrid, onResetGrid } = lane;
+  const { state, color, letter, onSeek, onNudgeGrid, onResetGrid, onSelectMemory, onToggleMemory } = lane;
   const [laneRef, size] = useElementSize<HTMLDivElement>(1368, 86);
   const VW = size.width;
   const VH = Math.max(1, size.height - 29);
@@ -426,9 +428,21 @@ const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; vi
                 height={VH}
                 fill={memoryLoopColor(span.active)}
                 fillOpacity={span.active ? 0.22 : 0.14}
-                stroke={memoryLoopColor(span.active)}
-                strokeWidth={span.active ? 1.5 : 1}
+                stroke={span.selected ? color : memoryLoopColor(span.active)}
+                strokeWidth={span.selected ? 2.5 : span.active ? 1.5 : 1}
                 vectorEffect="non-scaling-stroke"
+                pointerEvents="auto"
+                style={{ pointerEvents: "auto" }}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onSelectMemory?.(span.slot);
+                }}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onToggleMemory?.(span.slot);
+                }}
               >
                 <title>{span.active ? "Active loop" : "Memory loop"}</title>
               </rect>
@@ -522,4 +536,4 @@ const WaveLane = memo(function WaveLane({ lane, view, zoomBy }: { lane: Lane; vi
       </div>
     </div>
   );
-}, (previous, next) => previous.view === next.view && previous.zoomBy === next.zoomBy && previous.lane.state === next.lane.state && previous.lane.onSeek === next.lane.onSeek && previous.lane.onNudgeGrid === next.lane.onNudgeGrid && previous.lane.onResetGrid === next.lane.onResetGrid && previous.lane.color === next.lane.color && previous.lane.letter === next.lane.letter);
+}, (previous, next) => previous.view === next.view && previous.zoomBy === next.zoomBy && previous.lane.state === next.lane.state && previous.lane.onSeek === next.lane.onSeek && previous.lane.onNudgeGrid === next.lane.onNudgeGrid && previous.lane.onResetGrid === next.lane.onResetGrid && previous.lane.onSelectMemory === next.lane.onSelectMemory && previous.lane.onToggleMemory === next.lane.onToggleMemory && previous.lane.color === next.lane.color && previous.lane.letter === next.lane.letter);

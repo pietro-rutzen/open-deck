@@ -2725,10 +2725,10 @@ fn performance_set_memory_loops(
     deck: usize,
     loops: Vec<db::MemoryLoopRow>,
 ) -> Result<(), String> {
-    let stored: Vec<(u8, f64, f64, bool, bool)> = loops
+    let stored: Vec<(u32, f64, f64, bool, bool)> = loops
         .iter()
         .filter_map(|row| {
-            u8::try_from(row.slot)
+            u32::try_from(row.slot)
                 .ok()
                 .map(|slot| (slot, row.in_frame, row.out_frame, row.active, row.point))
         })
@@ -2752,11 +2752,18 @@ fn deck_memory(
     performance: State<'_, native_controls::PerformanceState>,
     deck: usize,
     action: String,
+    slot: Option<u32>,
 ) -> Result<native_controls::PerformanceMirror, String> {
     if deck >= compas_audio::NUM_DECKS
         || !matches!(
             action.as_str(),
-            "loop.memory_save" | "loop.memory_forget" | "loop.memory_active" | "loop.memory_delete"
+            "loop.memory_save"
+                | "loop.memory_forget"
+                | "loop.memory_active"
+                | "loop.memory_active_picked"
+                | "loop.memory_active_slot"
+                | "loop.memory_pick"
+                | "loop.memory_delete"
         )
     {
         return Err("Unknown memory action".into());
@@ -2775,6 +2782,7 @@ fn deck_memory(
         state.telemetry.is_loaded(deck),
         standby,
         &performance,
+        slot,
     );
     for message in action.message.into_iter().chain(action.messages) {
         state.send(message)?;

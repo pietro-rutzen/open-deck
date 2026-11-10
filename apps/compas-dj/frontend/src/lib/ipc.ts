@@ -351,6 +351,8 @@ export interface DbMemoryLoop {
   active: boolean;
   /** Saved cue point. Older libraries omit this and stay loops. */
   point?: boolean;
+  /** Session selection mirrored from the controller. Not stored in the library. */
+  picked?: boolean;
 }
 /** Saved per-track performance state, restored when a track is reloaded onto a deck. */
 export interface DbTrackState {
@@ -780,8 +782,8 @@ export const performanceSetLoop = (
 ) => invoke("performance_set_loop", { deck, inFrame, outFrame, active, armed, beats });
 export const performanceSetMemoryLoops = (deck: number, loops: DbMemoryLoop[]) =>
   invoke("performance_set_memory_loops", { deck, loops });
-export const deckMemory = (deck: number, action: string) =>
-  invoke<ControllerUpdate["performance"]>("deck_memory", { deck, action });
+export const deckMemory = (deck: number, action: string, slot: number | null = null) =>
+  invoke<ControllerUpdate["performance"]>("deck_memory", { deck, action, slot });
 export const performanceSetQuantize = (deck: number, enabled: boolean) =>
   invoke("performance_set_quantize", { deck, enabled });
 export const performanceSetJumpScale = (deck: number, scale: number) =>

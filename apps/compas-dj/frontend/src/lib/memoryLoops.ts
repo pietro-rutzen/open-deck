@@ -4,6 +4,8 @@ export interface MemoryLoopPoint {
   out_frame: number;
   active: boolean;
   point?: boolean;
+  /** Session selection. The Active button toggles only this loop. */
+  picked?: boolean;
 }
 
 export interface MemoryLoopSpan {
@@ -11,6 +13,7 @@ export interface MemoryLoopSpan {
   x: number;
   width: number;
   active: boolean;
+  selected: boolean;
 }
 
 export interface MemoryLoopFraction {
@@ -18,6 +21,7 @@ export interface MemoryLoopFraction {
   left: number;
   width: number;
   active: boolean;
+  selected: boolean;
 }
 
 const SAVED_LOOP_COLOR = "#e6b325";
@@ -58,7 +62,7 @@ export function memoryLoopSpans(
     const x = (start - origin) * scale;
     const span = (end - start) * scale;
     if (x + span <= 0 || x >= width) return [];
-    return [{ slot: loop.slot, x, width: span, active: loop.active }];
+    return [{ slot: loop.slot, x, width: span, active: loop.active, selected: loop.picked === true }];
   });
 }
 
@@ -115,6 +119,6 @@ export function memoryLoopFractions(
     const left = Math.max(0, Math.min(1, loop.in_frame / frames));
     const right = Math.max(0, Math.min(1, loop.out_frame / frames));
     if (right <= left) return [];
-    return [{ slot: loop.slot, left, width: right - left, active: loop.active }];
+    return [{ slot: loop.slot, left, width: right - left, active: loop.active, selected: loop.picked === true }];
   });
 }

@@ -644,6 +644,8 @@ export function Deck({
         beat={beatSynced}
         onStoreMemory={actions.storeMemoryLoop}
         onToggleActive={actions.toggleActiveLoop}
+        onSelectMemory={actions.selectMemoryLoop}
+        onToggleMemory={actions.toggleMemoryLoop}
       />
 
       <div className="deck-body">
@@ -1256,6 +1258,12 @@ const OverviewWave = memo(function OverviewWave({
   );
 });
 
+function selectedMemoryLoop(state: DeckState) {
+  return state.memoryLoops.find(
+    (loop) => loop.picked === true && loop.point !== true && loop.out_frame > loop.in_frame,
+  );
+}
+
 function OverviewMarks({
   state,
   onStoreMemory,
@@ -1288,7 +1296,7 @@ function OverviewMarks({
         className={`sq-check sq-check--active${active ? " sq-check--on" : ""}`}
         title="Active loop"
         aria-pressed={active}
-        disabled={!meta || (state.memoryLoops.length === 0 && !region)}
+        disabled={!meta || selectedMemoryLoop(state) == null}
         onClick={onToggleActive}
       />
     </div>
@@ -1303,6 +1311,8 @@ function OverviewBar({
   beat,
   onStoreMemory,
   onToggleActive,
+  onSelectMemory,
+  onToggleMemory,
 }: {
   state: DeckState;
   color: string;
@@ -1311,6 +1321,8 @@ function OverviewBar({
   beat: boolean;
   onStoreMemory: () => void;
   onToggleActive: () => void;
+  onSelectMemory: (slot: number) => void;
+  onToggleMemory: (slot: number) => void;
 }) {
   const meta = state.meta;
   const frames = meta?.frames ?? 0;
@@ -1391,11 +1403,24 @@ function OverviewBar({
         <div
           key={`memory-${span.slot}`}
           className="ov-memory"
+          title={span.active ? "Active loop" : "Memory loop"}
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelectMemory(span.slot);
+          }}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onToggleMemory(span.slot);
+          }}
           style={{
             left: `${span.left * 100}%`,
             width: `${span.width * 100}%`,
             background: `${memoryLoopColor(span.active)}33`,
             borderColor: memoryLoopColor(span.active),
+            outline: span.selected ? `1px solid ${color}` : undefined,
+            outlineOffset: span.selected ? -1 : undefined,
           }}
         />
       ))}

@@ -814,14 +814,16 @@ pub fn replace_memory_loops(
         params![path],
     )?;
     let mut armed = false;
-    for row in loops.iter().take(8) {
-        if row.slot < 0 || row.slot >= 8 || !row.in_frame.is_finite() {
+    let mut seen_slots = Vec::new();
+    for row in loops {
+        if row.slot < 0 || !row.in_frame.is_finite() || seen_slots.contains(&row.slot) {
             continue;
         }
         let point = row.point;
         if !point && (!row.out_frame.is_finite() || row.out_frame <= row.in_frame) {
             continue;
         }
+        seen_slots.push(row.slot);
         let out_frame = if point { row.in_frame } else { row.out_frame };
         let active = !point && row.active && !armed;
         if active {
@@ -1592,6 +1594,38 @@ mod tests {
             track_state(&c, "/b.wav").unwrap().memory_loops[0].in_frame,
             50.0
         );
+    }
+
+    #[test]
+    fn more_than_eight_memory_loops_round_trip() {
+        let c = mem();
+        add_track(&c, "/many.wav", "Many", "Artist", 1000).unwrap();
+        let rows: Vec<MemoryLoopRow> = (0..12)
+            .map(|slot| MemoryLoopRow {
+                slot,
+                in_frame: slot as f64 * 100.0,
+                out_frame: slot as f64 * 100.0 + 40.0,
+                active: slot == 11,
+                point: slot == 3,
+            })
+            .collect();
+        replace_memory_loops(&c, "/many.wav", &rows).unwrap();
+        let stored = track_state(&c, "/many.wav").unwrap();
+        assert_eq!(stored.memory_loops.len(), 12);
+        assert_eq!(stored.memory_loops[11].slot, 11);
+        assert!(stored.memory_loops[11].active);
+        assert_eq!(
+            stored.memory_loops.iter().filter(|row| row.active).count(),
+            1
+        );
+        let cue = stored
+            .memory_loops
+            .iter()
+            .find(|row| row.slot == 3)
+            .unwrap();
+        assert!(cue.point);
+        assert!(!cue.active);
+        assert_eq!(cue.out_frame, cue.in_frame);
     }
 
     #[test]

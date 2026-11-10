@@ -18,16 +18,16 @@ assert.equal(memoryMatchesLoop([saved], 48_000.2, 95_999.5), true);
 assert.equal(memoryMatchesLoop([saved], 10, 20), false);
 
 assert.deepEqual(memoryLoopSpans([saved, active], 48_000, 1, 0, 4, 400), [
-  { slot: 0, x: 100, width: 100, active: false },
-  { slot: 1, x: 0, width: 100, active: true },
+  { slot: 0, x: 100, width: 100, active: false, selected: false },
+  { slot: 1, x: 0, width: 100, active: true, selected: false },
 ]);
 assert.deepEqual(memoryLoopSpans([saved], 48_000, 1, 3, 4, 400), []);
 assert.deepEqual(memoryLoopSpans([saved], 0, 1, 0, 4, 400), []);
 assert.deepEqual(memoryLoopSpans([{ ...saved, out_frame: 48_000 }], 48_000, 1, 0, 4, 400), []);
 
 assert.deepEqual(memoryLoopFractions([saved, active], 192_000), [
-  { slot: 0, left: 0.25, width: 0.25, active: false },
-  { slot: 1, left: 0, width: 0.25, active: true },
+  { slot: 0, left: 0.25, width: 0.25, active: false, selected: false },
+  { slot: 1, left: 0, width: 0.25, active: true, selected: false },
 ]);
 assert.deepEqual(memoryLoopFractions([saved], 0), []);
 const cue = { slot: 2, in_frame: 48_000, out_frame: 48_000, active: false, point: true };
@@ -38,12 +38,35 @@ assert.deepEqual(memoryCueFractions([cue, saved], 192_000), [{ slot: 2, left: 0.
 assert.deepEqual(memoryCueMarks([cue], 48_000, 1, 0, 4, 400), [{ slot: 2, x: 100 }]);
 assert.deepEqual(memoryCueMarks([cue], 48_000, 1, 2, 4, 400), []);
 
+const picked = { ...saved, picked: true };
+assert.equal(memoryLoopSpans([picked], 48_000, 1, 0, 4, 400)[0].selected, true);
+assert.equal(memoryLoopFractions([picked], 192_000)[0].selected, true);
+const many = Array.from({ length: 9 }, (_, slot) => ({
+  slot,
+  in_frame: slot * 1_000,
+  out_frame: slot * 1_000 + 400,
+  active: slot === 8,
+}));
+const manyFractions = memoryLoopFractions(many, 20_000);
+assert.equal(manyFractions.length, 9);
+assert.equal(manyFractions[8].active, true);
+assert.equal(manyFractions[8].slot, 8);
+assert.equal(manyFractions.filter((span) => span.active).length, 1);
+
 const deck = readFileSync(new URL("../src/components/Deck.tsx", import.meta.url), "utf8");
+const waveform = readFileSync(new URL("../src/components/WaveformZone.tsx", import.meta.url), "utf8");
+const hook = readFileSync(new URL("../src/hooks/useDeck.ts", import.meta.url), "utf8");
 const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
 assert.match(deck, /title="Memory loop"/);
 assert.match(deck, /title="Memory cue"/);
 assert.match(deck, /Loop hot cue/);
 assert.match(deck, /title="Active loop"/);
+assert.match(deck, /selectedMemoryLoop\(state\) == null/);
+assert.match(deck, /onContextMenu/);
+assert.match(waveform, /onContextMenu/);
+assert.match(hook, /loop\.memory_active_picked/);
+assert.match(hook, /loop\.memory_pick/);
+assert.match(hook, /loop\.memory_active_slot/);
 assert.match(css, /\.sq-check \{[^}]*border-radius:\s*0;/);
 
 console.log("Memory loops: waveform spans, overview fractions, and square checks passed");

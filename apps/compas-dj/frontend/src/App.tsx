@@ -399,6 +399,8 @@ export function App() {
     onSeek: d.actions.seekFrac,
     onNudgeGrid: d.actions.nudgeGrid,
     onResetGrid: d.actions.resetGrid,
+    onSelectMemory: d.actions.selectMemoryLoop,
+    onToggleMemory: d.actions.toggleMemoryLoop,
   });
 
   const loadSamplerFromLibrary = useCallback((slot: number, path: string) => {
