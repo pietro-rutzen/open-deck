@@ -5,6 +5,7 @@ export const RGB_WAVE_KEY = 'Band thickness shows bass (blue), mids (amber) and 
 const NEUTRAL = '#8996a4';
 const LOUDNESS_REFERENCE = 1;
 const SMOOTH_RADIUS = 2;
+const LEVEL_STEP = 0.4;
 
 type Color = readonly [number, number, number];
 const BASS: Color = [255, 16, 33], MID: Color = [66, 255, 10], HIGH: Color = [8, 151, 255];
@@ -73,46 +74,94 @@ export function waveColumn(peaks: number[], bands: Bands[], start: number, end: 
   };
 }
 
-function smoothSeries(values: readonly number[], radius: number) {
-  if (radius <= 0 || values.length < 3) return values.slice();
-  const smoothed = new Array<number>(values.length);
-  for (let index = 0; index < values.length; index += 1) {
+export function smoothAmplitudes<T extends { amp: number }>(points: readonly T[], radius = SMOOTH_RADIUS): T[] {
+  if (radius <= 0 || points.length < 3) return points.map(point => ({ ...point }));
+  const amps = points.map(point => point.amp);
+  const smoothed = amps.map((amp, index) => {
     const start = Math.max(0, index - radius);
-    const end = Math.min(values.length - 1, index + radius);
+    const end = Math.min(amps.length - 1, index + radius);
     let weighted = 0;
     let weight = 0;
     for (let sample = start; sample <= end; sample += 1) {
+      const louder = Math.max(amp, amps[sample]);
+      const crossesStep = sample !== index && louder > 1e-8 && Math.abs(amp - amps[sample]) / louder > LEVEL_STEP;
+      if (crossesStep) continue;
       const sampleWeight = radius + 1 - Math.abs(sample - index);
-      weighted += values[sample] * sampleWeight;
+      weighted += amps[sample] * sampleWeight;
       weight += sampleWeight;
     }
-    smoothed[index] = weight > 0 ? weighted / weight : 0;
-  }
-  return smoothed;
-}
-
-export function smoothAmplitudes<T extends { amp: number }>(points: readonly T[], radius = SMOOTH_RADIUS): T[] {
-  const smoothed = smoothSeries(points.map(point => point.amp), radius);
+    return weight > 0 ? weighted / weight : amp;
+  });
   return points.map((point, index) => ({ ...point, amp: smoothed[index] }));
 }
 
 export type WaveAnchor = 'center' | 'baseline';
 
-// Adjacent columns share their interpolated edge. Batch all polygons of one hue
-// into one SVG path to avoid creating an element per audio bin.
+function columnEdges(points: readonly { x: number }[]) {
+  return points.map((point, index) => {
+    const previous = points[index - 1];
+    const next = points[index + 1];
+    return {
+      left: previous ? (previous.x + point.x) / 2 : point.x,
+      right: next ? (point.x + next.x) / 2 : point.x,
+    };
+  });
+}
+
+const coord = (value: number) => value.toFixed(1);
+
+function stepBaseline(points: readonly { x: number }[], crest: readonly number[], floor: number) {
+  const edges = columnEdges(points);
+  let path = `M${coord(edges[0].left)} ${coord(crest[0])}`;
+  for (let index = 0; index < points.length; index += 1) {
+    path += `L${coord(edges[index].right)} ${coord(crest[index])}`;
+    if (index + 1 < points.length) path += `L${coord(edges[index].right)} ${coord(crest[index + 1])}`;
+  }
+  const end = edges[edges.length - 1].right;
+  path += `L${coord(end)} ${coord(floor)}L${coord(edges[0].left)} ${coord(floor)}Z`;
+  return path;
+}
+
+function stepMirrored(points: readonly { x: number }[], depth: readonly number[], center: number) {
+  const edges = columnEdges(points);
+  const top = (index: number) => center - depth[index];
+  const bottom = (index: number) => center + depth[index];
+  let path = `M${coord(edges[0].left)} ${coord(top(0))}`;
+  for (let index = 0; index < points.length; index += 1) {
+    path += `L${coord(edges[index].right)} ${coord(top(index))}`;
+    if (index + 1 < points.length) path += `L${coord(edges[index].right)} ${coord(top(index + 1))}`;
+  }
+  for (let index = points.length - 1; index >= 0; index -= 1) {
+    path += `L${coord(edges[index].right)} ${coord(bottom(index))}`;
+    path += `L${coord(edges[index].left)} ${coord(bottom(index))}`;
+    if (index > 0) path += `L${coord(edges[index].left)} ${coord(bottom(index - 1))}`;
+  }
+  return `${path}Z`;
+}
+
+function columnDepths(point: WavePoint, gain: number, bandScale: number): [number, number, number] {
+  const [low, mid, high] = point.rms ?? [0, 0, 0];
+  const sum = low + mid + high;
+  const relativeEnergy = Math.min(1, sum * gain);
+  const bodyRadius = point.amp * (0.68 + 0.08 * relativeEnergy) * bandScale;
+  const scale = sum > 0 ? bodyRadius / sum : 0;
+  return [sum * scale, (mid + high) * scale, high * scale];
+}
+
+// Each column holds its own height and meets the next on a vertical edge.
+// Batch every bar of one hue into one SVG path.
 // A baseline anchor keeps the upper half and stretches it to the full height.
 export function rgbPaths(points: WavePoint[], center: number, anchor: WaveAnchor = 'center') {
   const paths = new Map<string, string[]>();
-  const coord = (v: number) => v.toFixed(1);
-  const floor = anchor === 'baseline' ? coord(center * 2) : '';
+  const edges = columnEdges(points);
+  const floor = center * 2;
   for (let i = 0; i < points.length; i++) {
-    const p = points[i], before = points[i - 1] ?? p, after = points[i + 1] ?? p;
-    if (p.amp + before.amp + after.amp === 0) continue;
-    const l = coord((p.x + before.x) / 2), r = coord((p.x + after.x) / 2), x = coord(p.x);
-    const a = (p.amp + before.amp) / 2, b = (p.amp + after.amp) / 2;
+    const p = points[i];
+    if (p.amp === 0) continue;
+    const { left, right } = edges[i];
     const path = anchor === 'baseline'
-      ? `M${l} ${coord((center - a) * 2)}L${x} ${coord((center - p.amp) * 2)} ${r} ${coord((center - b) * 2)} ${r} ${floor} ${l} ${floor}Z`
-      : `M${l} ${coord(center-a)}L${x} ${coord(center-p.amp)} ${r} ${coord(center-b)} ${r} ${coord(center+b)} ${x} ${coord(center+p.amp)} ${l} ${coord(center+a)}Z`;
+      ? `M${coord(left)} ${coord((center - p.amp) * 2)}L${coord(right)} ${coord((center - p.amp) * 2)} ${coord(right)} ${coord(floor)} ${coord(left)} ${coord(floor)}Z`
+      : `M${coord(left)} ${coord(center - p.amp)}L${coord(right)} ${coord(center - p.amp)} ${coord(right)} ${coord(center + p.amp)} ${coord(left)} ${coord(center + p.amp)}Z`;
     const group = paths.get(p.color);
     if (group) group.push(path); else paths.set(p.color, [path]);
   }
@@ -122,66 +171,14 @@ export function rgbPaths(points: WavePoint[], center: number, anchor: WaveAnchor
 export function wavePaths(points: WavePoint[], center: number, gain: number, bandScale = 1, anchor: WaveAnchor = 'center') {
   const paths = rgbPaths(points, center, anchor);
   if (!gain || !paths.length || points.length < 2) return paths;
-  if (anchor === 'baseline') return baselineBands(paths, points, center, gain, bandScale);
-  const layers = Array.from({ length: 3 }, () => ({ upper: [] as string[], lower: [] as string[] }));
-  const visible = [false, false, false];
-  for (const point of points) {
-    const [low, mid, high] = point.rms ?? [0, 0, 0];
-    const sum = low + mid + high;
-    // Keep the spectral rim visible at thumbnail size. Sustained energy fills
-    // slightly more of the peak envelope than short transients.
-    const relativeEnergy = Math.min(1, sum * gain);
-    const bodyRadius = point.amp * (0.68 + 0.08 * relativeEnergy) * bandScale;
-    const scale = sum > 0 ? bodyRadius / sum : 0;
-    const depths = [sum * scale, (mid + high) * scale, high * scale];
-    for (let i = 0; i < 3; i++) {
-      const x = point.x.toFixed(1);
-      layers[i].upper.push(x + ' ' + (center - depths[i]).toFixed(1));
-      layers[i].lower.push(x + ' ' + (center + depths[i]).toFixed(1));
-      visible[i] ||= depths[i] > 0;
-    }
-  }
+  const depths = points.map(point => columnDepths(point, gain, bandScale));
   const fills = ['#137fff', '#ffa916', '#fff4d9'];
-  for (let i = 0; i < layers.length; i++) {
-    if (visible[i]) paths.push({ fill: fills[i],
-      d: `M${layers[i].upper.join(' ')}L${layers[i].lower.reverse().join(' ')}Z` });
-  }
-  return paths;
-}
-
-function baselineBands(
-  paths: { fill: string; d: string }[],
-  points: WavePoint[],
-  center: number,
-  gain: number,
-  bandScale: number,
-) {
-  const floor = (center * 2).toFixed(1);
-  const crests = Array.from({ length: 3 }, () => [] as string[]);
-  const visible = [false, false, false];
-  let firstX = '';
-  let lastX = '';
-  for (const point of points) {
-    const [low, mid, high] = point.rms ?? [0, 0, 0];
-    const sum = low + mid + high;
-    const relativeEnergy = Math.min(1, sum * gain);
-    const bodyRadius = point.amp * (0.68 + 0.08 * relativeEnergy) * bandScale;
-    const scale = sum > 0 ? bodyRadius / sum : 0;
-    const depths = [sum * scale, (mid + high) * scale, high * scale];
-    const x = point.x.toFixed(1);
-    if (firstX === '') firstX = x;
-    lastX = x;
-    for (let i = 0; i < 3; i++) {
-      crests[i].push(x + ' ' + ((center - depths[i]) * 2).toFixed(1));
-      visible[i] ||= depths[i] > 0;
-    }
-  }
-  const fills = ['#137fff', '#ffa916', '#fff4d9'];
-  for (let i = 0; i < crests.length; i++) {
-    if (visible[i]) paths.push({
-      fill: fills[i],
-      d: `M${crests[i].join(' ')}L${lastX} ${floor} ${firstX} ${floor}Z`,
-    });
+  for (let layer = 0; layer < fills.length; layer += 1) {
+    if (!depths.some(row => row[layer] > 0)) continue;
+    const d = anchor === 'baseline'
+      ? stepBaseline(points, depths.map(row => (center - row[layer]) * 2), center * 2)
+      : stepMirrored(points, depths.map(row => row[layer]), center);
+    paths.push({ fill: fills[layer], d });
   }
   return paths;
 }

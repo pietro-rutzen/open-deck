@@ -51,17 +51,33 @@ const bands = [[.6, .2, .1], [0, .2, .1]];
     for (let y = 1; y < original.length; y += 2) {
       assert.ok(Math.abs(scaled[y] - (20 + (original[y] - 20) / 2)) <= 0.1);
     }
-    const [x0, top0, x1, top1, x2, bottom1, x3, bottom0] = coordinates(layer);
-    assert.deepEqual([x0, x1, x2, x3], [0, 1, 1, 0]);
-    assert.equal(top0 + bottom0, 40);
-    assert.equal(top1 + bottom1, 40);
-    assert.ok(top0 < top1);
+    const ysAt = (x) => {
+      const values = coordinates(layer);
+      const ys = [];
+      for (let offset = 0; offset < values.length; offset += 2) {
+        if (values[offset] === x) ys.push(values[offset + 1]);
+      }
+      return ys;
+    };
+    for (const x of [0, 1]) {
+      const ys = ysAt(x);
+      assert.equal(Math.min(...ys) + Math.max(...ys), 40);
+    }
+    assert.ok(Math.min(...ysAt(0)) < Math.min(...ysAt(1)));
     if (layer === bass) {
-      assert.equal(bottom0, 33.7); // Full measured energy fills 76% of the fixed-scale height.
-      assert.ok(bottom0 > bottom1);
+      assert.ok(ysAt(0).includes(33.7));
+      assert.ok(Math.max(...ysAt(0)) > Math.max(...ysAt(1)));
     }
   }
-  assert.equal(coordinates(bass)[5], coordinates(mids)[5]); // No visible blue at x=1.
+  const ysAtLayer = (layer, x) => {
+    const values = coordinates(layer);
+    const ys = [];
+    for (let offset = 0; offset < values.length; offset += 2) {
+      if (values[offset] === x) ys.push(values[offset + 1]);
+    }
+    return ys.sort((left, right) => left - right);
+  };
+  assert.deepEqual(ysAtLayer(bass, 1), ysAtLayer(mids, 1));
   assert.deepEqual(wavePaths(points, 20, structureGain([])), base);
 }
 
@@ -80,13 +96,14 @@ for (let index = 0; index < baselinePreview.length; index += 1) {
   assert.ok(Math.abs(Math.min(...baselineYs) - crest * 2) <= 0.2);
 }
 assert.equal(numbers(baselinePreview.at(-1)).at(-1), 40);
-assert.ok(numbers(baselinePreview[0]).join(',').length < numbers(mirroredPreview[0]).join(',').length);
+assert.ok(numbers(mirroredPreview[0]).filter((_, offset) => offset % 2 === 1).every((y) => y < 40));
 
 const deck = readFileSync(new URL('../src/components/Deck.tsx', import.meta.url), 'utf8');
 const library = readFileSync(new URL('../src/components/LibraryVisuals.tsx', import.meta.url), 'utf8');
 const zone = readFileSync(new URL('../src/components/WaveformZone.tsx', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
 assert.match(deck, /wavePaths\(smoothAmplitudes\(samples\), height \/ 2, structureGain\(bands\), 1, 'baseline'\)/);
+assert.match(deck, /x: \(\(column \+ 0\.5\) \/ count\) \* width/);
 assert.match(library, /wavePaths\(smoothAmplitudes\(points\), 20, structureGain\(bands\), bandScale, 'baseline'\)/);
 assert.equal(zone.includes("'baseline'"), false);
 assert.match(zone, /wavePaths\(smoothAmplitudes\(points\), centerY, bandGain\)/);
@@ -122,10 +139,58 @@ assert.ok(Math.abs(plateau[10].amp - 3.4) < 1e-9);
 assert.ok(Math.abs(softened[10].amp - plateau[10].amp) < 0.05);
 assert.ok(softened[10].amp < softened[3].amp * 0.4);
 
-const alternatingBands = Array.from({ length: 40 }, (_, index) => (index % 2 === 0 ? [0.8, 0, 0] : [0.2, 0, 0]));
-const alternating = smoothAmplitudes(alternatingBands.map((_, index) => ({
+const rippleBands = Array.from({ length: 40 }, (_, index) => (
+  index % 2 === 0 ? [0.5, 0.2, 0.1] : [0.46, 0.18, 0.09]
+));
+const ripple = smoothAmplitudes(rippleBands.map((_, index) => ({
   x: index,
-  ...waveColumn(alternatingBands.map(() => 1), alternatingBands, index, index + 1, 20),
+  ...waveColumn(rippleBands.map(() => 1), rippleBands, index, index + 1, 20),
 })));
-assert.ok(alternating[16].amp / alternating[17].amp < 2);
-console.log('Loudness stays on a fixed scale, and light smoothing keeps a breakdown');
+assert.ok(ripple[16].amp / ripple[17].amp < 1.04);
+
+const stepBands = Array.from({ length: 40 }, (_, index) => (index % 2 === 0 ? [0.8, 0, 0] : [0.2, 0, 0]));
+const preservedStep = smoothAmplitudes(stepBands.map((_, index) => ({
+  x: index,
+  ...waveColumn(stepBands.map(() => 1), stepBands, index, index + 1, 20),
+})));
+assert.ok(preservedStep[16].amp / preservedStep[17].amp > 3);
+
+const abruptBands = Array.from({ length: 32 }, (_, index) => {
+  if (index < 6 || index >= 26) return [0, 0, 0];
+  if (index < 20) return [0.5, 0.2, 0.1];
+  return [0.08, 0.04, 0.02];
+});
+const abruptPeaks = abruptBands.map((band) => band[0] + band[1] + band[2]);
+const abrupt = smoothAmplitudes(abruptBands.map((_, index) => ({
+  x: index,
+  ...waveColumn(abruptPeaks, abruptBands, index, index + 1, 20),
+})));
+assert.ok(abrupt[5].amp < 0.05);
+assert.ok(Math.abs(abrupt[6].amp - 16) < 0.05);
+assert.ok(Math.abs(abrupt[19].amp - 16) < 0.05);
+assert.ok(Math.abs(abrupt[20].amp - 2.8) < 0.05);
+assert.ok(Math.abs(abrupt[25].amp - 2.8) < 0.05);
+assert.ok(abrupt[26].amp < 0.05);
+const abruptPaths = wavePaths(abrupt, 20, structureGain(abruptBands), 1, 'baseline');
+const crestByX = new Map();
+for (const path of abruptPaths) {
+  const values = path.d.match(/-?\d+\.\d+/g).map(Number);
+  for (let offset = 0; offset < values.length; offset += 2) {
+    const key = values[offset].toFixed(1);
+    crestByX.set(key, Math.min(crestByX.get(key) ?? 40, values[offset + 1]));
+  }
+}
+const crestHeight = (x) => 40 - crestByX.get(x.toFixed(1));
+const loudHeight = crestHeight(10.5);
+const tailHeights = [21.5, 22.5, 23.5, 24.5].map(crestHeight);
+assert.ok(tailHeights.every((height) => Math.abs(height - tailHeights[0]) < 0.15));
+assert.ok(tailHeights[0] > 3 && tailHeights[0] < loudHeight * 0.35);
+assert.ok(crestHeight(4.5) < 0.3);
+assert.ok(crestHeight(6.5) > loudHeight * 0.9);
+const highXs = [...crestByX.keys()].map(Number).filter((x) => crestHeight(x) > loudHeight * 0.7);
+const quietXs = [...crestByX.keys()].map(Number).filter((x) => x >= Math.max(...highXs) && crestHeight(x) < loudHeight * 0.3 && crestHeight(x) > 1);
+const silentXs = [...crestByX.keys()].map(Number).filter((x) => x >= Math.max(...quietXs) && crestHeight(x) < 0.3);
+assert.ok(Math.min(...quietXs) - Math.max(...highXs) <= 2);
+assert.ok(Math.min(...silentXs) - Math.max(...quietXs) <= 2);
+assert.ok(Math.min(...highXs) - 4.5 <= 2);
+console.log('Loudness stays on a fixed scale, and level steps keep a vertical edge');

@@ -1236,7 +1236,7 @@ const OverviewWave = memo(function OverviewWave({
       const start = Math.floor(column * peaks.length / count);
       const end = Math.max(start + 1, Math.floor((column + 1) * peaks.length / count));
       const measured = waveColumn(peaks, bands, start, end, (height / 2) * 0.94);
-      return { ...measured, x: measured.loudest / peaks.length * width };
+      return { ...measured, x: ((column + 0.5) / count) * width };
     });
     return wavePaths(smoothAmplitudes(samples), height / 2, structureGain(bands), 1, 'baseline');
   }, [peaks, bands, size.width, size.height]);
