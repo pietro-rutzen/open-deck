@@ -1,6 +1,7 @@
 //! Path and manifest rules for a watched folder's `mp3/` mirror.
 //! Encoding lives in `mp3_encode`. This module never opens an audio device.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Write;
@@ -107,8 +108,11 @@ pub(crate) fn machine_is_busy(load_per_cpu: f64) -> bool {
     load_per_cpu.is_finite() && load_per_cpu > CPU_YIELD_LOAD_PER_CPU
 }
 
-pub(crate) fn playback_should_pause(any_deck_playing: bool) -> bool {
-    any_deck_playing
+/// True only while a deck's play-head is moving. A loaded deck that is paused reports rate 0.
+pub(crate) fn playback_should_pause(playhead_rates: impl IntoIterator<Item = f64>) -> bool {
+    playhead_rates
+        .into_iter()
+        .any(|rate| rate.is_finite() && rate.abs() > f64::EPSILON)
 }
 
 /// `mp3/Artist/Album/song.mp3` for `Artist/Album/song.flac`.
@@ -652,6 +656,417 @@ pub(crate) fn atomic_replace(
     Ok(())
 }
 
+const MIRROR_WALK_LIMIT: u32 = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CopySource {
+    NotMirror,
+    Unmapped,
+    Mapped(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MirrorAnalysisChoice {
+    Measure,
+    UseStored,
+    LeaveUnanalyzed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MirrorFolderRow {
+    pub path: PathBuf,
+    pub name: String,
+    pub track_count: u64,
+    pub source_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MirrorFileRow {
+    pub path: PathBuf,
+    pub name: String,
+    pub source_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MirrorBrowse {
+    pub mirror_path: Option<PathBuf>,
+    pub inside: bool,
+    pub file_count: u64,
+    pub source_paths: Vec<PathBuf>,
+    pub folders: Vec<MirrorFolderRow>,
+    pub files: Vec<MirrorFileRow>,
+}
+
+struct WalkedMp3 {
+    source_path: Option<PathBuf>,
+}
+
+impl MirrorBrowse {
+    fn empty() -> Self {
+        Self {
+            mirror_path: None,
+            inside: false,
+            file_count: 0,
+            source_paths: Vec::new(),
+            folders: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+}
+
+pub(crate) fn mirror_analysis_choice(
+    source: &CopySource,
+    source_has_tempo: bool,
+) -> MirrorAnalysisChoice {
+    match source {
+        CopySource::NotMirror => MirrorAnalysisChoice::Measure,
+        CopySource::Mapped(_) if source_has_tempo => MirrorAnalysisChoice::UseStored,
+        CopySource::Mapped(_) | CopySource::Unmapped => MirrorAnalysisChoice::LeaveUnanalyzed,
+    }
+}
+
+pub(crate) fn recorded_play_path(
+    source: CopySource,
+    played: &Path,
+    source_in_library: bool,
+) -> Option<PathBuf> {
+    match source {
+        CopySource::NotMirror => Some(played.to_path_buf()),
+        CopySource::Mapped(path) if source_in_library => Some(path),
+        CopySource::Mapped(_) | CopySource::Unmapped => None,
+    }
+}
+
+pub(crate) fn copy_display_title(stem: &str) -> &str {
+    let stripped = strip_order_prefix(stem);
+    if stripped.is_empty() {
+        stem
+    } else {
+        stripped
+    }
+}
+
+pub(crate) fn copy_source(roots: &[String], file: &Path) -> CopySource {
+    if !is_under_watch_mirror(roots, &file.to_string_lossy()) {
+        return CopySource::NotMirror;
+    }
+    let Some(root) = single_watch_root(roots, file) else {
+        return CopySource::Unmapped;
+    };
+    let Ok(stripped) = file.strip_prefix(&root) else {
+        return CopySource::Unmapped;
+    };
+    let Some(relative) = relative_string(stripped) else {
+        return CopySource::Unmapped;
+    };
+    let (manifest, _) = load_manifest(&root);
+    match source_by_dest(&manifest).get(&relative) {
+        Some(source) => CopySource::Mapped(root.join(source)),
+        None => CopySource::Unmapped,
+    }
+}
+
+/// The mirror directory for `open`, or its contents when `open` is already inside it.
+/// Reads the directory and the manifest. It does not create files or library rows.
+pub(crate) fn browse_mirror(roots: &[String], open: &Path) -> MirrorBrowse {
+    let Some(root) = single_watch_root(roots, open) else {
+        return MirrorBrowse::empty();
+    };
+    let open = trim_path(open);
+    let inside = is_path_inside_mirror(&root, &open);
+    let mirror_dir = if inside {
+        open
+    } else {
+        mirror_root_dir(&root).join(open.strip_prefix(&root).unwrap_or(Path::new("")))
+    };
+    if !mirror_dir.is_dir() {
+        return MirrorBrowse {
+            mirror_path: Some(mirror_dir),
+            inside,
+            ..MirrorBrowse::empty()
+        };
+    }
+    let (manifest, _) = load_manifest(&root);
+    let sources = source_by_dest(&manifest);
+    if inside {
+        let (folders, files) = list_mirror_dir(&mirror_dir, &root, &sources);
+        let file_count =
+            files.len() as u64 + folders.iter().map(|folder| folder.track_count).sum::<u64>();
+        let mut source_paths = files
+            .iter()
+            .filter_map(|file| file.source_path.clone())
+            .collect::<Vec<_>>();
+        for folder in &folders {
+            source_paths.extend(folder.source_paths.iter().cloned());
+        }
+        return MirrorBrowse {
+            mirror_path: Some(mirror_dir),
+            inside: true,
+            file_count,
+            source_paths,
+            folders,
+            files,
+        };
+    }
+    let walked = walk_files(&mirror_dir, &root, &sources, 0);
+    let source_paths = walked
+        .iter()
+        .filter_map(|file| file.source_path.clone())
+        .collect();
+    MirrorBrowse {
+        mirror_path: Some(mirror_dir),
+        inside: false,
+        file_count: walked.len() as u64,
+        source_paths,
+        folders: Vec::new(),
+        files: Vec::new(),
+    }
+}
+
+fn source_by_dest(manifest: &Manifest) -> BTreeMap<String, String> {
+    let mut sources = BTreeMap::new();
+    for entry in manifest.files.values() {
+        if entry.dest.is_empty() || !safe_source_rel(&entry.source) {
+            continue;
+        }
+        sources
+            .entry(entry.dest.clone())
+            .or_insert_with(|| entry.source.clone());
+    }
+    sources
+}
+
+fn single_watch_root(roots: &[String], open: &Path) -> Option<PathBuf> {
+    let open = trim_path(open);
+    let mut found = None;
+    for root in roots {
+        let trimmed = root.trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let root_path = PathBuf::from(trimmed);
+        if open == root_path || open.starts_with(&root_path) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(root_path);
+        }
+    }
+    found
+}
+
+fn trim_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        PathBuf::from(text.as_ref())
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
+fn is_path_inside_mirror(root: &Path, open: &Path) -> bool {
+    let Ok(relative) = open.strip_prefix(root) else {
+        return false;
+    };
+    relative
+        .components()
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(MIRROR_DIR))
+}
+
+fn mirror_root_dir(root: &Path) -> PathBuf {
+    let fallback = root.join(MIRROR_DIR);
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return fallback;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        if entry.file_name().eq_ignore_ascii_case(MIRROR_DIR) {
+            return entry.path();
+        }
+    }
+    fallback
+}
+
+fn list_mirror_dir(
+    dir: &Path,
+    root: &Path,
+    sources: &BTreeMap<String, String>,
+) -> (Vec<MirrorFolderRow>, Vec<MirrorFileRow>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut folders = Vec::new();
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if hidden_mirror_entry(&name) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            let nested = walk_files(&path, root, sources, 1);
+            if nested.is_empty() {
+                continue;
+            }
+            let source_paths = nested
+                .iter()
+                .filter_map(|file| file.source_path.clone())
+                .collect();
+            folders.push(MirrorFolderRow {
+                path,
+                name,
+                track_count: nested.len() as u64,
+                source_paths,
+            });
+        } else if file_type.is_file() && is_mp3_name(&name) {
+            files.push(MirrorFileRow {
+                source_path: mapped_source(root, &path, sources),
+                path,
+                name,
+            });
+        }
+    }
+    folders.sort_by(|left, right| cmp_numeric_names(&left.name, &right.name));
+    files.sort_by(|left, right| cmp_numeric_names(&left.name, &right.name));
+    (folders, files)
+}
+
+fn walk_files(
+    dir: &Path,
+    root: &Path,
+    sources: &BTreeMap<String, String>,
+    depth: u32,
+) -> Vec<WalkedMp3> {
+    if depth > MIRROR_WALK_LIMIT {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if hidden_mirror_entry(&name) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            files.extend(walk_files(&path, root, sources, depth + 1));
+        } else if file_type.is_file() && is_mp3_name(&name) {
+            files.push(WalkedMp3 {
+                source_path: mapped_source(root, &path, sources),
+            });
+        }
+    }
+    files
+}
+
+fn mapped_source(root: &Path, file: &Path, sources: &BTreeMap<String, String>) -> Option<PathBuf> {
+    let relative = relative_string(file.strip_prefix(root).ok()?)?;
+    sources.get(&relative).map(|source| root.join(source))
+}
+
+fn hidden_mirror_entry(name: &str) -> bool {
+    name.is_empty()
+        || name.starts_with('.')
+        || name.ends_with(".partial")
+        || name.contains(".opendeck-order-")
+}
+
+fn is_mp3_name(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("mp3"))
+}
+
+fn cmp_numeric_names(left: &str, right: &str) -> Ordering {
+    let mut left_chars = left.chars().peekable();
+    let mut right_chars = right.chars().peekable();
+    loop {
+        match (left_chars.peek().copied(), right_chars.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(left_char), Some(right_char))
+                if left_char.is_ascii_digit() && right_char.is_ascii_digit() =>
+            {
+                let left_digits = take_digits(&mut left_chars);
+                let right_digits = take_digits(&mut right_chars);
+                let order = cmp_digit_runs(&left_digits, &right_digits);
+                if order != Ordering::Equal {
+                    return order;
+                }
+            }
+            (Some(left_char), Some(right_char)) => {
+                let order = left_char
+                    .to_ascii_lowercase()
+                    .cmp(&right_char.to_ascii_lowercase());
+                if order != Ordering::Equal {
+                    return order;
+                }
+                left_chars.next();
+                right_chars.next();
+            }
+        }
+    }
+}
+
+fn take_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut digits = String::new();
+    while chars
+        .peek()
+        .is_some_and(|character| character.is_ascii_digit())
+    {
+        if let Some(character) = chars.next() {
+            digits.push(character);
+        }
+    }
+    digits
+}
+
+fn cmp_digit_runs(left: &str, right: &str) -> Ordering {
+    let left_trimmed = left.trim_start_matches('0');
+    let right_trimmed = right.trim_start_matches('0');
+    let left_value = if left_trimmed.is_empty() {
+        "0"
+    } else {
+        left_trimmed
+    };
+    let right_value = if right_trimmed.is_empty() {
+        "0"
+    } else {
+        right_trimmed
+    };
+    left_value
+        .len()
+        .cmp(&right_value.len())
+        .then_with(|| left_value.cmp(right_value))
+        .then_with(|| left.len().cmp(&right.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,11 +1387,140 @@ mod tests {
 
     #[test]
     fn mirror_pauses_for_playback_and_yields_when_the_machine_is_busy() {
-        assert!(playback_should_pause(true));
-        assert!(!playback_should_pause(false));
+        assert!(playback_should_pause([0.0, 44_100.0]));
+        assert!(!playback_should_pause([0.0, 0.0]));
+        assert!(!playback_should_pause([f64::NAN]));
         assert!(!machine_is_busy(0.2));
         assert!(!machine_is_busy(CPU_YIELD_LOAD_PER_CPU));
         assert!(machine_is_busy(CPU_YIELD_LOAD_PER_CPU + 0.01));
         assert!(!machine_is_busy(f64::NAN));
+    }
+
+    #[test]
+    fn mirror_listing_follows_filename_order_and_maps_the_source() {
+        let root = scratch("browse");
+        let mirror = root.join("mp3");
+        std::fs::create_dir(&mirror).unwrap();
+        std::fs::write(mirror.join("2 - Ada - Second.mp3"), b"b").unwrap();
+        std::fs::write(mirror.join("10 - Ada - Tenth.mp3"), b"t").unwrap();
+        std::fs::write(mirror.join("1 - Ada - First.mp3"), b"a").unwrap();
+        std::fs::write(mirror.join("song.mp3.partial"), b"p").unwrap();
+        std::fs::write(mirror.join(".opendeck-order-0001"), b"o").unwrap();
+        std::fs::write(mirror.join("notes.txt"), b"n").unwrap();
+        let nested = mirror.join("Album");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("3 - Ada - Nested.mp3"), b"n").unwrap();
+        let manifest = Manifest {
+            version: 2,
+            files: BTreeMap::from([
+                (
+                    "dev:1:ino:1".to_string(),
+                    ManifestFile {
+                        source: "01 - first.flac".to_string(),
+                        source_len: 1,
+                        source_mtime_ns: 1,
+                        dest: "mp3/1 - Ada - First.mp3".to_string(),
+                        source_dev: 1,
+                        source_ino: 1,
+                    },
+                ),
+                (
+                    "dev:1:ino:2".to_string(),
+                    ManifestFile {
+                        source: "02 - second.flac".to_string(),
+                        source_len: 1,
+                        source_mtime_ns: 1,
+                        dest: "mp3/2 - Ada - Second.mp3".to_string(),
+                        source_dev: 1,
+                        source_ino: 2,
+                    },
+                ),
+            ]),
+        };
+        save_manifest(&root, &manifest).unwrap();
+        let names_before = dir_names(&mirror);
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let outside = browse_mirror(&roots, &root);
+        assert!(!outside.inside);
+        assert_eq!(outside.file_count, 4);
+        assert!(outside.files.is_empty());
+        assert_eq!(outside.mirror_path.as_deref(), Some(mirror.as_path()));
+        let inside = browse_mirror(&roots, &mirror);
+        assert!(inside.inside);
+        assert_eq!(
+            inside
+                .files
+                .iter()
+                .map(|file| file.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "1 - Ada - First.mp3",
+                "2 - Ada - Second.mp3",
+                "10 - Ada - Tenth.mp3",
+            ]
+        );
+        assert_eq!(inside.folders.len(), 1);
+        assert_eq!(inside.folders[0].name, "Album");
+        assert_eq!(inside.folders[0].track_count, 1);
+        assert_eq!(
+            inside.files[0].source_path.as_deref(),
+            Some(root.join("01 - first.flac").as_path())
+        );
+        assert!(inside.files[2].source_path.is_none());
+        assert_eq!(dir_names(&mirror), names_before);
+        let nested_view = browse_mirror(&roots, &nested);
+        assert!(nested_view.inside);
+        assert_eq!(nested_view.files.len(), 1);
+        assert!(nested_view.folders.is_empty());
+        let copy = mirror.join("1 - Ada - First.mp3");
+        assert_eq!(
+            copy_source(&roots, &copy),
+            CopySource::Mapped(root.join("01 - first.flac"))
+        );
+        assert_eq!(
+            copy_source(&roots, &mirror.join("10 - Ada - Tenth.mp3")),
+            CopySource::Unmapped
+        );
+        assert_eq!(
+            mirror_analysis_choice(&CopySource::Mapped(root.join("01 - first.flac")), true),
+            MirrorAnalysisChoice::UseStored
+        );
+        assert_eq!(
+            mirror_analysis_choice(&CopySource::Mapped(root.join("01 - first.flac")), false),
+            MirrorAnalysisChoice::LeaveUnanalyzed
+        );
+        assert_eq!(
+            mirror_analysis_choice(&CopySource::Unmapped, false),
+            MirrorAnalysisChoice::LeaveUnanalyzed
+        );
+        assert_eq!(
+            mirror_analysis_choice(&CopySource::NotMirror, false),
+            MirrorAnalysisChoice::Measure
+        );
+        assert_eq!(
+            recorded_play_path(
+                CopySource::Mapped(root.join("01 - first.flac")),
+                &copy,
+                true
+            ),
+            Some(root.join("01 - first.flac"))
+        );
+        assert_eq!(recorded_play_path(CopySource::Unmapped, &copy, false), None);
+        let empty = scratch("missing");
+        let missing = browse_mirror(&[empty.to_string_lossy().into_owned()], &empty);
+        assert_eq!(missing.file_count, 0);
+        assert!(!empty.join("mp3").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&empty).unwrap();
+    }
+
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 }

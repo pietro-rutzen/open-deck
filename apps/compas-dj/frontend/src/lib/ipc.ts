@@ -331,6 +331,8 @@ export interface DbTrack {
   last_played_at: number | null;
   /** User tags (lowercased) — usable in `tag:` search and smart crates. */
   tags: string[];
+  /** Set when this row is an MP3 copy of a library track. Playback uses `path`. */
+  source_path?: string | null;
 }
 export interface DbCue {
   slot: number;
@@ -401,6 +403,26 @@ export const listWatchFolderMp3 = () =>
 
 export const setWatchFolderMp3 = (path: string, keepMp3: boolean) =>
   invoke("set_watch_folder_mp3", { path, keepMp3 });
+
+export interface MirrorBrowseFolder {
+  path: string;
+  name: string;
+  track_count: number;
+  played_count: number;
+}
+
+export interface MirrorBrowse {
+  mirror_path: string | null;
+  inside: boolean;
+  file_count: number;
+  played_count: number;
+  folders: MirrorBrowseFolder[];
+  files: DbTrack[];
+}
+
+/** Files in the open folder's MP3 mirror. Empty until that mirror has copies. */
+export const listMp3Mirror = (path: string) =>
+  invoke<MirrorBrowse>("list_mp3_mirror", { path });
 
 export const onMp3MirrorProgress = (
   cb: (progress: Mp3MirrorProgress) => void,

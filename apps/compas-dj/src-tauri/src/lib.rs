@@ -1376,42 +1376,70 @@ fn load_track(
                     return;
                 }
             }
-            let analysis_app = app.clone();
-            let analysis_tx = tx.clone();
-            let analysis_path = body.path.clone();
             let installed_gain = body.replay_gain;
-            let submitted = app
-                .state::<deck_loads::DeckLoads>()
-                .commit(deck, ticket, || {
-                    analysis.submit(
-                        deck,
-                        Box::new(move || {
-                            run_deferred_analysis(
-                                analysis_app,
-                                analysis_tx,
-                                deck,
-                                ticket,
-                                analysis_path,
-                                installed_gain,
-                                buffer,
-                            )
-                        }),
-                    )
-                });
-            if submitted.is_err() {
-                let _ = app
-                    .state::<deck_loads::DeckLoads>()
-                    .commit(deck, ticket, || {
-                        let _ = app.emit(
-                            "deck:analysis-failed",
-                            DeckAnalysisFailedEvent {
-                                deck,
-                                generation: ticket,
-                                path: body.path.clone(),
-                            },
-                        );
-                        Ok(())
-                    });
+            match mirror_load_plan(&app, &body.path, ticket, installed_gain) {
+                MirrorLoadPlan::Measure => {
+                    let analysis_app = app.clone();
+                    let analysis_tx = tx.clone();
+                    let analysis_path = body.path.clone();
+                    let submitted =
+                        app.state::<deck_loads::DeckLoads>()
+                            .commit(deck, ticket, || {
+                                analysis.submit(
+                                    deck,
+                                    Box::new(move || {
+                                        run_deferred_analysis(
+                                            analysis_app,
+                                            analysis_tx,
+                                            deck,
+                                            ticket,
+                                            analysis_path,
+                                            installed_gain,
+                                            buffer,
+                                        )
+                                    }),
+                                )
+                            });
+                    if submitted.is_err() {
+                        let _ = app
+                            .state::<deck_loads::DeckLoads>()
+                            .commit(deck, ticket, || {
+                                let _ = app.emit(
+                                    "deck:analysis-failed",
+                                    DeckAnalysisFailedEvent {
+                                        deck,
+                                        generation: ticket,
+                                        path: body.path.clone(),
+                                    },
+                                );
+                                Ok(())
+                            });
+                    }
+                }
+                MirrorLoadPlan::Stored(stored) => {
+                    drop(buffer);
+                    let _ = app
+                        .state::<deck_loads::DeckLoads>()
+                        .commit(deck, ticket, || {
+                            publish_analysis(&app, &tx, deck, loaded.source_rate, &stored)
+                        });
+                }
+                MirrorLoadPlan::Skip => {
+                    drop(buffer);
+                    let _ = app
+                        .state::<deck_loads::DeckLoads>()
+                        .commit(deck, ticket, || {
+                            let _ = app.emit(
+                                "deck:analysis-failed",
+                                DeckAnalysisFailedEvent {
+                                    deck,
+                                    generation: ticket,
+                                    path: body.path.clone(),
+                                },
+                            );
+                            Ok(())
+                        });
+                }
             }
         }));
         if outcome.is_err() {
@@ -1443,6 +1471,111 @@ fn load_track(
         return Err(message);
     }
     Ok(())
+}
+
+enum MirrorLoadPlan {
+    Measure,
+    Stored(deck_prepare::AnalysisBody),
+    Skip,
+}
+
+fn path_might_be_mirror(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|part| part.eq_ignore_ascii_case(mp3_mirror::MIRROR_DIR))
+}
+
+fn mirror_load_plan(
+    app: &AppHandle,
+    path: &str,
+    generation: u64,
+    installed_gain: f32,
+) -> MirrorLoadPlan {
+    if !path_might_be_mirror(path) {
+        return MirrorLoadPlan::Measure;
+    }
+    let Some(db) = app.try_state::<db::Db>() else {
+        return MirrorLoadPlan::Measure;
+    };
+    let Ok(roots) = with_db(&db, db::list_watch_folders) else {
+        return MirrorLoadPlan::Measure;
+    };
+    let source = mp3_mirror::copy_source(&roots, std::path::Path::new(path));
+    let stored = match &source {
+        mp3_mirror::CopySource::NotMirror => return MirrorLoadPlan::Measure,
+        mp3_mirror::CopySource::Unmapped => return MirrorLoadPlan::Skip,
+        mp3_mirror::CopySource::Mapped(source_path) => {
+            let Some(source_path) = source_path.to_str() else {
+                return MirrorLoadPlan::Skip;
+            };
+            with_db(&db, |connection| {
+                db::track_stored_tempo(connection, source_path)
+            })
+            .ok()
+            .flatten()
+        }
+    };
+    match mp3_mirror::mirror_analysis_choice(&source, stored.is_some()) {
+        mp3_mirror::MirrorAnalysisChoice::Measure => MirrorLoadPlan::Measure,
+        mp3_mirror::MirrorAnalysisChoice::LeaveUnanalyzed => MirrorLoadPlan::Skip,
+        mp3_mirror::MirrorAnalysisChoice::UseStored => {
+            let Some(stored) = stored else {
+                return MirrorLoadPlan::Skip;
+            };
+            MirrorLoadPlan::Stored(analysis_from_stored(
+                path,
+                generation,
+                installed_gain,
+                stored,
+            ))
+        }
+    }
+}
+
+fn finite_f32(value: f64) -> f32 {
+    if value.is_finite() {
+        value as f32
+    } else {
+        0.0
+    }
+}
+
+fn analysis_from_stored(
+    path: &str,
+    generation: u64,
+    installed_gain: f32,
+    stored: db::StoredTempo,
+) -> deck_prepare::AnalysisBody {
+    let bpm = finite_f32(stored.bpm);
+    let interval = if stored.beat_interval_sec.is_finite() && stored.beat_interval_sec > 0.0 {
+        stored.beat_interval_sec
+    } else if bpm > 0.0 {
+        60.0 / f64::from(bpm)
+    } else {
+        0.0
+    };
+    let first = if stored.first_beat_sec.is_finite() {
+        stored.first_beat_sec
+    } else {
+        0.0
+    };
+    let offset = if stored.grid_offset_sec.is_finite() {
+        stored.grid_offset_sec
+    } else {
+        0.0
+    };
+    deck_prepare::AnalysisBody {
+        generation,
+        path: path.to_string(),
+        bpm,
+        bpm_confidence: finite_f32(stored.bpm_confidence),
+        first_beat_sec: finite_f32(first + offset),
+        beat_interval_sec: finite_f32(interval),
+        key_camelot: stored.key_camelot,
+        key_name: stored.key_name,
+        band_peaks: Vec::new(),
+        measured_replay_gain: installed_gain,
+        apply_replay_gain: false,
+    }
 }
 
 fn emit_load_error(app: &AppHandle, deck: usize, generation: u64, message: String) {
@@ -1871,9 +2004,11 @@ fn kick_analysis(app: &AppHandle) {
     });
 }
 
-fn deck_is_playing(app: &AppHandle) -> bool {
+fn transport_is_advancing(app: &AppHandle) -> bool {
     let engine = app.state::<EngineHandle>();
-    (0..compas_audio::NUM_DECKS).any(|deck| engine.telemetry.is_playing(deck))
+    mp3_mirror::playback_should_pause(
+        (0..compas_audio::NUM_DECKS).map(|deck| engine.telemetry.deck_rate(deck)),
+    )
 }
 
 fn kick_mp3_mirror(app: &AppHandle) {
@@ -1981,7 +2116,7 @@ fn kick_mp3_mirror(app: &AppHandle) {
 }
 
 fn wait_while_playing(app: &AppHandle) {
-    while mp3_mirror::playback_should_pause(deck_is_playing(app)) {
+    while transport_is_advancing(app) {
         thread::sleep(Duration::from_millis(250));
     }
 }
@@ -1991,7 +2126,7 @@ fn wait_for_mirror_slot(app: &AppHandle) {
     let started = Instant::now();
     while mp3_mirror::machine_is_busy(mp3_worker::load_per_cpu())
         && started.elapsed() < Duration::from_secs(5)
-        && !deck_is_playing(app)
+        && !transport_is_advancing(app)
     {
         thread::sleep(Duration::from_millis(250));
     }
@@ -2031,6 +2166,10 @@ fn prioritize_analysis(app: AppHandle, path: String) -> Result<(), String> {
         return Err("Track path must be an absolute library path".into());
     }
     let db = app.state::<db::Db>();
+    let roots = with_db(&db, db::list_watch_folders)?;
+    if mp3_mirror::is_under_watch_mirror(&roots, &path) {
+        return Err("MP3 copies use the source track's saved analysis".into());
+    }
     if !with_db(&db, |c| db::track_exists(c, &path))? {
         return Err("Import this track before requesting analysis".into());
     }
@@ -2040,6 +2179,148 @@ fn prioritize_analysis(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|e| e.to_string())? = Some(path);
     kick_analysis(&app);
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct MirrorBrowseFolder {
+    path: String,
+    name: String,
+    track_count: u64,
+    played_count: u64,
+}
+
+#[derive(serde::Serialize)]
+struct MirrorBrowseFile {
+    path: String,
+    source_path: Option<String>,
+    title: String,
+    artist: String,
+    duration_ms: i64,
+    bpm: Option<f64>,
+    key_camelot: Option<String>,
+    key_name: Option<String>,
+    grid_offset_sec: f64,
+    gain: f64,
+    play_count: i64,
+    last_played_at: Option<i64>,
+    tags: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct MirrorBrowseResponse {
+    mirror_path: Option<String>,
+    inside: bool,
+    file_count: u64,
+    played_count: u64,
+    folders: Vec<MirrorBrowseFolder>,
+    files: Vec<MirrorBrowseFile>,
+}
+
+fn played_sources(db: &State<'_, db::Db>, sources: &[std::path::PathBuf]) -> Result<u64, String> {
+    with_db(db, |connection| {
+        let mut played = 0u64;
+        for source in sources {
+            let Some(path) = source.to_str() else {
+                continue;
+            };
+            if db::play_count_of(connection, path)?.unwrap_or(0) > 0 {
+                played += 1;
+            }
+        }
+        Ok(played)
+    })
+}
+
+fn mirror_browse_file(
+    path: &str,
+    source: Option<&str>,
+    name: &str,
+    row: Option<db::TrackRow>,
+) -> MirrorBrowseFile {
+    if let Some(row) = row {
+        return MirrorBrowseFile {
+            path: path.to_string(),
+            source_path: source.map(str::to_string),
+            title: row.title,
+            artist: row.artist,
+            duration_ms: row.duration_ms,
+            bpm: row.bpm,
+            key_camelot: row.key_camelot,
+            key_name: row.key_name,
+            grid_offset_sec: row.grid_offset_sec,
+            gain: row.gain,
+            play_count: row.play_count,
+            last_played_at: row.last_played_at,
+            tags: row.tags,
+        };
+    }
+    let stem = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    MirrorBrowseFile {
+        path: path.to_string(),
+        source_path: source.map(str::to_string),
+        title: mp3_mirror::copy_display_title(stem).to_string(),
+        artist: String::new(),
+        duration_ms: 0,
+        bpm: None,
+        key_camelot: None,
+        key_name: None,
+        grid_offset_sec: 0.0,
+        gain: 1.0,
+        play_count: 0,
+        last_played_at: None,
+        tags: Vec::new(),
+    }
+}
+
+/// List one folder's MP3 mirror. Copies stay out of the library table.
+#[tauri::command]
+fn list_mp3_mirror(db: State<'_, db::Db>, path: String) -> Result<MirrorBrowseResponse, String> {
+    if path.len() > 4096 || !std::path::Path::new(&path).is_absolute() {
+        return Err("Folder path must be absolute".into());
+    }
+    let roots = with_db(&db, db::list_watch_folders)?;
+    let browse = mp3_mirror::browse_mirror(&roots, std::path::Path::new(&path));
+    let played_count = played_sources(&db, &browse.source_paths)?;
+    let mut folders = Vec::with_capacity(browse.folders.len());
+    for folder in browse.folders {
+        let Some(folder_path) = folder.path.to_str() else {
+            continue;
+        };
+        folders.push(MirrorBrowseFolder {
+            path: folder_path.to_string(),
+            name: folder.name,
+            track_count: folder.track_count,
+            played_count: played_sources(&db, &folder.source_paths)?,
+        });
+    }
+    let mut files = Vec::with_capacity(browse.files.len());
+    for file in browse.files {
+        let Some(file_path) = file.path.to_str() else {
+            continue;
+        };
+        let source = file
+            .source_path
+            .as_deref()
+            .and_then(|source| source.to_str());
+        let row = source
+            .and_then(|source| {
+                with_db(&db, |connection| db::track_by_path(connection, source)).ok()
+            })
+            .flatten();
+        files.push(mirror_browse_file(file_path, source, &file.name, row));
+    }
+    Ok(MirrorBrowseResponse {
+        mirror_path: browse
+            .mirror_path
+            .as_deref()
+            .and_then(|path| path.to_str())
+            .map(str::to_string),
+        inside: browse.inside,
+        file_count: browse.file_count,
+        played_count,
+        folders,
+        files,
+    })
 }
 
 /// Register a folder, start live-watching it, and import its audio files now; returns the count
@@ -2698,7 +2979,25 @@ fn db_set_gain(db: State<'_, db::Db>, path: String, gain: f64) -> Result<(), Str
 
 #[tauri::command]
 fn db_record_play(app: AppHandle, db: State<'_, db::Db>, path: String) -> Result<(), String> {
-    with_db(&db, |c| db::record_play(c, &path))?;
+    let roots = with_db(&db, db::list_watch_folders)?;
+    let played = std::path::PathBuf::from(&path);
+    let source = mp3_mirror::copy_source(&roots, &played);
+    let source_in_library = match &source {
+        mp3_mirror::CopySource::Mapped(source_path) => {
+            source_path.to_str().is_some_and(|source_path| {
+                with_db(&db, |connection| db::track_exists(connection, source_path))
+                    .unwrap_or(false)
+            })
+        }
+        mp3_mirror::CopySource::NotMirror | mp3_mirror::CopySource::Unmapped => false,
+    };
+    let Some(target) = mp3_mirror::recorded_play_path(source, &played, source_in_library) else {
+        return Ok(());
+    };
+    let Some(target) = target.to_str() else {
+        return Ok(());
+    };
+    with_db(&db, |connection| db::record_play(connection, target))?;
     let _ = app.emit("library:changed", ());
     Ok(())
 }
@@ -4725,6 +5024,7 @@ pub fn run() {
             rescan_watch_folders,
             list_watch_folder_mp3,
             set_watch_folder_mp3,
+            list_mp3_mirror,
             db_track_state,
             db_upsert_analysis,
             db_set_cue,

@@ -6,7 +6,7 @@ const source = readFileSync(new URL("../src/lib/mp3Mirror.ts", import.meta.url),
 const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { mp3CopyProgressLabel, selectedWatchFolder } = await import(
+const { isInsideMirror, mirrorDirectory, mp3CopyProgressLabel, selectedWatchFolder } = await import(
   `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`
 );
 
@@ -40,6 +40,20 @@ for (const entry of folderCases) {
   assert.equal(selectedWatchFolder(entry.openPath, entry.folders), entry.expected);
 }
 
+const mirrorCases = [
+  { openPath: music, root: music, directory: `${music}/mp3`, inside: false },
+  { openPath: nested, root: music, directory: `${music}/mp3/nights`, inside: false },
+  { openPath: `${music}/mp3`, root: music, directory: `${music}/mp3`, inside: true },
+  { openPath: `${music}/mp3/nights`, root: music, directory: `${music}/mp3/nights`, inside: true },
+];
+for (const entry of mirrorCases) {
+  assert.equal(mirrorDirectory(entry.openPath, entry.root), entry.directory);
+  assert.equal(isInsideMirror(entry.openPath, [entry.root]), entry.inside);
+}
+assert.equal(isInsideMirror(`${music}/mp3`, [music, nested]), true);
+assert.equal(isInsideMirror(nested, [music, nested]), false);
+assert.equal(isInsideMirror(null, [music]), false);
+
 const library = readFileSync(new URL("../src/components/Library.tsx", import.meta.url), "utf8");
 const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
 const toolbarStart = library.indexOf('className="tl-toolbar"');
@@ -70,5 +84,11 @@ assert.match(toolbar, /Keep MP3 copies/);
 assert.equal(toolbar.includes("tl-mp3"), false);
 assert.equal(toolbar.includes("sq-check"), false);
 assert.equal(css.includes("tl-mp3"), false);
+assert.match(library, /name: 'mp3'/);
+assert.match(library, /title=\{row\.kind === 'folder' && row\.mirror \? 'MP3 copies' : undefined\}/);
+assert.match(library, /t\.source_path \|\| t\.path/);
+assert.match(library, /listMp3Mirror/);
+assert.equal(toolbar.includes("name: 'mp3'"), false);
+assert.match(library, /MP3 copies follow the source folder reorder/);
 
-console.log("MP3 mirror: toolbar control, folder selection, and fixed count slot passed");
+console.log("MP3 mirror: toolbar control, folder selection, and mirror navigation passed");

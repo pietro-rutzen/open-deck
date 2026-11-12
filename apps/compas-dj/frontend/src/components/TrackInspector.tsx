@@ -136,7 +136,8 @@ export const TrackInspector = ({
   onRemove: () => void;
 }) => {
   const [pane, setPane] = useState<InspectorPane>("summary");
-  const visual = useTrackVisuals(track.path, true, true, 2);
+  const mirrorCopy = Boolean(track.source_path);
+  const visual = useTrackVisuals(track.source_path || track.path, true, true, 2);
   const file = useTrackFileFacts(track.path);
   const artwork = visual.data?.artwork_data_url ?? null;
   const title = visual.data?.title || track.title || fileStem(track.path);
@@ -333,18 +334,24 @@ export const TrackInspector = ({
             <section className="inspector-group">
               <div className="overline">Tags</div>
               <div className="inspector-tags">
-                {track.tags.map((tag) => (
-                  <button
-                    className="chip"
-                    key={tag}
-                    type="button"
-                    onClick={() => onDropTag(tag)}
-                    aria-label={`Remove tag ${tag}`}
-                  >
-                    {tag} ×
-                  </button>
-                ))}
-                {tagging ? (
+                {track.tags.map((tag) =>
+                  mirrorCopy ? (
+                    <span className="chip" key={tag}>
+                      {tag}
+                    </span>
+                  ) : (
+                    <button
+                      className="chip"
+                      key={tag}
+                      type="button"
+                      onClick={() => onDropTag(tag)}
+                      aria-label={`Remove tag ${tag}`}
+                    >
+                      {tag} ×
+                    </button>
+                  ),
+                )}
+                {mirrorCopy ? null : tagging ? (
                   <input
                     autoFocus
                     value={tagInput}
@@ -365,13 +372,15 @@ export const TrackInspector = ({
               </div>
             </section>
             <FactGroup title="File" rows={fileRows} />
-            <details className="inspector-remove">
-              <summary>Library options</summary>
-              <button className="chip" type="button" onClick={onRemove}>
-                Remove from library
-              </button>
-              <p>The original file stays on disk.</p>
-            </details>
+            {mirrorCopy ? null : (
+              <details className="inspector-remove">
+                <summary>Library options</summary>
+                <button className="chip" type="button" onClick={onRemove}>
+                  Remove from library
+                </button>
+                <p>The original file stays on disk.</p>
+              </details>
+            )}
           </>
         )}
         {pane === "artwork" && (

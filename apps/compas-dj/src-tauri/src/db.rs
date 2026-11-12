@@ -632,6 +632,78 @@ pub fn track_analysis_hint(
     .optional()
 }
 
+pub fn track_by_path(c: &Connection, path: &str) -> rusqlite::Result<Option<TrackRow>> {
+    c.query_row(
+        &format!(
+            "SELECT path, title, artist, duration_ms, bpm, key_camelot, key_name,
+                    grid_offset_sec, gain, play_count, last_played_at, {}
+             FROM tracks WHERE path = ?1",
+            tags_select("path"),
+        ),
+        params![path],
+        row_to_track,
+    )
+    .optional()
+}
+
+pub fn play_count_of(c: &Connection, path: &str) -> rusqlite::Result<Option<i64>> {
+    c.query_row(
+        "SELECT play_count FROM tracks WHERE path = ?1",
+        params![path],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredTempo {
+    pub bpm: f64,
+    pub bpm_confidence: f64,
+    pub first_beat_sec: f64,
+    pub beat_interval_sec: f64,
+    pub key_camelot: String,
+    pub key_name: String,
+    pub grid_offset_sec: f64,
+}
+
+/// Saved tempo and key for a library track. `None` when the row is missing or the tempo is unset.
+pub fn track_stored_tempo(c: &Connection, path: &str) -> rusqlite::Result<Option<StoredTempo>> {
+    let row = c
+        .query_row(
+            "SELECT bpm, bpm_confidence, first_beat_sec, beat_interval_sec,
+                    key_camelot, key_name, grid_offset_sec
+             FROM tracks WHERE path = ?1",
+            params![path],
+            |row| {
+                Ok((
+                    row.get::<_, Option<f64>>(0)?,
+                    row.get::<_, Option<f64>>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, f64>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((bpm, confidence, first, interval, camelot, name, offset)) = row else {
+        return Ok(None);
+    };
+    let Some(bpm) = bpm.filter(|bpm| bpm.is_finite() && *bpm > 0.0) else {
+        return Ok(None);
+    };
+    Ok(Some(StoredTempo {
+        bpm,
+        bpm_confidence: confidence.filter(|value| value.is_finite()).unwrap_or(0.0),
+        first_beat_sec: first.filter(|value| value.is_finite()).unwrap_or(0.0),
+        beat_interval_sec: interval.filter(|value| value.is_finite()).unwrap_or(0.0),
+        key_camelot: camelot.unwrap_or_default(),
+        key_name: name.unwrap_or_default(),
+        grid_offset_sec: if offset.is_finite() { offset } else { 0.0 },
+    }))
+}
+
 pub fn list_track_paths(c: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = c.prepare("SELECT path FROM tracks")?;
     let rows = stmt.query_map([], |row| row.get(0))?;
@@ -2379,5 +2451,38 @@ mod tests {
         );
         assert!(!track_exists(&connection, &track_path).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stored_tempo_stays_on_the_library_row() {
+        let connection = mem();
+        add_track(&connection, "/a.flac", "Song", "Ada", 1_000).unwrap();
+        assert!(track_by_path(&connection, "/missing.flac")
+            .unwrap()
+            .is_none());
+        assert!(track_stored_tempo(&connection, "/a.flac")
+            .unwrap()
+            .is_none());
+        upsert_analysis(
+            &connection,
+            "/a.flac",
+            128.0,
+            0.5,
+            0.2,
+            0.46875,
+            "8A",
+            "A minor",
+        )
+        .unwrap();
+        let stored = track_stored_tempo(&connection, "/a.flac").unwrap().unwrap();
+        assert_eq!(stored.bpm, 128.0);
+        assert_eq!(stored.key_camelot, "8A");
+        let row = track_by_path(&connection, "/a.flac").unwrap().unwrap();
+        assert_eq!(row.title, "Song");
+        upsert_analysis(&connection, "/a.flac", 0.0, 0.0, 0.0, 0.0, "", "").unwrap();
+        assert!(track_stored_tempo(&connection, "/a.flac")
+            .unwrap()
+            .is_none());
+        assert!(play_count_of(&connection, "/a.flac").unwrap().is_some());
     }
 }

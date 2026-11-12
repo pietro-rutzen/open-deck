@@ -22,6 +22,7 @@ import {
   dbResetPlayCounts,
   deleteLibraryFolder,
   inTauri,
+  listMp3Mirror,
   listWatchFolderMp3,
   listWatchFolders,
   onMp3MirrorProgress,
@@ -44,6 +45,7 @@ import {
   prioritizeAnalysis,
   type DbTrack,
   type FolderEdit,
+  type MirrorBrowse,
   type KeyNotation,
 } from '../lib/ipc';
 import {
@@ -80,7 +82,7 @@ import {
   reorderPaths,
   writeFolderOrders,
 } from '../lib/libraryFolders';
-import { mp3CopyProgressLabel, selectedWatchFolder } from '../lib/mp3Mirror';
+import { isInsideMirror, mp3CopyProgressLabel, selectedWatchFolder } from '../lib/mp3Mirror';
 import { controllerLoadPath, selectedControllerRow, stepControllerRow } from '../lib/libraryController';
 import { filterLibraryTracks } from '../lib/librarySearch';
 import { listeningModeActive, setListeningMode } from '../lib/listeningMode';
@@ -317,8 +319,9 @@ export const Library = memo(
     };
     const [, setNextQueueVersion] = useState(0);
     useEffect(() => subscribeNextQueue(() => setNextQueueVersion((version) => version + 1)), []);
+    const mirrorCopyPathsRef = useRef<ReadonlySet<string>>(new Set());
     useEffect(() => {
-      if (selectedPath && inTauri())
+      if (selectedPath && inTauri() && !mirrorCopyPathsRef.current.has(selectedPath))
         prioritizeAnalysis(selectedPath).catch(() => {});
     }, [selectedPath]);
     const inspectorRef = useRef<HTMLElement>(null);
@@ -464,8 +467,8 @@ export const Library = memo(
         .catch(() => {});
     };
     const deckCount = Math.min(DECKS.length, Math.max(loadedPaths.length, 2));
-    const trackMenuGroups = (track: DbTrack): TrackMenuItem[][] => [
-      DECKS.slice(0, deckCount).map((deck, index) => ({
+    const trackMenuGroups = (track: DbTrack): TrackMenuItem[][] => {
+      const loadGroup = DECKS.slice(0, deckCount).map((deck, index) => ({
         id: `load-${deck.letter}`,
         label:
           listening && index === 0
@@ -482,8 +485,8 @@ export const Library = memo(
           }
           void load(index, track.path);
         },
-      })),
-      [
+      }));
+      const queueGroup = [
         ...nextDecks.flatMap((deck) => {
           if (loadedPaths[deck.index] === track.path) return [];
           if (readQueuedPaths(deck.index).includes(track.path)) return [];
@@ -509,8 +512,8 @@ export const Library = memo(
           label: `Remove tag ${tag}`,
           onSelect: () => dropTag(track.path, tag),
         })),
-      ],
-      [
+      ];
+      const removeGroup = [
         {
           id: 'remove-folder',
           label: 'Remove from folder',
@@ -532,11 +535,22 @@ export const Library = memo(
             );
           },
         },
-      ],
-    ];
+      ];
+      if (track.source_path) {
+        return [
+          loadGroup,
+          queueGroup.filter((item) => item.id.startsWith('queue-')),
+        ];
+      }
+      return [loadGroup, queueGroup, removeGroup];
+    };
 
     // Watched folders (auto-import).
     const [folders, setFolders] = useState<string[]>([]);
+    const foldersRef = useRef(folders);
+    foldersRef.current = folders;
+    const [mirrorBrowse, setMirrorBrowse] = useState<MirrorBrowse | null>(null);
+    const [mirrorEpoch, setMirrorEpoch] = useState(0);
     const [mp3On, setMp3On] = useState<Record<string, boolean>>({});
     const [mp3Progress, setMp3Progress] = useState<
       Record<string, { done: number; total: number; active: boolean }>
@@ -565,11 +579,29 @@ export const Library = memo(
             active: progress.active,
           },
         }));
+        if (!progress.active) setMirrorEpoch((epoch) => epoch + 1);
       });
       return () => {
         un.then((stop) => stop());
       };
     }, []);
+    useEffect(() => {
+      setMirrorBrowse(null);
+    }, [folderPath]);
+    useEffect(() => {
+      if (!inTauri() || !folderPath) return;
+      let cancelled = false;
+      listMp3Mirror(folderPath)
+        .then((listing) => {
+          if (!cancelled) setMirrorBrowse(listing);
+        })
+        .catch(() => {
+          if (!cancelled) setMirrorBrowse(null);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, [folderPath, mirrorEpoch]);
     const toggleMp3 = (folder: string) => {
       if (!inTauri()) return;
       const next = !mp3On[folder];
@@ -631,6 +663,7 @@ export const Library = memo(
       const un = onLibraryChanged(() => {
         lib.refresh();
         refreshFolders();
+        setMirrorEpoch((epoch) => epoch + 1);
       });
       return () => {
         un.then((u) => u());
@@ -654,7 +687,10 @@ export const Library = memo(
           const hovering =
             list != null && pointerOverElement(list, event.payload.position);
           if (event.payload.type === 'over') {
-            setFileDropActive(hovering && folderPathRef.current != null);
+            const open = folderPathRef.current;
+            setFileDropActive(
+              hovering && open != null && !isInsideMirror(open, foldersRef.current),
+            );
             return;
           }
           if (event.payload.type !== 'drop') return;
@@ -665,6 +701,10 @@ export const Library = memo(
           const folder = folderPathRef.current;
           if (!folder) {
             setActionError('Open a folder before dropping files into it');
+            return;
+          }
+          if (isInsideMirror(folder, foldersRef.current)) {
+            setActionError('Add tracks from the source folder. MP3 copies stay with that folder.');
             return;
           }
           moveIntoFolder(folder, paths)
@@ -901,15 +941,49 @@ export const Library = memo(
       mp3ProgressForFolder?.total ?? 0,
       mp3ProgressForFolder?.active ?? false,
     );
-    const folderEntries = useMemo(
-      () =>
-        browsingFolder && folderPath
-          ? childFolders(lib.tracks, folderPath)
-          : [],
-      [browsingFolder, folderPath, lib.tracks],
+    const viewingMirror = Boolean(browsingFolder && mirrorBrowse?.inside);
+    mirrorCopyPathsRef.current = new Set(
+      viewingMirror ? (mirrorBrowse?.files ?? []).map((file) => file.path) : [],
     );
+    const folderEntries = useMemo(() => {
+      if (!browsingFolder || !folderPath) return [];
+      if (viewingMirror && mirrorBrowse) {
+        return mirrorBrowse.folders.map((folder) => ({
+          path: folder.path,
+          name: folder.name,
+          trackCount: folder.track_count,
+          playedCount: folder.played_count,
+          mirror: true,
+        }));
+      }
+      const children = childFolders(lib.tracks, folderPath).map((folder) => ({
+        ...folder,
+        mirror: false,
+      }));
+      if (
+        !mirrorBrowse?.mirror_path ||
+        mirrorBrowse.inside ||
+        mirrorBrowse.file_count <= 0
+      ) {
+        return children;
+      }
+      const mirrorRow = {
+        path: mirrorBrowse.mirror_path,
+        name: 'mp3',
+        trackCount: mirrorBrowse.file_count,
+        playedCount: mirrorBrowse.played_count,
+        mirror: true,
+      };
+      const insertAt = children.findIndex(
+        (folder) =>
+          folder.name.localeCompare(mirrorRow.name, undefined, { sensitivity: 'base' }) > 0,
+      );
+      const index = insertAt < 0 ? children.length : insertAt;
+      return [...children.slice(0, index), mirrorRow, ...children.slice(index)];
+    }, [browsingFolder, folderPath, lib.tracks, mirrorBrowse, viewingMirror]);
     const folderTracks = useMemo(() => {
       if (!browsingFolder || !folderPath) return filtered;
+      if (viewingMirror && mirrorBrowse) return mirrorBrowse.files;
       const direct = directTracks(lib.tracks, folderPath);
       if (sort.column !== 'order') return sortTracks(direct, sort);
       const compareOrder = folderOrderComparator(folderOrders[folderPath]);
@@ -917,11 +991,11 @@ export const Library = memo(
         compareOrder(left.path, right.path),
       );
       return sort.direction === 'asc' ? bySavedOrder : bySavedOrder.reverse();
-    }, [browsingFolder, folderPath, folderOrders, lib.tracks, sort, filtered]);
+    }, [browsingFolder, folderPath, folderOrders, lib.tracks, sort, filtered, viewingMirror, mirrorBrowse]);
     useEffect(() => {
-      if (!browsingFolder) setReorderArmed(false);
-    }, [browsingFolder]);
-    const canReorder = browsingFolder && reorderArmed && !reordering;
+      if (!browsingFolder || viewingMirror) setReorderArmed(false);
+    }, [browsingFolder, viewingMirror]);
+    const canReorder = browsingFolder && reorderArmed && !reordering && !viewingMirror;
     const reorderTrack = (from: string, to: string) => {
       if (!canReorder) return;
       const next = reorderPaths(
@@ -1050,6 +1124,7 @@ export const Library = memo(
           name: string;
           trackCount: number;
           playedCount: number;
+          mirror: boolean;
           key: string;
         }
       | { kind: 'track'; track: DbTrack; key: string };
@@ -1517,13 +1592,15 @@ export const Library = memo(
               type="button"
               className={`add-btn${canReorder ? ' add-btn--on' : ''}`}
               aria-pressed={canReorder}
-              disabled={!folderPath || !browsingFolder || reordering}
+              disabled={!folderPath || !browsingFolder || reordering || viewingMirror}
               title={
-                canReorder
-                  ? 'Reorder is on. Drag a track onto another row. Reordering edits filenames so the folder matches this list. Click again to drag onto decks only.'
-                  : folderPath
-                    ? 'Turn on to rearrange this folder. Reordering edits filenames. Off, dragging a track only loads a deck.'
-                    : 'Open a folder to rearrange its tracks. Reordering edits filenames.'
+                viewingMirror
+                  ? 'MP3 copies follow the source folder reorder.'
+                  : canReorder
+                    ? 'Reorder is on. Drag a track onto another row. Reordering edits filenames so the folder matches this list. Click again to drag onto decks only.'
+                    : folderPath
+                      ? 'Turn on to rearrange this folder. Reordering edits filenames. Off, dragging a track only loads a deck.'
+                      : 'Open a folder to rearrange its tracks. Reordering edits filenames.'
               }
               onClick={() => {
                 stopReorderScroll();
@@ -1643,22 +1720,25 @@ export const Library = memo(
                         aria-selected={selectedRow}
                         aria-setsize={browseRows.length}
                         aria-posinset={index + 1}
+                        title={row.kind === 'folder' && row.mirror ? 'MP3 copies' : undefined}
                         aria-label={
                           row.kind === 'up'
                             ? `Back to ${row.name}`
-                            : `${row.name}, ${row.playedCount} of ${row.trackCount} played`
+                            : row.kind === 'folder' && row.mirror
+                              ? `MP3 copies, ${row.trackCount} files`
+                              : `${row.name}, ${row.playedCount} of ${row.trackCount} played`
                         }
                         tabIndex={
                           selectedRow || (!browseKey && index === 0) ? 0 : -1
                         }
                         data-browse-key={row.key}
                         onMouseDown={(event) => {
-                          if (row.kind !== 'folder' || event.button !== 2) return;
+                          if (row.kind !== 'folder' || row.mirror || event.button !== 2) return;
                           selectBrowse(index);
                           openFolderMenu(row.path, row.name, event);
                         }}
                         onContextMenu={(event) => {
-                          if (row.kind !== 'folder') return;
+                          if (row.kind !== 'folder' || row.mirror) return;
                           selectBrowse(index);
                           openFolderMenu(row.path, row.name, event);
                         }}
@@ -1860,7 +1940,7 @@ export const Library = memo(
                           : String(trackNumber).padStart(2, '0')}
                       </span>
                       <TrackCells
-                        path={t.path}
+                        path={t.source_path || t.path}
                         title={t.title || baseName(t.path)}
                         artist={t.artist}
                         color={loadedAs?.color}
@@ -1965,8 +2045,16 @@ export const Library = memo(
             <div className="inspector-empty">
               <Icon name="folder" size={28} />
               <h3>{selectedBrowse.name}</h3>
-              <p>{selectedBrowse.trackCount} tracks in this folder.</p>
-              <p>Right-click the folder to rename it or move it to the Trash.</p>
+              <p>
+                {selectedBrowse.mirror
+                  ? `${selectedBrowse.trackCount} MP3 copies. Go back to the source folder.`
+                  : `${selectedBrowse.trackCount} tracks in this folder.`}
+              </p>
+              <p>
+                {selectedBrowse.mirror
+                  ? 'The up row and the folder path return to the source folder.'
+                  : 'Right-click the folder to rename it or move it to the Trash.'}
+              </p>
             </div>
           ) : (
             <div className="inspector-empty">
