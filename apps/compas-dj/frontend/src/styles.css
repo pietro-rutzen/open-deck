@@ -486,7 +486,6 @@ button.src-row:hover { background: rgba(255, 255, 255, 0.04); }
 .src-row--muted { color: var(--text-tertiary); font-size: 11px; }
 .src-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .src-name { flex: 1 0 auto; white-space: nowrap; }
-.tl-mp3-progress { display: inline-block; width: 4.2em; min-width: 4.2em; margin-left: 6px; text-align: right; font-variant-numeric: tabular-nums; font-size: 10px; color: var(--text-tertiary); }
 .ctrl-tag { font-family: var(--font-mono); font-size: 8px; color: var(--stream); border: 1px solid rgba(40, 224, 255, 0.4); border-radius: 4px; padding: 1px 4px; }
 
 .tracklist { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }

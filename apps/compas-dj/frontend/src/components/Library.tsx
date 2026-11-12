@@ -1540,21 +1540,16 @@ export const Library = memo(
               disabled={mp3Folder == null}
               title={
                 mp3Folder
-                  ? 'Keep 320 kbps MP3 copies of this folder for older CDJs. Turning this off leaves copies in place.'
+                  ? mp3ProgressLabel
+                    ? `Keep MP3 copies ${mp3ProgressLabel}`
+                    : 'Keep MP3 copies'
                   : 'Open one watched folder to keep MP3 copies'
               }
               onClick={() => {
                 if (mp3Folder) toggleMp3(mp3Folder);
               }}
             >
-              Keep MP3 copies
-              <span
-                className="mono tl-mp3-progress"
-                title={mp3ProgressLabel ? `MP3 copies ${mp3ProgressLabel}` : undefined}
-                aria-hidden={mp3ProgressLabel === ''}
-              >
-                {mp3ProgressLabel}
-              </span>
+              MP3
             </button>
           </div>
 

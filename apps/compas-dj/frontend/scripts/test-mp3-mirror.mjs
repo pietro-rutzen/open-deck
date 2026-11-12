@@ -53,7 +53,7 @@ const controlOrder = [
   "'Listening mode'",
   "\n              Reset played\n",
   "\n              Reorder\n",
-  "\n              Keep MP3 copies\n",
+  "\n              MP3\n",
 ];
 let cursor = -1;
 for (const marker of controlOrder) {
@@ -66,11 +66,9 @@ assert.equal(folderList.includes("tl-mp3"), false);
 assert.match(toolbar, /disabled=\{mp3Folder == null\}/);
 assert.match(toolbar, /Open one watched folder to keep MP3 copies/);
 assert.match(toolbar, /className=\{`add-btn\$\{mp3Folder && mp3On\[mp3Folder\] \? ' add-btn--on' : ''\}`\}/);
-assert.match(toolbar, /className="mono tl-mp3-progress"/);
-assert.equal(toolbar.includes("tl-mp3-check"), false);
+assert.match(toolbar, /Keep MP3 copies/);
+assert.equal(toolbar.includes("tl-mp3"), false);
 assert.equal(toolbar.includes("sq-check"), false);
-assert.match(css, /\.tl-mp3-progress \{[^}]*display:\s*inline-block;/);
-assert.match(css, /\.tl-mp3-progress \{[^}]*width:\s*4\.2em;/);
-assert.match(css, /\.tl-mp3-progress \{[^}]*min-width:\s*4\.2em;/);
+assert.equal(css.includes("tl-mp3"), false);
 
 console.log("MP3 mirror: toolbar control, folder selection, and fixed count slot passed");
