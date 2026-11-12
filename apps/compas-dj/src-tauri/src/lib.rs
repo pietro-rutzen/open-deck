@@ -2441,7 +2441,7 @@ fn set_watch_folder_mp3(
     Ok(())
 }
 
-/// Converted sources, convertible sources, and files left alone because they are already MP3.
+/// Mirrored files, every audio source in the folder, and how many of those sources were already MP3.
 #[tauri::command]
 fn mp3_conversion_status(
     db: State<'_, db::Db>,

@@ -100,7 +100,11 @@ pub(crate) fn sync_folder(
     });
     let mut manifest = manifest;
     remember_keeps(&mut manifest, &plan.keep);
-    if plan.encode.is_empty() && plan.rename.is_empty() && plan.delete.is_empty() {
+    if plan.encode.is_empty()
+        && plan.copy.is_empty()
+        && plan.rename.is_empty()
+        && plan.delete.is_empty()
+    {
         if keeps_differ {
             if let Err(error) = store_manifest(root, &manifest, policy) {
                 return Err(error.to_string());
@@ -133,7 +137,11 @@ pub(crate) fn sync_folder(
             Err(error) => errors.push(error),
         }
     }
-    for job in &plan.encode {
+    let mut writes = Vec::with_capacity(plan.encode.len() + plan.copy.len());
+    writes.extend(plan.encode.iter().map(|job| (job, false)));
+    writes.extend(plan.copy.iter().map(|job| (job, true)));
+    writes.sort_by(|left, right| left.0.dest_rel.cmp(&right.0.dest_rel));
+    for (job, copy_bytes) in writes {
         if !enabled() {
             report_progress(root, false, &errors, &mut progress);
             return Ok(errors);
@@ -163,13 +171,18 @@ pub(crate) fn sync_folder(
             }
         };
         let analysis = hint(&source_path);
-        if let Err(error) = mp3_encode::encode_mirror(
-            &source_path,
-            &dest_path,
-            analysis.bpm,
-            analysis.musical_key.as_deref(),
-            &mut during_encode,
-        ) {
+        let written = if copy_bytes {
+            mp3_mirror::clone_or_copy(&source_path, &dest_path).map_err(|error| error.to_string())
+        } else {
+            mp3_encode::encode_mirror(
+                &source_path,
+                &dest_path,
+                analysis.bpm,
+                analysis.musical_key.as_deref(),
+                &mut during_encode,
+            )
+        };
+        if let Err(error) = written {
             errors.push(format!("{}: {error}", job.source_rel));
             report_progress(root, true, &errors, &mut progress);
             continue;
@@ -378,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_skips_mp3_sources_reencodes_changes_and_deletes_only_its_files() {
+    fn sync_copies_mp3_sources_reencodes_changes_and_deletes_only_its_files() {
         let _guard = test_encode_lock();
         let root = scratch("sync");
         std::fs::create_dir(root.join("Artist")).unwrap();
@@ -395,8 +408,16 @@ mod tests {
             sync_folder(&root, || true, || {}, || {}, &names, hint, |_progress| {}).unwrap();
         assert!(errors.is_empty(), "{errors:?}");
         let mirrored = root.join("mp3").join("Artist").join("a.mp3");
+        let copied = root.join("mp3").join("already.mp3");
         assert!(mirrored.is_file());
-        assert!(!root.join("mp3").join("already.mp3").exists());
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            std::fs::read(root.join("already.mp3")).unwrap()
+        );
+        assert_ne!(
+            std::fs::metadata(&copied).unwrap().ino(),
+            std::fs::metadata(root.join("already.mp3")).unwrap().ino()
+        );
         assert_eq!(
             std::fs::read(root.join("mp3").join("keep-user.mp3")).unwrap(),
             b"user-file"
@@ -500,6 +521,88 @@ mod tests {
     }
 
     #[test]
+    fn mp3_copy_keeps_source_bytes_renames_on_reorder_and_follows_source_edits() {
+        let root = scratch("copy");
+        let payload = b"ID3\x03source-tags-stay".to_vec();
+        let mut original = payload.clone();
+        original.extend(std::iter::repeat(0x5A).take(64 * 1024));
+        std::fs::write(root.join("01 - Song.mp3"), &original).unwrap();
+        std::fs::write(root.join("02 - Other.mp3"), b"ID3other").unwrap();
+        std::fs::create_dir(root.join("mp3")).unwrap();
+        std::fs::write(root.join("mp3").join("keep-user.mp3"), b"user-file").unwrap();
+        let source = root.join("01 - Song.mp3");
+        let source_path = source.to_str().unwrap().to_string();
+        let other = root.join("02 - Other.mp3");
+        let other_path = other.to_str().unwrap().to_string();
+        let names = HashMap::from([
+            (source_path, ("Ada".to_string(), "Song".to_string())),
+            (other_path, ("Bea".to_string(), "Other".to_string())),
+        ]);
+        let hint = |_path: &Path| AnalysisHint {
+            bpm: Some(140.0),
+            musical_key: Some("Cm".to_string()),
+        };
+        let errors =
+            sync_folder(&root, || true, || {}, || {}, &names, hint, |_progress| {}).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        let copied = root.join("mp3").join("1 - Ada - Song.mp3");
+        assert_eq!(std::fs::read(&copied).unwrap(), original);
+        assert_ne!(
+            std::fs::metadata(&copied).unwrap().ino(),
+            std::fs::metadata(&source).unwrap().ino()
+        );
+        {
+            use std::io::Write;
+            let mut mirror = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&copied)
+                .unwrap();
+            mirror.write_all(b"mirror-only").unwrap();
+        }
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        let copied_bytes = std::fs::read(&copied).unwrap();
+        let copied_inode = std::fs::metadata(&copied).unwrap().ino();
+
+        let renamed_source = root.join("03 - Song.mp3");
+        std::fs::rename(&source, &renamed_source).unwrap();
+        let renamed_path = renamed_source.to_str().unwrap().to_string();
+        let names = HashMap::from([
+            (renamed_path, ("Ada".to_string(), "Song".to_string())),
+            (
+                root.join("02 - Other.mp3").to_str().unwrap().to_string(),
+                ("Bea".to_string(), "Other".to_string()),
+            ),
+        ]);
+        let errors =
+            sync_folder(&root, || true, || {}, || {}, &names, hint, |_progress| {}).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        let reordered = root.join("mp3").join("2 - Ada - Song.mp3");
+        assert!(reordered.is_file());
+        assert!(!copied.exists());
+        assert_eq!(std::fs::read(&reordered).unwrap(), copied_bytes);
+        assert_eq!(std::fs::metadata(&reordered).unwrap().ino(), copied_inode);
+
+        let mut changed = original.clone();
+        changed.extend_from_slice(b"edited");
+        std::fs::write(&renamed_source, &changed).unwrap();
+        let errors =
+            sync_folder(&root, || true, || {}, || {}, &names, hint, |_progress| {}).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(std::fs::read(&reordered).unwrap(), changed);
+
+        std::fs::remove_file(&renamed_source).unwrap();
+        let errors =
+            sync_folder(&root, || true, || {}, || {}, &names, hint, |_progress| {}).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!reordered.exists());
+        assert_eq!(
+            std::fs::read(root.join("mp3").join("keep-user.mp3")).unwrap(),
+            b"user-file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn idle_folder_reports_converted_sources_not_a_cleared_counter() {
         let root = scratch("progress");
         std::fs::create_dir_all(root.join("mp3")).unwrap();
@@ -551,11 +654,17 @@ mod tests {
         let last = seen
             .last()
             .expect("a finished folder still reports its sources");
-        assert_eq!(last.converted, 2);
-        assert_eq!(last.convertible, 2);
+        assert_eq!(last.converted, 25);
+        assert_eq!(last.convertible, 25);
         assert_eq!(last.already_mp3, 23);
         assert!(last.failures.is_empty());
         assert!(!last.active);
+        assert!(seen
+            .iter()
+            .any(|progress| { progress.active && progress.converted < progress.convertible }));
+        assert!(seen
+            .windows(2)
+            .all(|pair| pair[0].converted <= pair[1].converted));
         assert!(seen
             .iter()
             .all(|progress| !(progress.converted == 0 && progress.convertible > 0)));

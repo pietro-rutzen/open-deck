@@ -978,6 +978,7 @@ export const Library = memo(
       },
     );
     const mp3Fraction = mp3Folder && mp3On[mp3Folder] ? mp3Presentation.fraction : '';
+    const mp3Activity = mp3Folder && mp3On[mp3Folder] ? mp3Presentation.activity : '';
     const viewingMirror = Boolean(browsingFolder && mirrorBrowse?.inside);
     mirrorCopyPathsRef.current = new Set(
       viewingMirror ? (mirrorBrowse?.files ?? []).map((file) => file.path) : [],
@@ -1755,12 +1756,20 @@ export const Library = memo(
                         aria-selected={selectedRow}
                         aria-setsize={browseRows.length}
                         aria-posinset={index + 1}
-                        title={row.kind === 'folder' && row.mirror ? 'MP3 copies' : undefined}
+                        title={
+                          row.kind === 'folder' && row.mirror
+                            ? mp3Activity || mp3Presentation.failed
+                              ? mp3Presentation.title
+                              : 'MP3 copies'
+                            : undefined
+                        }
                         aria-label={
                           row.kind === 'up'
                             ? `Back to ${row.name}`
                             : row.kind === 'folder' && row.mirror
-                              ? `MP3 copies, ${row.trackCount} files`
+                              ? mp3Activity
+                                ? `MP3 copies, ${mp3Activity}`
+                                : `MP3 copies, ${row.trackCount} files`
                               : `${row.name}, ${row.playedCount} of ${row.trackCount} played`
                         }
                         tabIndex={
@@ -1812,9 +1821,11 @@ export const Library = memo(
                         <span
                           className={`mono tl-folder-count ${row.kind === 'folder' && !row.mirror ? playedClass(row.playedCount, row.trackCount) : ''}`}
                         >
-                          {row.kind === 'folder' && !row.mirror
-                            ? playedLabel(row.playedCount, row.trackCount)
-                            : ''}
+                          {row.kind === 'folder' && row.mirror && mp3Activity
+                            ? mp3Activity
+                            : row.kind === 'folder' && !row.mirror
+                              ? playedLabel(row.playedCount, row.trackCount)
+                              : ''}
                         </span>
                       </div>
                     );

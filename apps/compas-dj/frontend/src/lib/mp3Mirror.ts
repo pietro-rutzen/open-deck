@@ -55,25 +55,23 @@ export interface Mp3ConversionState {
 const wholeCount = (value: number) =>
   Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 
-/// Painted fraction is converted / convertible sources. A finished folder hides
-/// it. Already-MP3 files and failures stay in the hover title.
+/// Painted fraction is mirrored files over every audio source in the open folder.
+/// A finished folder hides it. Failures stay on the hover title.
 export const mp3ConversionPresentation = (
   state: Mp3ConversionState,
-): { fraction: string; title: string } => {
-  const convertible = wholeCount(state.convertible);
-  const converted = Math.min(wholeCount(state.converted), convertible);
-  const alreadyMp3 = wholeCount(state.alreadyMp3);
+): { fraction: string; activity: string; title: string; failed: boolean } => {
+  const total = wholeCount(state.convertible);
+  const done = Math.min(wholeCount(state.converted), total);
   const failures = state.failures.filter((failure) => failure.trim().length > 0);
-  const complete =
-    convertible > 0 && converted >= convertible && failures.length === 0 && !state.active;
-  const fraction = convertible > 0 && !complete ? `${converted}/${convertible}` : '';
+  const complete = total > 0 && done >= total && failures.length === 0 && !state.active;
+  const fraction = total > 0 && !complete ? `${done}/${total}` : '';
+  const activity = fraction.length > 0 ? `converting ${fraction}` : '';
   const details = [
-    convertible > 0 ? `${converted} of ${convertible} converted` : null,
-    alreadyMp3 > 0 ? `${alreadyMp3} already MP3` : null,
+    fraction.length > 0 ? `${done} of ${total} in the mirror` : null,
     failures.length > 0 ? `Failed: ${failures.join('; ')}` : null,
   ].filter((line): line is string => line != null);
   const title = details.length > 0
     ? `Keep MP3 copies. ${details.join('. ')}.`
     : 'Keep MP3 copies';
-  return { fraction, title };
+  return { fraction, activity, title, failed: failures.length > 0 };
 };

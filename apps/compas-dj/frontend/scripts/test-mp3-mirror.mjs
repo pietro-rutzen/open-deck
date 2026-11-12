@@ -12,47 +12,54 @@ const { isInsideMirror, mirrorDirectory, mp3ConversionPresentation, selectedWatc
 
 const presentations = [
   {
-    name: "finished hyperpop is not 0/2",
-    state: { converted: 2, convertible: 2, alreadyMp3: 23, failures: [], active: false },
+    name: "a finished folder hides the count",
+    state: { converted: 25, convertible: 25, alreadyMp3: 23, failures: [], active: false },
     fraction: "",
-    title: /2 of 2 converted.*23 already MP3/,
+    activity: "",
+    title: /^Keep MP3 copies$/,
   },
   {
     name: "partial sources stay visible after the worker idles",
-    state: { converted: 3, convertible: 25, alreadyMp3: 0, failures: [], active: false },
+    state: { converted: 3, convertible: 25, alreadyMp3: 22, failures: [], active: false },
     fraction: "3/25",
-    title: /3 of 25 converted/,
+    activity: "converting 3/25",
+    title: /3 of 25 in the mirror/,
   },
   {
-    name: "a running folder shows converted over convertible",
-    state: { converted: 3, convertible: 25, alreadyMp3: 0, failures: [], active: true },
+    name: "a running folder shows mirrored over every source",
+    state: { converted: 3, convertible: 25, alreadyMp3: 22, failures: [], active: true },
     fraction: "3/25",
-    title: /3 of 25 converted/,
+    activity: "converting 3/25",
+    title: /3 of 25 in the mirror/,
   },
   {
     name: "a failure stays in the fraction and on the hover",
     state: {
-      converted: 1,
-      convertible: 2,
+      converted: 24,
+      convertible: 25,
       alreadyMp3: 23,
       failures: ["one.flac: could not decode"],
       active: false,
     },
-    fraction: "1/2",
+    fraction: "24/25",
+    activity: "converting 24/25",
     title: /Failed: one\.flac: could not decode/,
   },
   {
-    name: "already-mp3 folders have nothing to paint",
-    state: { converted: 0, convertible: 0, alreadyMp3: 10, failures: [], active: false },
+    name: "an empty folder has nothing to paint",
+    state: { converted: 0, convertible: 0, alreadyMp3: 0, failures: [], active: false },
     fraction: "",
-    title: /10 already MP3/,
+    activity: "",
+    title: /^Keep MP3 copies$/,
   },
 ];
 for (const entry of presentations) {
   const shown = mp3ConversionPresentation(entry.state);
   assert.equal(shown.fraction, entry.fraction, entry.name);
+  assert.equal(shown.activity, entry.activity, entry.name);
   assert.match(shown.title, entry.title, entry.name);
   assert.equal(shown.title.includes("played"), false, entry.name);
+  assert.equal(shown.title.includes("already MP3"), false, entry.name);
 }
 
 const music = "/Users/pietro/Music/party";
@@ -112,12 +119,15 @@ assert.match(toolbar, /Open one watched folder to keep MP3 copies/);
 assert.match(toolbar, /className=\{`add-btn\$\{mp3Folder && mp3On\[mp3Folder\] \? ' add-btn--on' : ''\}`\}/);
 assert.match(toolbar, /mp3Presentation\.title/);
 assert.match(source, /Keep MP3 copies/);
+assert.match(source, /converting \$\{fraction\}/);
+assert.match(library, /const mp3Activity/);
+assert.match(library, /row\.mirror && mp3Activity/);
+assert.match(library, /t\.source_path \|\| t\.path/);
 assert.equal(toolbar.includes("tl-mp3"), false);
 assert.equal(toolbar.includes("sq-check"), false);
 assert.equal(css.includes("tl-mp3"), false);
 assert.match(library, /name: 'mp3'/);
-assert.match(library, /title=\{row\.kind === 'folder' && row\.mirror \? 'MP3 copies' : undefined\}/);
-assert.match(library, /t\.source_path \|\| t\.path/);
+assert.match(library, /mp3Activity \|\| mp3Presentation\.failed/);
 assert.match(library, /listMp3Mirror/);
 assert.equal(toolbar.includes("name: 'mp3'"), false);
 assert.match(library, /MP3 copies follow the source folder reorder/);

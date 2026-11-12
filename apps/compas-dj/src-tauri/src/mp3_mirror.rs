@@ -98,6 +98,8 @@ pub(crate) struct DeleteJob {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MirrorPlan {
     pub(crate) encode: Vec<EncodeJob>,
+    /// Existing MP3 sources. The bytes are cloned or copied, never re-encoded.
+    pub(crate) copy: Vec<EncodeJob>,
     pub(crate) rename: Vec<RenameJob>,
     pub(crate) keep: Vec<KeepJob>,
     pub(crate) skip: Vec<String>,
@@ -115,8 +117,8 @@ pub(crate) fn playback_should_pause(playhead_rates: impl IntoIterator<Item = f64
         .any(|rate| rate.is_finite() && rate.abs() > f64::EPSILON)
 }
 
-/// `mp3/Artist/Album/song.mp3` for `Artist/Album/song.flac`.
-/// `None` for an existing MP3, a path inside the reserved mirror, or a non-audio file.
+/// `mp3/Artist/Album/song.mp3` for `Artist/Album/song.flac` and for an existing `song.mp3`.
+/// `None` for a path inside the reserved mirror, or for a non-audio file.
 pub(crate) fn mirror_dest_rel(source_rel: &str) -> Option<String> {
     if source_rel.is_empty() || source_rel.contains('\\') {
         return None;
@@ -137,7 +139,7 @@ pub(crate) fn mirror_dest_rel(source_rel: &str) -> Option<String> {
     }
     let file_name = *parts.last()?;
     let (stem, ext) = file_name.rsplit_once('.')?;
-    if stem.is_empty() || !is_convertible_extension(ext) {
+    if stem.is_empty() || !is_mirror_source_extension(ext) {
         return None;
     }
     let mut dest = String::from(MIRROR_DIR);
@@ -151,10 +153,12 @@ pub(crate) fn mirror_dest_rel(source_rel: &str) -> Option<String> {
     Some(dest)
 }
 
-fn is_convertible_extension(ext: &str) -> bool {
-    if ext.eq_ignore_ascii_case("mp3") {
-        return false;
-    }
+pub(crate) fn source_is_mp3(rel: &str) -> bool {
+    rel.rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("mp3"))
+}
+
+fn is_mirror_source_extension(ext: &str) -> bool {
     crate::is_audio_file(Path::new(&format!("track.{ext}")))
 }
 
@@ -444,10 +448,22 @@ fn assigned_dests(sources: &[SourceStamp]) -> BTreeMap<String, String> {
                     }
                 }
             } else {
-                let candidate = limit_file_name(&format!("{stem}.mp3"));
-                if !taken.insert(candidate.to_lowercase()) {
-                    continue;
-                }
+                let mut copy = 1usize;
+                let candidate = loop {
+                    let suffix = if copy == 1 {
+                        String::new()
+                    } else {
+                        format!(" ({copy})")
+                    };
+                    let candidate = limit_file_name(&format!("{stem}{suffix}.mp3"));
+                    if taken.insert(candidate.to_lowercase()) {
+                        break candidate;
+                    }
+                    copy += 1;
+                    if copy > 1000 {
+                        break limit_file_name(&format!("{stem} ({copy}).mp3"));
+                    }
+                };
                 candidate
             };
             let dest = if parent.is_empty() {
@@ -476,6 +492,7 @@ pub(crate) fn plan_mirror(
         by_source.insert(entry.source.as_str(), (key.as_str(), entry));
     }
     let mut encode = Vec::new();
+    let mut copy = Vec::new();
     let mut rename = Vec::new();
     let mut keep = Vec::new();
     let mut skip = Vec::new();
@@ -542,13 +559,20 @@ pub(crate) fn plan_mirror(
                     });
                 }
             }
-            _ => encode.push(EncodeJob {
-                source_rel: source.rel.clone(),
-                dest_rel: dest.clone(),
-                identity,
-                dev: source.dev,
-                ino: source.ino,
-            }),
+            _ => {
+                let job = EncodeJob {
+                    source_rel: source.rel.clone(),
+                    dest_rel: dest.clone(),
+                    identity,
+                    dev: source.dev,
+                    ino: source.ino,
+                };
+                if source_is_mp3(&source.rel) {
+                    copy.push(job);
+                } else {
+                    encode.push(job);
+                }
+            }
         }
     }
     let delete = match policy {
@@ -580,6 +604,7 @@ pub(crate) fn plan_mirror(
     };
     MirrorPlan {
         encode,
+        copy,
         rename,
         keep,
         skip,
@@ -587,8 +612,9 @@ pub(crate) fn plan_mirror(
     }
 }
 
-/// Converted copies over convertible sources. Already-MP3 files are counted
-/// separately so a mirror's file count cannot become the denominator.
+/// Mirrored files over every audio source in the folder. An existing MP3 is part
+/// of both numbers once its copy is in place. `already_mp3` is how many sources
+/// were already MP3, which is included in `convertible` rather than a remainder.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversionStatus {
     pub(crate) converted: u32,
@@ -608,10 +634,10 @@ pub(crate) fn conversion_status(root: &Path, scope_prefix: &str) -> ConversionSt
     let plan = plan_mirror(&sources, &manifest, policy, |dest| {
         root.join(dest).is_file()
     });
-    let converted =
-        u32::try_from(plan.keep.len().saturating_add(plan.rename.len())).unwrap_or(u32::MAX);
-    let convertible =
-        converted.saturating_add(u32::try_from(plan.encode.len()).unwrap_or(u32::MAX));
+    let done = plan.keep.len().saturating_add(plan.rename.len());
+    let pending = plan.encode.len().saturating_add(plan.copy.len());
+    let converted = u32::try_from(done).unwrap_or(u32::MAX);
+    let convertible = converted.saturating_add(u32::try_from(pending).unwrap_or(u32::MAX));
     ConversionStatus {
         converted,
         convertible,
@@ -726,6 +752,63 @@ pub(crate) fn atomic_replace(
         }
     }
     Ok(())
+}
+
+/// Place an existing MP3 into the mirror without re-encoding it.
+///
+/// On the same APFS volume this is a `clonefile` clone: a separate file that
+/// shares extents until either side is written. Reorder can rename that file,
+/// and replacing it cannot rewrite the source. A USB volume cannot hold the
+/// clone, so the bytes are copied instead. A hard link is not used: it is the
+/// same inode, and a later write or delete of the mirror would change the source.
+pub(crate) fn clone_or_copy(source: &Path, dest: &Path) -> std::io::Result<()> {
+    atomic_replace(dest, |tmp| {
+        if clone_same_volume(source, tmp).is_ok() {
+            return Ok(());
+        }
+        let mut input = File::open(source)?;
+        let mut output = File::create(tmp)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        Ok(())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn clone_same_volume(source: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source_path = std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the source path contains a null",
+        )
+    })?;
+    let dest_path = std::ffi::CString::new(dest.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the mirror path contains a null",
+        )
+    })?;
+    unsafe extern "C" {
+        fn clonefile(src: *const std::ffi::c_char, dst: *const std::ffi::c_char, flags: u32)
+            -> i32;
+    }
+    // SAFETY: both pointers come from CStrings that outlive this call. clonefile
+    // creates `dest` and does not retain the pointers. flags 0 follows the source.
+    let copied = unsafe { clonefile(source_path.as_ptr(), dest_path.as_ptr(), 0) };
+    if copied == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_same_volume(_source: &Path, _dest: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "clonefile is a macOS APFS call",
+    ))
 }
 
 const MIRROR_WALK_LIMIT: u32 = 32;
@@ -1192,7 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn mirror_paths_keep_the_tree_and_skip_mp3_sources() {
+    fn mirror_paths_keep_the_tree_and_include_mp3_sources() {
         assert_eq!(
             mirror_dest_rel("Artist/Album/song.flac").as_deref(),
             Some("mp3/Artist/Album/song.mp3")
@@ -1204,8 +1287,8 @@ mod tests {
         assert_eq!(mirror_dest_rel("take.wav").as_deref(), Some("mp3/take.mp3"));
         assert_eq!(mirror_dest_rel("take.aif").as_deref(), Some("mp3/take.mp3"));
         assert_eq!(mirror_dest_rel("take.m4a").as_deref(), Some("mp3/take.mp3"));
-        assert_eq!(mirror_dest_rel("song.mp3"), None);
-        assert_eq!(mirror_dest_rel("song.MP3"), None);
+        assert_eq!(mirror_dest_rel("song.mp3").as_deref(), Some("mp3/song.mp3"));
+        assert_eq!(mirror_dest_rel("song.MP3").as_deref(), Some("mp3/song.mp3"));
         assert_eq!(mirror_dest_rel("mp3/song.flac"), None);
         assert_eq!(mirror_dest_rel("MP3/song.wav"), None);
         assert_eq!(mirror_dest_rel("../song.flac"), None);
@@ -1259,11 +1342,18 @@ mod tests {
             vec!["mp3/song.mp3".to_string()],
             "the flac owns the shared name and is unchanged"
         );
-        assert!(plan.encode.iter().all(|job| job.source_rel != "song.wav"));
         assert!(plan
             .encode
             .iter()
             .all(|job| job.source_rel != "already.mp3"));
+        assert!(plan
+            .copy
+            .iter()
+            .any(|job| job.source_rel == "already.mp3" && job.dest_rel == "mp3/already.mp3"));
+        assert!(plan
+            .encode
+            .iter()
+            .any(|job| job.source_rel == "song.wav" && job.dest_rel == "mp3/song (2).mp3"));
         assert!(plan
             .encode
             .iter()
@@ -1324,7 +1414,7 @@ mod tests {
     }
 
     #[test]
-    fn source_stamps_ignore_mp3_sources_and_the_mirror_tree() {
+    fn source_stamps_include_mp3_sources_and_skip_the_mirror_tree() {
         let root = scratch("stamps");
         std::fs::create_dir(root.join("Artist")).unwrap();
         std::fs::write(root.join("Artist").join("a.flac"), b"fLaC").unwrap();
@@ -1332,8 +1422,9 @@ mod tests {
         std::fs::create_dir(root.join("mp3")).unwrap();
         std::fs::write(root.join("mp3").join("hidden.wav"), b"RIFF").unwrap();
         let stamps = source_stamps(&root);
-        assert_eq!(stamps.len(), 1);
+        assert_eq!(stamps.len(), 2);
         assert_eq!(stamps[0].rel, "Artist/a.flac");
+        assert_eq!(stamps[1].rel, "already.mp3");
         assert_eq!(stamps[0].len, 4);
         assert!(stamps[0].mtime_ns > 0);
         let _ = std::fs::remove_dir_all(&root);
@@ -1393,6 +1484,27 @@ mod tests {
             .encode
             .windows(2)
             .all(|pair| pair[0].dest_rel <= pair[1].dest_rel));
+    }
+
+    #[test]
+    fn ordered_folder_numbers_mp3_copies_with_the_lossless_files() {
+        let sources = vec![
+            named("01 - a.flac", 4, 4, 1, 1, "Ada", "First"),
+            named("02 - b.mp3", 4, 4, 1, 2, "Bea", "Second"),
+            named("03 - c.wav", 4, 4, 1, 3, "Cy", "Third"),
+        ];
+        let plan = plan_mirror(
+            &sources,
+            &Manifest::default(),
+            OrphanPolicy::KeepAll,
+            |_| false,
+        );
+        assert_eq!(plan.copy.len(), 1);
+        assert_eq!(plan.copy[0].source_rel, "02 - b.mp3");
+        assert_eq!(plan.copy[0].dest_rel, "mp3/2 - Bea - Second.mp3");
+        assert_eq!(plan.encode.len(), 2);
+        assert_eq!(plan.encode[0].dest_rel, "mp3/1 - Ada - First.mp3");
+        assert_eq!(plan.encode[1].dest_rel, "mp3/3 - Cy - Third.mp3");
     }
 
     #[test]
@@ -1623,24 +1735,14 @@ mod tests {
         }
         save_manifest(&root, &manifest).unwrap();
         let finished = conversion_status(&root, "");
-        assert_eq!(
-            finished,
-            ConversionStatus {
-                converted: 2,
-                convertible: 2,
-                already_mp3: 23,
-            }
-        );
+        assert_eq!(finished.converted, 2);
+        assert_eq!(finished.convertible, 25);
+        assert_eq!(finished.already_mp3, 23);
         std::fs::remove_file(root.join("mp3/two.mp3")).unwrap();
         let partial = conversion_status(&root, "");
-        assert_eq!(
-            partial,
-            ConversionStatus {
-                converted: 1,
-                convertible: 2,
-                already_mp3: 23,
-            }
-        );
+        assert_eq!(partial.converted, 1);
+        assert_eq!(partial.convertible, 25);
+        assert_eq!(partial.already_mp3, 23);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
