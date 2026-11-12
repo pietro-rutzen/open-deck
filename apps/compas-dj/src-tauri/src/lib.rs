@@ -1912,9 +1912,16 @@ fn kick_mp3_mirror(app: &AppHandle) {
             if folders.is_empty() {
                 break;
             }
+            let names = app
+                .try_state::<db::Db>()
+                .and_then(|db| with_db(&db, db::track_labels).ok())
+                .unwrap_or_default();
             for folder in folders {
                 let folder_path = folder.clone();
                 let app_for_folder = app.clone();
+                let mut last_progress = Instant::now()
+                    .checked_sub(Duration::from_millis(400))
+                    .unwrap_or_else(Instant::now);
                 let errors = mp3_worker::sync_folder(
                     std::path::Path::new(&folder),
                     || {
@@ -1930,8 +1937,17 @@ fn kick_mp3_mirror(app: &AppHandle) {
                     },
                     || wait_for_mirror_slot(&app_for_folder),
                     || wait_while_playing(&app_for_folder),
+                    &names,
                     |source| analysis_hint(&app_for_folder, source),
                     |done, total, active| {
+                        let now = Instant::now();
+                        let settled = !active || (total > 0 && done >= total);
+                        if !settled
+                            && now.duration_since(last_progress) < Duration::from_millis(400)
+                        {
+                            return;
+                        }
+                        last_progress = now;
                         let _ = app_for_folder.emit(
                             "mp3-mirror:progress",
                             Mp3MirrorProgress {

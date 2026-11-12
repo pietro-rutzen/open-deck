@@ -80,7 +80,7 @@ import {
   reorderPaths,
   writeFolderOrders,
 } from '../lib/libraryFolders';
-import { mp3CopyProgressLabel } from '../lib/mp3Mirror';
+import { mp3CopyProgressLabel, selectedWatchFolder } from '../lib/mp3Mirror';
 import { controllerLoadPath, selectedControllerRow, stepControllerRow } from '../lib/libraryController';
 import { filterLibraryTracks } from '../lib/librarySearch';
 import { listeningModeActive, setListeningMode } from '../lib/listeningMode';
@@ -894,6 +894,13 @@ export const Library = memo(
       [sourceTracks, sort],
     );
     const browsingFolder = Boolean(folderPath) && !q.trim();
+    const mp3Folder = selectedWatchFolder(folderPath, folders);
+    const mp3ProgressForFolder = mp3Folder ? mp3Progress[mp3Folder] : undefined;
+    const mp3ProgressLabel = mp3CopyProgressLabel(
+      mp3ProgressForFolder?.done ?? 0,
+      mp3ProgressForFolder?.total ?? 0,
+      mp3ProgressForFolder?.active ?? false,
+    );
     const folderEntries = useMemo(
       () =>
         browsingFolder && folderPath
@@ -1375,12 +1382,6 @@ export const Library = memo(
           )}
           {folders.map((f) => {
             const counts = folderPlayCounts(lib.tracks, f);
-            const progress = mp3Progress[f];
-            const progressLabel = mp3CopyProgressLabel(
-              progress?.done ?? 0,
-              progress?.total ?? 0,
-              progress?.active ?? false,
-            );
             return (
               <div
                 key={f}
@@ -1402,32 +1403,12 @@ export const Library = memo(
                   }
                 }}
               >
-                <button
-                  type="button"
-                  className={`sq-check${mp3On[f] ? ' sq-check--on' : ''}`}
-                  aria-pressed={Boolean(mp3On[f])}
-                  aria-label="Keep MP3 copies"
-                  title="Keep MP3 copies"
-                  onMouseDown={(event) => event.stopPropagation()}
-                  onKeyDown={(event) => event.stopPropagation()}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    toggleMp3(f);
-                  }}
-                />
                 <Icon name="folder" size={13} />
                 <span className="src-name">{baseName(f)}</span>
                 <span
                   className={`mono src-play-count ${playedClass(counts.played, counts.total)}`}
                 >
                   {playedLabel(counts.played, counts.total)}
-                </span>
-                <span
-                  className="mono src-mp3-progress"
-                  title={progressLabel ? `MP3 copies ${progressLabel}` : undefined}
-                  aria-hidden={progressLabel === ''}
-                >
-                  {progressLabel}
                 </span>
                 <button
                   className="crate-add"
@@ -1521,6 +1502,18 @@ export const Library = memo(
               {listening ? 'Performance mode' : 'Listening mode'}
             </button>
             <button
+              className="add-btn"
+              onClick={resetPlayed}
+              disabled={viewCounts.played === 0}
+              title={
+                browsingFolder
+                  ? 'Clear played marks in this folder'
+                  : 'Clear played marks for the whole library'
+              }
+            >
+              Reset played
+            </button>
+            <button
               type="button"
               className={`add-btn${canReorder ? ' add-btn--on' : ''}`}
               aria-pressed={canReorder}
@@ -1541,16 +1534,27 @@ export const Library = memo(
               Reorder
             </button>
             <button
-              className="add-btn"
-              onClick={resetPlayed}
-              disabled={viewCounts.played === 0}
+              type="button"
+              className={`add-btn${mp3Folder && mp3On[mp3Folder] ? ' add-btn--on' : ''}`}
+              aria-pressed={Boolean(mp3Folder && mp3On[mp3Folder])}
+              disabled={mp3Folder == null}
               title={
-                browsingFolder
-                  ? 'Clear played marks in this folder'
-                  : 'Clear played marks for the whole library'
+                mp3Folder
+                  ? 'Keep 320 kbps MP3 copies of this folder for older CDJs. Turning this off leaves copies in place.'
+                  : 'Open one watched folder to keep MP3 copies'
               }
+              onClick={() => {
+                if (mp3Folder) toggleMp3(mp3Folder);
+              }}
             >
-              Reset played
+              Keep MP3 copies
+              <span
+                className="mono tl-mp3-progress"
+                title={mp3ProgressLabel ? `MP3 copies ${mp3ProgressLabel}` : undefined}
+                aria-hidden={mp3ProgressLabel === ''}
+              >
+                {mp3ProgressLabel}
+              </span>
             </button>
           </div>
 

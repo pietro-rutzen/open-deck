@@ -6,7 +6,7 @@ const source = readFileSync(new URL("../src/lib/mp3Mirror.ts", import.meta.url),
 const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { mp3CopyProgressLabel } = await import(
+const { mp3CopyProgressLabel, selectedWatchFolder } = await import(
   `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`
 );
 
@@ -25,14 +25,52 @@ for (const entry of cases) {
   );
 }
 
+const music = "/Users/pietro/Music/party";
+const nested = "/Users/pietro/Music/party/nights";
+const other = "/Users/pietro/Music/other";
+const folderCases = [
+  { openPath: null, folders: [music], expected: null },
+  { openPath: music, folders: [music, other], expected: music },
+  { openPath: `${nested}/`, folders: [music], expected: music },
+  { openPath: nested, folders: [music, nested], expected: null },
+  { openPath: "/Users/pietro/Music/party-live", folders: [music], expected: null },
+  { openPath: other, folders: [], expected: null },
+];
+for (const entry of folderCases) {
+  assert.equal(selectedWatchFolder(entry.openPath, entry.folders), entry.expected);
+}
+
 const library = readFileSync(new URL("../src/components/Library.tsx", import.meta.url), "utf8");
 const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
-assert.match(library, /title="Keep MP3 copies"/);
-assert.match(library, /aria-label="Keep MP3 copies"/);
-assert.match(library, /className=\{`sq-check\$\{mp3On\[f\] \? ' sq-check--on' : ''\}`\}/);
-assert.match(library, /src-mp3-progress/);
-assert.match(css, /\.sq-check \{[^}]*border-radius:\s*0;/);
-assert.match(css, /\.src-mp3-progress \{[^}]*width:\s*4\.2em;/);
-assert.match(css, /\.src-mp3-progress \{[^}]*min-width:\s*4\.2em;/);
+const toolbarStart = library.indexOf('className="tl-toolbar"');
+const toolbarEnd = library.indexOf('className="tl-sheet"', toolbarStart);
+assert.ok(toolbarStart > 0 && toolbarEnd > toolbarStart);
+const toolbar = library.slice(toolbarStart, toolbarEnd);
+const folderList = library.slice(0, toolbarStart);
+const controlOrder = [
+  'aria-label="Search library"',
+  "'+ Add tracks'",
+  "'Listening mode'",
+  "\n              Reset played\n",
+  "\n              Reorder\n",
+  "\n              Keep MP3 copies\n",
+];
+let cursor = -1;
+for (const marker of controlOrder) {
+  const at = toolbar.indexOf(marker);
+  assert.ok(at > cursor, `toolbar order missing ${marker}`);
+  cursor = at;
+}
+assert.equal(folderList.includes("Keep MP3 copies"), false);
+assert.equal(folderList.includes("tl-mp3"), false);
+assert.match(toolbar, /disabled=\{mp3Folder == null\}/);
+assert.match(toolbar, /Open one watched folder to keep MP3 copies/);
+assert.match(toolbar, /className=\{`add-btn\$\{mp3Folder && mp3On\[mp3Folder\] \? ' add-btn--on' : ''\}`\}/);
+assert.match(toolbar, /className="mono tl-mp3-progress"/);
+assert.equal(toolbar.includes("tl-mp3-check"), false);
+assert.equal(toolbar.includes("sq-check"), false);
+assert.match(css, /\.tl-mp3-progress \{[^}]*display:\s*inline-block;/);
+assert.match(css, /\.tl-mp3-progress \{[^}]*width:\s*4\.2em;/);
+assert.match(css, /\.tl-mp3-progress \{[^}]*min-width:\s*4\.2em;/);
 
-console.log("MP3 mirror: progress label, square checkbox, and fixed count slot passed");
+console.log("MP3 mirror: toolbar control, folder selection, and fixed count slot passed");

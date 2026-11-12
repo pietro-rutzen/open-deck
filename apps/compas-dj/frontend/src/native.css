@@ -114,8 +114,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focu
 .src-dot { width: 6px; height: 6px; }
 .ctrl-tag { border: 0; color: var(--text-secondary); font-family: var(--font-ui); font-size: 10px; }
 .crate-add { border: 0; }
-.tl-toolbar { height: auto; min-height: 48px; padding: 0 14px; gap: 8px; flex-wrap: wrap; overflow: visible; }
-.tl-toolbar .search { flex: 1 1 260px; min-width: 260px; }
+.tl-toolbar { height: auto; min-height: 48px; padding: 0 14px; gap: 8px; flex-wrap: nowrap; overflow: hidden; }
+.tl-toolbar .search { flex: 1 1 140px; min-width: 96px; }
+.tl-toolbar .tl-crumbs { flex: 0 1 auto; min-width: 0; overflow: hidden; }
 .tl-toolbar .add-btn, .tl-toolbar .tl-count, .tl-toolbar .tl-crumbs { flex: none; }
 .search { max-width: none; border-color: #ffffff08; background: #1c1d20; padding: 5px 8px; }
 .search input { width: 100%; min-width: 40px; font-size: 11px; }

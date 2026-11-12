@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 pub(crate) const MIRROR_DIR: &str = "mp3";
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 const MANIFEST_FILE: &str = ".opendeck-mp3-manifest.json";
 /// One-minute load average divided by the CPU count. Above this, the worker
 /// yields between files. At or below it, a file may start.
@@ -27,6 +27,12 @@ pub(crate) struct ManifestFile {
     pub(crate) source: String,
     pub(crate) source_len: u64,
     pub(crate) source_mtime_ns: u64,
+    #[serde(default)]
+    pub(crate) dest: String,
+    #[serde(default)]
+    pub(crate) source_dev: u64,
+    #[serde(default)]
+    pub(crate) source_ino: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -50,19 +56,51 @@ pub(crate) struct SourceStamp {
     pub(crate) rel: String,
     pub(crate) len: u64,
     pub(crate) mtime_ns: u64,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) artist: String,
+    pub(crate) title: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EncodeJob {
     pub(crate) source_rel: String,
     pub(crate) dest_rel: String,
+    pub(crate) identity: String,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RenameJob {
+    pub(crate) previous_key: String,
+    pub(crate) identity: String,
+    pub(crate) from_rel: String,
+    pub(crate) to_rel: String,
+    pub(crate) entry: ManifestFile,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeepJob {
+    pub(crate) previous_key: String,
+    pub(crate) identity: String,
+    pub(crate) entry: ManifestFile,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeleteJob {
+    pub(crate) identity: String,
+    pub(crate) dest_rel: String,
+    pub(crate) source_rel: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MirrorPlan {
     pub(crate) encode: Vec<EncodeJob>,
+    pub(crate) rename: Vec<RenameJob>,
+    pub(crate) keep: Vec<KeepJob>,
     pub(crate) skip: Vec<String>,
-    pub(crate) delete: Vec<String>,
+    pub(crate) delete: Vec<DeleteJob>,
 }
 
 pub(crate) fn machine_is_busy(load_per_cpu: f64) -> bool {
@@ -170,10 +208,15 @@ pub(crate) fn source_stamps(root: &Path) -> Vec<SourceStamp> {
         }) else {
             continue;
         };
+        let (dev, ino) = file_identity(&meta);
         stamps.push(SourceStamp {
             rel,
             len: meta.len(),
             mtime_ns,
+            dev,
+            ino,
+            artist: String::new(),
+            title: String::new(),
         });
     }
     stamps.sort_by(|left, right| left.rel.cmp(&right.rel));
@@ -195,37 +238,313 @@ fn relative_string(path: &Path) -> Option<String> {
     }
 }
 
+fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return (meta.dev(), meta.ino());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        (0, 0)
+    }
+}
+
+pub(crate) fn identity_key(dev: u64, ino: u64, source: &str) -> String {
+    if ino != 0 {
+        format!("dev:{dev}:ino:{ino}")
+    } else {
+        format!("path:{source}")
+    }
+}
+
+fn normalized_manifest(manifest: &Manifest) -> Manifest {
+    if manifest.version >= MANIFEST_VERSION {
+        return manifest.clone();
+    }
+    let mut files = BTreeMap::new();
+    for (key, entry) in &manifest.files {
+        let mut entry = entry.clone();
+        if entry.dest.is_empty() {
+            entry.dest = key.clone();
+        }
+        let id = identity_key(entry.source_dev, entry.source_ino, &entry.source);
+        files.insert(id, entry);
+    }
+    Manifest {
+        version: MANIFEST_VERSION,
+        files,
+    }
+}
+
+fn parent_of(rel: &str) -> &str {
+    match rel.rfind('/') {
+        Some(index) => &rel[..index],
+        None => "",
+    }
+}
+
+fn file_name_of(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+fn order_index(file_name: &str) -> Option<u32> {
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, _)| stem);
+    let digits = stem
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = stem[digits..].trim_start();
+    let marker = rest.chars().next()?;
+    if !matches!(marker, '.' | '-' | ')') {
+        return None;
+    }
+    let name = rest[marker.len_utf8()..].trim_start();
+    if name.is_empty() {
+        return None;
+    }
+    stem[..digits].parse().ok()
+}
+
+fn strip_order_prefix(stem: &str) -> &str {
+    let digits = stem
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return stem;
+    }
+    let rest = stem[digits..].trim_start();
+    let Some(marker) = rest.chars().next() else {
+        return stem;
+    };
+    if !matches!(marker, '.' | '-' | ')') {
+        return stem;
+    }
+    let name = rest[marker.len_utf8()..].trim_start();
+    if name.is_empty() {
+        stem
+    } else {
+        name
+    }
+}
+
+fn clean_label(value: &str) -> String {
+    let mut cleaned = String::new();
+    let mut spaced = false;
+    for character in value.chars() {
+        let blocked = character.is_control()
+            || matches!(
+                character,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+            );
+        if blocked || character.is_whitespace() {
+            if !cleaned.is_empty() && !spaced {
+                cleaned.push(' ');
+                spaced = true;
+            }
+            continue;
+        }
+        cleaned.push(character);
+        spaced = false;
+    }
+    cleaned.trim().trim_matches('.').trim().to_string()
+}
+
+fn display_label(artist: &str, title: &str, fallback_stem: &str) -> String {
+    let artist = clean_label(artist);
+    let title = clean_label(title);
+    let label = match (artist.is_empty(), title.is_empty()) {
+        (false, false) => format!("{artist} - {title}"),
+        (true, false) => title,
+        (false, true) => artist,
+        (true, true) => clean_label(strip_order_prefix(fallback_stem)),
+    };
+    if label.is_empty() {
+        "track".to_string()
+    } else {
+        label
+    }
+}
+
+fn limit_file_name(name: &str) -> String {
+    let mut limited = name.to_string();
+    while limited.len() > 240 {
+        limited.pop();
+    }
+    let trimmed = limited.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "track.mp3".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn assigned_dests(sources: &[SourceStamp]) -> BTreeMap<String, String> {
+    let mut groups: BTreeMap<String, Vec<&SourceStamp>> = BTreeMap::new();
+    for source in sources {
+        if mirror_dest_rel(&source.rel).is_none() {
+            continue;
+        }
+        groups
+            .entry(parent_of(&source.rel).to_string())
+            .or_default()
+            .push(source);
+    }
+    let mut dests = BTreeMap::new();
+    for (parent, mut group) in groups {
+        let ordered = group
+            .iter()
+            .all(|source| order_index(file_name_of(&source.rel)).is_some());
+        if ordered {
+            group.sort_by(|left, right| {
+                order_index(file_name_of(&left.rel))
+                    .cmp(&order_index(file_name_of(&right.rel)))
+                    .then_with(|| left.rel.cmp(&right.rel))
+            });
+        } else {
+            group.sort_by(|left, right| left.rel.cmp(&right.rel));
+        }
+        let width = group.len().to_string().len();
+        let mut taken = BTreeSet::new();
+        for (position, source) in group.iter().enumerate() {
+            let stem = file_name_of(&source.rel)
+                .rsplit_once('.')
+                .map_or(file_name_of(&source.rel), |(stem, _)| stem);
+            let name = if ordered {
+                let mut copy = 1usize;
+                loop {
+                    let label = display_label(&source.artist, &source.title, stem);
+                    let suffix = if copy == 1 {
+                        String::new()
+                    } else {
+                        format!(" ({copy})")
+                    };
+                    let candidate =
+                        limit_file_name(&format!("{:0width$} - {label}{suffix}.mp3", position + 1));
+                    if taken.insert(candidate.to_lowercase()) {
+                        break candidate;
+                    }
+                    copy += 1;
+                    if copy > 1000 {
+                        break limit_file_name(&format!(
+                            "{:0width$} - track ({copy}).mp3",
+                            position + 1
+                        ));
+                    }
+                }
+            } else {
+                let candidate = limit_file_name(&format!("{stem}.mp3"));
+                if !taken.insert(candidate.to_lowercase()) {
+                    continue;
+                }
+                candidate
+            };
+            let dest = if parent.is_empty() {
+                format!("mp3/{name}")
+            } else {
+                format!("mp3/{parent}/{name}")
+            };
+            if safe_mirror_rel(&dest) {
+                dests.insert(source.rel.clone(), dest);
+            }
+        }
+    }
+    dests
+}
+
 pub(crate) fn plan_mirror(
     sources: &[SourceStamp],
     manifest: &Manifest,
     policy: OrphanPolicy,
     dest_exists: impl Fn(&str) -> bool,
 ) -> MirrorPlan {
-    let mut sources = sources.to_vec();
-    sources.sort_by(|left, right| left.rel.cmp(&right.rel));
+    let manifest = normalized_manifest(manifest);
+    let dests = assigned_dests(sources);
+    let mut by_source: BTreeMap<&str, (&str, &ManifestFile)> = BTreeMap::new();
+    for (key, entry) in &manifest.files {
+        by_source.insert(entry.source.as_str(), (key.as_str(), entry));
+    }
     let mut encode = Vec::new();
+    let mut rename = Vec::new();
+    let mut keep = Vec::new();
     let mut skip = Vec::new();
-    let mut claimed = BTreeSet::new();
-    for source in sources.iter() {
-        let Some(dest) = mirror_dest_rel(&source.rel) else {
+    let mut claimed_sources = BTreeSet::new();
+    let mut ordered: Vec<&SourceStamp> = sources
+        .iter()
+        .filter(|source| dests.contains_key(&source.rel))
+        .collect();
+    ordered.sort_by(|left, right| dests[&left.rel].cmp(&dests[&right.rel]));
+    for source in ordered {
+        let Some(dest) = dests.get(&source.rel) else {
             continue;
         };
-        if !safe_mirror_rel(&dest) || !claimed.insert(dest.clone()) {
+        if !claimed_sources.insert(source.rel.clone()) {
             continue;
         }
-        let unchanged = manifest.files.get(&dest).is_some_and(|entry| {
-            entry.source == source.rel
-                && entry.source_len == source.len
-                && entry.source_mtime_ns == source.mtime_ns
-                && dest_exists(&dest)
-        });
-        if unchanged {
-            skip.push(dest);
-        } else {
-            encode.push(EncodeJob {
+        let identity = identity_key(source.dev, source.ino, &source.rel);
+        let matched = manifest
+            .files
+            .get(&identity)
+            .map(|entry| (identity.as_str(), entry))
+            .or_else(|| {
+                if source.ino != 0 {
+                    manifest
+                        .files
+                        .iter()
+                        .find(|(_, entry)| {
+                            entry.source_dev == source.dev && entry.source_ino == source.ino
+                        })
+                        .map(|(key, entry)| (key.as_str(), entry))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| by_source.get(source.rel.as_str()).copied());
+        let entry = ManifestFile {
+            source: source.rel.clone(),
+            source_len: source.len,
+            source_mtime_ns: source.mtime_ns,
+            dest: dest.clone(),
+            source_dev: source.dev,
+            source_ino: source.ino,
+        };
+        match matched {
+            Some((key, previous))
+                if previous.source_len == source.len
+                    && previous.source_mtime_ns == source.mtime_ns
+                    && dest_exists(&previous.dest) =>
+            {
+                if previous.dest == *dest {
+                    skip.push(dest.clone());
+                    keep.push(KeepJob {
+                        previous_key: key.to_string(),
+                        identity: identity.clone(),
+                        entry,
+                    });
+                } else {
+                    rename.push(RenameJob {
+                        previous_key: key.to_string(),
+                        identity,
+                        from_rel: previous.dest.clone(),
+                        to_rel: dest.clone(),
+                        entry,
+                    });
+                }
+            }
+            _ => encode.push(EncodeJob {
                 source_rel: source.rel.clone(),
-                dest_rel: dest,
-            });
+                dest_rel: dest.clone(),
+                identity,
+                dev: source.dev,
+                ino: source.ino,
+            }),
         }
     }
     let delete = match policy {
@@ -233,14 +552,32 @@ pub(crate) fn plan_mirror(
         OrphanPolicy::DeleteTracked => manifest
             .files
             .iter()
-            .filter(|(dest, entry)| {
-                safe_mirror_rel(dest) && !sources.iter().any(|source| source.rel == entry.source)
+            .filter(|(key, entry)| {
+                if !safe_mirror_rel(&entry.dest) && !safe_mirror_rel(key) {
+                    return false;
+                }
+                let source_known = sources.iter().any(|source| source.rel == entry.source);
+                let inode_known = entry.source_ino != 0
+                    && sources.iter().any(|source| {
+                        source.dev == entry.source_dev && source.ino == entry.source_ino
+                    });
+                !source_known && !inode_known
             })
-            .map(|(dest, _)| dest.clone())
+            .map(|(key, entry)| DeleteJob {
+                identity: key.clone(),
+                dest_rel: if entry.dest.is_empty() {
+                    key.clone()
+                } else {
+                    entry.dest.clone()
+                },
+                source_rel: entry.source.clone(),
+            })
             .collect(),
     };
     MirrorPlan {
         encode,
+        rename,
+        keep,
         skip,
         delete,
     }
@@ -256,18 +593,16 @@ pub(crate) fn load_manifest(root: &Path) -> (Manifest, OrphanPolicy) {
         Err(_) => return (Manifest::default(), OrphanPolicy::KeepAll),
     };
     match serde_json::from_slice::<Manifest>(&bytes) {
-        Ok(manifest) if manifest.version == MANIFEST_VERSION => {
-            (manifest, OrphanPolicy::DeleteTracked)
+        Ok(manifest) if manifest.version == 1 || manifest.version == MANIFEST_VERSION => {
+            (normalized_manifest(&manifest), OrphanPolicy::DeleteTracked)
         }
         _ => (Manifest::default(), OrphanPolicy::KeepAll),
     }
 }
 
 pub(crate) fn save_manifest(root: &Path, manifest: &Manifest) -> std::io::Result<()> {
-    let stored = Manifest {
-        version: MANIFEST_VERSION,
-        files: manifest.files.clone(),
-    };
+    let mut stored = normalized_manifest(manifest);
+    stored.version = MANIFEST_VERSION;
     let bytes = serde_json::to_vec_pretty(&stored)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     write_atomic(&manifest_path(root), &bytes)
@@ -335,10 +670,37 @@ mod tests {
     }
 
     fn stamp(rel: &str, len: u64, mtime_ns: u64) -> SourceStamp {
+        named(rel, len, mtime_ns, 0, 0, "", "")
+    }
+
+    fn named(
+        rel: &str,
+        len: u64,
+        mtime_ns: u64,
+        dev: u64,
+        ino: u64,
+        artist: &str,
+        title: &str,
+    ) -> SourceStamp {
         SourceStamp {
             rel: rel.to_string(),
             len,
             mtime_ns,
+            dev,
+            ino,
+            artist: artist.to_string(),
+            title: title.to_string(),
+        }
+    }
+
+    fn tracked(source: &str, len: u64, mtime_ns: u64) -> ManifestFile {
+        ManifestFile {
+            source: source.to_string(),
+            source_len: len,
+            source_mtime_ns: mtime_ns,
+            dest: String::new(),
+            source_dev: 0,
+            source_ino: 0,
         }
     }
 
@@ -396,30 +758,9 @@ mod tests {
         let manifest = Manifest {
             version: 1,
             files: BTreeMap::from([
-                (
-                    "mp3/song.mp3".to_string(),
-                    ManifestFile {
-                        source: "song.flac".to_string(),
-                        source_len: 10,
-                        source_mtime_ns: 100,
-                    },
-                ),
-                (
-                    "mp3/gone.mp3".to_string(),
-                    ManifestFile {
-                        source: "gone.flac".to_string(),
-                        source_len: 3,
-                        source_mtime_ns: 3,
-                    },
-                ),
-                (
-                    "mp3/changed.mp3".to_string(),
-                    ManifestFile {
-                        source: "new.aiff".to_string(),
-                        source_len: 1,
-                        source_mtime_ns: 1,
-                    },
-                ),
+                ("mp3/song.mp3".to_string(), tracked("song.flac", 10, 100)),
+                ("mp3/gone.mp3".to_string(), tracked("gone.flac", 3, 3)),
+                ("mp3/changed.mp3".to_string(), tracked("new.aiff", 1, 1)),
             ]),
         };
         let present = ["mp3/song.mp3", "mp3/gone.mp3", "mp3/notes.mp3"];
@@ -440,8 +781,12 @@ mod tests {
             .encode
             .iter()
             .any(|job| job.source_rel == "new.aiff" && job.dest_rel == "mp3/new.mp3"));
-        assert_eq!(plan.delete, vec!["mp3/gone.mp3".to_string()]);
-        assert!(!plan.delete.iter().any(|dest| dest == "mp3/notes.mp3"));
+        assert_eq!(plan.delete.len(), 1);
+        assert_eq!(plan.delete[0].dest_rel, "mp3/gone.mp3");
+        assert!(!plan
+            .delete
+            .iter()
+            .any(|job| job.dest_rel == "mp3/notes.mp3"));
 
         let missing_dest = plan_mirror(&sources, &manifest, OrphanPolicy::DeleteTracked, |_| false);
         assert!(missing_dest
@@ -472,20 +817,15 @@ mod tests {
             &root,
             &Manifest {
                 version: 0,
-                files: BTreeMap::from([(
-                    "mp3/a.mp3".to_string(),
-                    ManifestFile {
-                        source: "a.flac".to_string(),
-                        source_len: 2,
-                        source_mtime_ns: 2,
-                    },
-                )]),
+                files: BTreeMap::from([("mp3/a.mp3".to_string(), tracked("a.flac", 2, 2))]),
             },
         )
         .unwrap();
         let (loaded, policy) = load_manifest(&root);
         assert_eq!(policy, OrphanPolicy::DeleteTracked);
-        assert_eq!(loaded.files["mp3/a.mp3"].source, "a.flac");
+        let saved = loaded.files.get("path:a.flac").expect("source identity");
+        assert_eq!(saved.source, "a.flac");
+        assert_eq!(saved.dest, "mp3/a.mp3");
 
         std::fs::write(manifest_path(&root), b"{").unwrap();
         let (loaded, policy) = load_manifest(&root);
@@ -529,6 +869,105 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"new-bytes");
         assert!(!partial_path(&dest).unwrap().exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ordered_folders_use_padded_artist_title_names_and_plain_folders_do_not() {
+        let plain = plan_mirror(
+            &[named("Album/song.flac", 4, 4, 1, 2, "Ada", "Song")],
+            &Manifest::default(),
+            OrphanPolicy::KeepAll,
+            |_| false,
+        );
+        assert_eq!(plain.encode[0].dest_rel, "mp3/Album/song.mp3");
+
+        let mut many = Vec::new();
+        for index in 1..=100 {
+            many.push(named(
+                &format!("Album/{index:03} - take.flac"),
+                4,
+                4,
+                1,
+                index,
+                "Ada",
+                "Song",
+            ));
+        }
+        let planned = plan_mirror(&many, &Manifest::default(), OrphanPolicy::KeepAll, |_| {
+            false
+        });
+        assert_eq!(planned.encode.len(), 100);
+        assert_eq!(planned.encode[0].dest_rel, "mp3/Album/001 - Ada - Song.mp3");
+        assert_eq!(
+            planned.encode[99].dest_rel,
+            "mp3/Album/100 - Ada - Song.mp3"
+        );
+        assert!(planned
+            .encode
+            .windows(2)
+            .all(|pair| pair[0].dest_rel <= pair[1].dest_rel));
+    }
+
+    #[test]
+    fn reorder_renames_by_source_identity_and_leaves_orphans_deletable() {
+        let sources = vec![
+            named("01 - a.flac", 10, 100, 7, 8, "Ada", "First"),
+            named("02 - b.flac", 10, 100, 7, 9, "Ada", "Second"),
+        ];
+        let manifest = Manifest {
+            version: 2,
+            files: BTreeMap::from([
+                (
+                    identity_key(7, 8, "a.flac"),
+                    ManifestFile {
+                        source: "a.flac".to_string(),
+                        source_len: 10,
+                        source_mtime_ns: 100,
+                        dest: "mp3/a.mp3".to_string(),
+                        source_dev: 7,
+                        source_ino: 8,
+                    },
+                ),
+                (
+                    identity_key(7, 9, "b.flac"),
+                    ManifestFile {
+                        source: "b.flac".to_string(),
+                        source_len: 10,
+                        source_mtime_ns: 100,
+                        dest: "mp3/b.mp3".to_string(),
+                        source_dev: 7,
+                        source_ino: 9,
+                    },
+                ),
+                (
+                    identity_key(7, 4, "gone.flac"),
+                    ManifestFile {
+                        source: "gone.flac".to_string(),
+                        source_len: 1,
+                        source_mtime_ns: 1,
+                        dest: "mp3/gone.mp3".to_string(),
+                        source_dev: 7,
+                        source_ino: 4,
+                    },
+                ),
+            ]),
+        };
+        let plan = plan_mirror(&sources, &manifest, OrphanPolicy::DeleteTracked, |dest| {
+            dest == "mp3/a.mp3" || dest == "mp3/b.mp3" || dest == "mp3/gone.mp3"
+        });
+        assert!(plan.encode.is_empty());
+        assert_eq!(plan.rename.len(), 2);
+        assert!(plan.rename.iter().any(|job| {
+            job.from_rel == "mp3/a.mp3"
+                && job.to_rel == "mp3/1 - Ada - First.mp3"
+                && job.entry.source == "01 - a.flac"
+        }));
+        assert!(plan
+            .rename
+            .iter()
+            .any(|job| job.to_rel == "mp3/2 - Ada - Second.mp3"));
+        assert_eq!(plan.delete.len(), 1);
+        assert_eq!(plan.delete[0].dest_rel, "mp3/gone.mp3");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! One background pass over a watched folder. The audio callback never calls this.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -51,6 +52,7 @@ pub(crate) fn sync_folder(
     mut enabled: impl FnMut() -> bool,
     mut between_files: impl FnMut(),
     mut during_encode: impl FnMut(),
+    names: &HashMap<String, (String, String)>,
     mut hint: impl FnMut(&Path) -> AnalysisHint,
     mut progress: impl FnMut(u32, u32, bool),
 ) -> Result<Vec<String>, String> {
@@ -62,21 +64,67 @@ pub(crate) fn sync_folder(
         progress(0, 0, false);
         return Ok(Vec::new());
     }
-    let sources = mp3_mirror::source_stamps(root);
+    let mut sources = mp3_mirror::source_stamps(root);
+    for source in &mut sources {
+        let path = root.join(&source.rel);
+        let Some(path) = path.to_str() else {
+            continue;
+        };
+        let Some((artist, title)) = names.get(path) else {
+            continue;
+        };
+        source.artist.clone_from(artist);
+        source.title.clone_from(title);
+    }
     let (manifest, policy) = mp3_mirror::load_manifest(root);
     let plan = mp3_mirror::plan_mirror(&sources, &manifest, policy, |dest| {
         mirrored_path(root, dest).is_some_and(|path| path.is_file())
     });
     let total =
-        u32::try_from(plan.encode.len() + plan.skip.len() + plan.delete.len()).unwrap_or(u32::MAX);
+        u32::try_from(plan.encode.len() + plan.rename.len() + plan.skip.len() + plan.delete.len())
+            .unwrap_or(u32::MAX);
     let mut done = u32::try_from(plan.skip.len()).unwrap_or(0).min(total);
-    if plan.encode.is_empty() && plan.delete.is_empty() {
+    let keeps_differ = plan.keep.iter().any(|job| {
+        job.previous_key != job.identity || manifest.files.get(&job.identity) != Some(&job.entry)
+    });
+    let mut manifest = manifest;
+    remember_keeps(&mut manifest, &plan.keep);
+    if plan.encode.is_empty() && plan.rename.is_empty() && plan.delete.is_empty() {
+        if keeps_differ {
+            if let Err(error) = store_manifest(root, &manifest, policy) {
+                return Err(error.to_string());
+            }
+        }
         progress(0, 0, false);
         return Ok(Vec::new());
     }
     progress(done, total, true);
-    let mut manifest = manifest;
     let mut errors = Vec::new();
+    if !plan.rename.is_empty() {
+        between_files();
+        if !enabled() {
+            progress(0, 0, false);
+            return Ok(errors);
+        }
+        match rename_mirrors(root, &plan.rename) {
+            Ok(()) => {
+                for job in &plan.rename {
+                    manifest.files.remove(&job.previous_key);
+                    manifest
+                        .files
+                        .insert(job.identity.clone(), job.entry.clone());
+                }
+                if let Err(error) = mp3_mirror::save_manifest(root, &manifest) {
+                    errors.push(format!("manifest: {error}"));
+                }
+                done = done
+                    .saturating_add(u32::try_from(plan.rename.len()).unwrap_or(0))
+                    .min(total);
+                progress(done, total, true);
+            }
+            Err(error) => errors.push(error),
+        }
+    }
     for job in &plan.encode {
         if !enabled() {
             progress(0, 0, false);
@@ -119,15 +167,18 @@ pub(crate) fn sync_folder(
         }
         let (source_len, source_mtime_ns) = stamp;
         manifest.files.insert(
-            job.dest_rel.clone(),
+            job.identity.clone(),
             ManifestFile {
                 source: job.source_rel.clone(),
                 source_len,
                 source_mtime_ns,
+                dest: job.dest_rel.clone(),
+                source_dev: job.dev,
+                source_ino: job.ino,
             },
         );
         if let Err(error) = mp3_mirror::save_manifest(root, &manifest) {
-            manifest.files.remove(&job.dest_rel);
+            manifest.files.remove(&job.identity);
             errors.push(format!("manifest: {error}"));
             continue;
         }
@@ -138,21 +189,18 @@ pub(crate) fn sync_folder(
         progress(0, 0, false);
         return Ok(errors);
     }
-    for dest in &plan.delete {
-        let Some(entry) = manifest.files.get(dest).cloned() else {
-            continue;
-        };
-        if !source_is_confirmed_missing(root, &entry.source) {
+    for job in &plan.delete {
+        if !source_is_confirmed_missing(root, &job.source_rel) {
             continue;
         }
-        if let Some(path) = mirrored_path(root, dest) {
+        if let Some(path) = mirrored_path(root, &job.dest_rel) {
             if path.is_file() && std::fs::remove_file(&path).is_err() {
-                errors.push(format!("could not remove {dest}"));
+                errors.push(format!("could not remove {}", job.dest_rel));
                 continue;
             }
             remove_empty_parents(root, &path);
         }
-        manifest.files.remove(dest);
+        manifest.files.remove(&job.identity);
         done = done.saturating_add(1).min(total);
         progress(done, total, true);
     }
@@ -219,6 +267,56 @@ fn remove_empty_parents(root: &Path, file: &Path) {
     }
 }
 
+fn remember_keeps(manifest: &mut Manifest, keeps: &[mp3_mirror::KeepJob]) {
+    for job in keeps {
+        if job.previous_key != job.identity {
+            manifest.files.remove(&job.previous_key);
+        }
+        manifest
+            .files
+            .insert(job.identity.clone(), job.entry.clone());
+    }
+}
+
+fn rename_mirrors(root: &Path, jobs: &[mp3_mirror::RenameJob]) -> Result<(), String> {
+    let mut parked = Vec::with_capacity(jobs.len());
+    for (index, job) in jobs.iter().enumerate() {
+        let Some(from) = mirrored_path(root, &job.from_rel) else {
+            undo_parked(&parked);
+            return Err(format!("{} is not a mirror path", job.from_rel));
+        };
+        let Some(parent) = from.parent() else {
+            undo_parked(&parked);
+            return Err(format!("{} has no folder", job.from_rel));
+        };
+        let temp = parent.join(format!(".opendeck-order-{index:04}"));
+        if let Err(error) = std::fs::rename(&from, &temp) {
+            undo_parked(&parked);
+            return Err(format!("{}: {error}", job.from_rel));
+        }
+        parked.push((temp, from, job.to_rel.clone()));
+    }
+    parked.sort_by(|left, right| left.2.cmp(&right.2));
+    for (temp, _from, to_rel) in &parked {
+        let Some(to) = mirrored_path(root, to_rel) else {
+            return Err(format!("{to_rel} is not a mirror path"));
+        };
+        if let Some(parent) = to.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(error) = std::fs::rename(temp, to) {
+            return Err(format!("{to_rel}: {error}"));
+        }
+    }
+    Ok(())
+}
+
+fn undo_parked(parked: &[(PathBuf, PathBuf, String)]) {
+    for (temp, original, _) in parked.iter().rev() {
+        let _ = std::fs::rename(temp, original);
+    }
+}
+
 fn store_manifest(root: &Path, manifest: &Manifest, policy: OrphanPolicy) -> std::io::Result<()> {
     if manifest.files.is_empty() {
         if policy == OrphanPolicy::DeleteTracked || mp3_mirror::manifest_path(root).is_file() {
@@ -235,6 +333,7 @@ mod tests {
     use super::*;
     use crate::mp3_encode::{test_encode_lock, write_stereo_pcm_wav};
     use id3::TagLike;
+    use std::os::unix::fs::MetadataExt;
 
     fn scratch(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -266,7 +365,8 @@ mod tests {
             bpm: Some(128.0),
             musical_key: Some("Am".to_string()),
         };
-        let errors = sync_folder(&root, || true, || {}, || {}, hint, |_, _, _| {}).unwrap();
+        let names = HashMap::new();
+        let errors = sync_folder(&root, || true, || {}, || {}, &names, hint, |_, _, _| {}).unwrap();
         assert!(errors.is_empty(), "{errors:?}");
         let mirrored = root.join("mp3").join("Artist").join("a.mp3");
         assert!(mirrored.is_file());
@@ -277,12 +377,12 @@ mod tests {
         );
         let first = std::fs::read(&mirrored).unwrap();
         let modified = mirrored.metadata().unwrap().modified().unwrap();
-        let errors = sync_folder(&root, || true, || {}, || {}, hint, |_, _, _| {}).unwrap();
+        let errors = sync_folder(&root, || true, || {}, || {}, &names, hint, |_, _, _| {}).unwrap();
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(std::fs::read(&mirrored).unwrap(), first);
         assert_eq!(mirrored.metadata().unwrap().modified().unwrap(), modified);
         write_stereo_pcm_wav(&root.join("Artist").join("a.wav"), 44_100, &silence(8_000));
-        let errors = sync_folder(&root, || true, || {}, || {}, hint, |_, _, _| {}).unwrap();
+        let errors = sync_folder(&root, || true, || {}, || {}, &names, hint, |_, _, _| {}).unwrap();
         assert!(errors.is_empty(), "{errors:?}");
         assert_ne!(std::fs::read(&mirrored).unwrap(), first);
         let tag = id3::Tag::read_from_path(&mirrored).unwrap();
@@ -295,9 +395,72 @@ mod tests {
             Some("Am")
         );
         std::fs::remove_file(root.join("Artist").join("a.wav")).unwrap();
-        let errors = sync_folder(&root, || true, || {}, || {}, hint, |_, _, _| {}).unwrap();
+        let errors = sync_folder(&root, || true, || {}, || {}, &names, hint, |_, _, _| {}).unwrap();
         assert!(errors.is_empty(), "{errors:?}");
         assert!(!mirrored.exists());
+        assert_eq!(
+            std::fs::read(root.join("mp3").join("keep-user.mp3")).unwrap(),
+            b"user-file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reorder_renames_the_mp3_without_reencoding_and_keeps_orphan_cleanup() {
+        let _guard = test_encode_lock();
+        let root = scratch("reorder");
+        write_stereo_pcm_wav(&root.join("a.wav"), 44_100, &silence(4_000));
+        std::fs::create_dir(root.join("mp3")).unwrap();
+        std::fs::write(root.join("mp3").join("keep-user.mp3"), b"user-file").unwrap();
+        let source = root.join("a.wav");
+        let source_path = source.to_str().unwrap().to_string();
+        let names = HashMap::from([(source_path, ("Ada".to_string(), "Song".to_string()))]);
+        let hint = |_path: &Path| AnalysisHint {
+            bpm: None,
+            musical_key: None,
+        };
+        let errors = sync_folder(&root, || true, || {}, || {}, &names, hint, |_, _, _| {}).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        let mirrored = root.join("mp3").join("a.mp3");
+        let first = std::fs::read(&mirrored).unwrap();
+        let inode = std::fs::metadata(&mirrored).unwrap().ino();
+        let tag = id3::Tag::read_from_path(&mirrored).ok();
+        let title = tag.as_ref().and_then(|tag| tag.title());
+        assert_eq!(title, None);
+
+        let ordered = root.join("01 - a.wav");
+        std::fs::rename(&source, &ordered).unwrap();
+        let ordered_path = ordered.to_str().unwrap().to_string();
+        let names = HashMap::from([(ordered_path, ("Ada".to_string(), "Song".to_string()))]);
+        let errors = sync_folder(&root, || true, || {}, || {}, &names, hint, |_, _, _| {}).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        let renamed = root.join("mp3").join("1 - Ada - Song.mp3");
+        assert!(renamed.is_file());
+        assert!(!mirrored.exists());
+        assert_eq!(std::fs::read(&renamed).unwrap(), first);
+        assert_eq!(std::fs::metadata(&renamed).unwrap().ino(), inode);
+        let tag = id3::Tag::read_from_path(&renamed).ok();
+        assert_eq!(tag.as_ref().and_then(|tag| tag.title()), None);
+
+        let manifest =
+            std::fs::read_to_string(root.join("mp3").join(".opendeck-mp3-manifest.json")).unwrap();
+        assert!(manifest.contains("01 - a.wav"));
+        assert!(manifest.contains("1 - Ada - Song.mp3"));
+        assert!(manifest.contains("source_ino"));
+
+        std::fs::remove_file(&ordered).unwrap();
+        let errors = sync_folder(
+            &root,
+            || true,
+            || {},
+            || {},
+            &HashMap::new(),
+            hint,
+            |_, _, _| {},
+        )
+        .unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!renamed.exists());
         assert_eq!(
             std::fs::read(root.join("mp3").join("keep-user.mp3")).unwrap(),
             b"user-file"
