@@ -72,26 +72,33 @@ export function waveColumn(peaks: number[], bands: Bands[], start: number, end: 
     color: rms ? frequencyColor(...rms) : NEUTRAL };
 }
 
+export type WaveAnchor = 'center' | 'baseline';
+
 // Adjacent columns share their interpolated edge. Batch all polygons of one hue
 // into one SVG path to avoid creating an element per audio bin.
-export function rgbPaths(points: WavePoint[], center: number) {
+// A baseline anchor keeps the upper half and stretches it to the full height.
+export function rgbPaths(points: WavePoint[], center: number, anchor: WaveAnchor = 'center') {
   const paths = new Map<string, string[]>();
   const coord = (v: number) => v.toFixed(1);
+  const floor = anchor === 'baseline' ? coord(center * 2) : '';
   for (let i = 0; i < points.length; i++) {
     const p = points[i], before = points[i - 1] ?? p, after = points[i + 1] ?? p;
     if (p.amp + before.amp + after.amp === 0) continue;
     const l = coord((p.x + before.x) / 2), r = coord((p.x + after.x) / 2), x = coord(p.x);
     const a = (p.amp + before.amp) / 2, b = (p.amp + after.amp) / 2;
-    const path = `M${l} ${coord(center-a)}L${x} ${coord(center-p.amp)} ${r} ${coord(center-b)} ${r} ${coord(center+b)} ${x} ${coord(center+p.amp)} ${l} ${coord(center+a)}Z`;
+    const path = anchor === 'baseline'
+      ? `M${l} ${coord((center - a) * 2)}L${x} ${coord((center - p.amp) * 2)} ${r} ${coord((center - b) * 2)} ${r} ${floor} ${l} ${floor}Z`
+      : `M${l} ${coord(center-a)}L${x} ${coord(center-p.amp)} ${r} ${coord(center-b)} ${r} ${coord(center+b)} ${x} ${coord(center+p.amp)} ${l} ${coord(center+a)}Z`;
     const group = paths.get(p.color);
     if (group) group.push(path); else paths.set(p.color, [path]);
   }
   return Array.from(paths, ([fill, segments]) => ({ fill, d: segments.join('') }));
 }
 
-export function wavePaths(points: WavePoint[], center: number, gain: number, bandScale = 1) {
-  const paths = rgbPaths(points, center);
+export function wavePaths(points: WavePoint[], center: number, gain: number, bandScale = 1, anchor: WaveAnchor = 'center') {
+  const paths = rgbPaths(points, center, anchor);
   if (!gain || !paths.length || points.length < 2) return paths;
+  if (anchor === 'baseline') return baselineBands(paths, points, center, gain, bandScale);
   const layers = Array.from({ length: 3 }, () => ({ upper: [] as string[], lower: [] as string[] }));
   const visible = [false, false, false];
   for (const point of points) {
@@ -114,6 +121,43 @@ export function wavePaths(points: WavePoint[], center: number, gain: number, ban
   for (let i = 0; i < layers.length; i++) {
     if (visible[i]) paths.push({ fill: fills[i],
       d: `M${layers[i].upper.join(' ')}L${layers[i].lower.reverse().join(' ')}Z` });
+  }
+  return paths;
+}
+
+function baselineBands(
+  paths: { fill: string; d: string }[],
+  points: WavePoint[],
+  center: number,
+  gain: number,
+  bandScale: number,
+) {
+  const floor = (center * 2).toFixed(1);
+  const crests = Array.from({ length: 3 }, () => [] as string[]);
+  const visible = [false, false, false];
+  let firstX = '';
+  let lastX = '';
+  for (const point of points) {
+    const [low, mid, high] = point.rms ?? [0, 0, 0];
+    const sum = low + mid + high;
+    const relativeEnergy = Math.min(1, sum * gain);
+    const bodyRadius = point.amp * (0.68 + 0.08 * relativeEnergy) * bandScale;
+    const scale = sum > 0 ? bodyRadius / sum : 0;
+    const depths = [sum * scale, (mid + high) * scale, high * scale];
+    const x = point.x.toFixed(1);
+    if (firstX === '') firstX = x;
+    lastX = x;
+    for (let i = 0; i < 3; i++) {
+      crests[i].push(x + ' ' + ((center - depths[i]) * 2).toFixed(1));
+      visible[i] ||= depths[i] > 0;
+    }
+  }
+  const fills = ['#137fff', '#ffa916', '#fff4d9'];
+  for (let i = 0; i < crests.length; i++) {
+    if (visible[i]) paths.push({
+      fill: fills[i],
+      d: `M${crests[i].join(' ')}L${lastX} ${floor} ${firstX} ${floor}Z`,
+    });
   }
   return paths;
 }

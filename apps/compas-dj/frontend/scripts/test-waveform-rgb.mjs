@@ -67,3 +67,36 @@ for (const view of ['preview', 'detail']) {
   assert.equal(coordinates(bass)[5], coordinates(mids)[5]); // No visible blue at x=1.
   assert.deepEqual(wavePaths(points, 20, structureGain([])), base);
 }
+
+const previewPoints = bands.map((_, x) => ({ x, ...waveColumn([1, 1], bands, x, x + 1, 1, 20, 'preview') }));
+const mirroredPreview = wavePaths(previewPoints, 20, structureGain(bands));
+const baselinePreview = wavePaths(previewPoints, 20, structureGain(bands), 1, 'baseline');
+const numbers = (path) => path.d.match(/-?\d+\.\d+/g).map(Number);
+assert.equal(baselinePreview.length, mirroredPreview.length);
+for (let index = 0; index < baselinePreview.length; index += 1) {
+  const mirroredYs = numbers(mirroredPreview[index]).filter((_, offset) => offset % 2 === 1);
+  const baselineYs = numbers(baselinePreview[index]).filter((_, offset) => offset % 2 === 1);
+  const upper = mirroredYs.filter((y) => y <= 20);
+  const crest = Math.min(...upper);
+  assert.ok(baselineYs.every((y) => y <= 40.05 && y >= crest * 2 - 0.2));
+  assert.ok(baselineYs.some((y) => Math.abs(y - 40) < 0.05));
+  assert.ok(Math.abs(Math.min(...baselineYs) - crest * 2) <= 0.2);
+}
+assert.equal(numbers(baselinePreview.at(-1)).at(-1), 40);
+assert.ok(numbers(baselinePreview[0]).join(',').length < numbers(mirroredPreview[0]).join(',').length);
+
+const deck = readFileSync(new URL('../src/components/Deck.tsx', import.meta.url), 'utf8');
+const library = readFileSync(new URL('../src/components/LibraryVisuals.tsx', import.meta.url), 'utf8');
+const zone = readFileSync(new URL('../src/components/WaveformZone.tsx', import.meta.url), 'utf8');
+const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
+assert.match(deck, /wavePaths\(samples, cy, bandGain, 1, 'baseline'\)/);
+assert.match(library, /wavePaths\(points, 20, structureGain\(bands\), bandScale, 'baseline'\)/);
+assert.equal(zone.includes("'baseline'"), false);
+assert.match(css, /\.ov-cue \{[^}]*top:\s*0;[^}]*bottom:\s*0;/);
+assert.match(css, /\.ov-loop \{[^}]*top:\s*0;[^}]*bottom:\s*0;/);
+assert.match(css, /\.ov-memory \{[^}]*top:\s*0;[^}]*bottom:\s*0;/);
+assert.match(css, /\.ov-memory-cue \{[^}]*top:\s*0;[^}]*bottom:\s*0;/);
+assert.match(css, /\.ov-marks \{[^}]*top:\s*4px;/);
+assert.match(deck, /y1="0"/);
+assert.match(deck, /y2="100"/);
+console.log('Preview waveforms use the upper half from the bottom edge; the scrolling waveform stays mirrored');

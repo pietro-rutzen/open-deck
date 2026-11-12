@@ -176,7 +176,7 @@ export function MiniWaveform({ peaks, bands = [], bandScale = 1, label = "Track 
       ...waveColumn(peaks, bands, Math.floor(i * peaks.length / count), Math.floor((i + 1) * peaks.length / count), gain, 19, 'preview'),
       x: ((i + 0.5) * 256) / count,
     }));
-    return wavePaths(points, 20, structureGain(bands), bandScale);
+    return wavePaths(points, 20, structureGain(bands), bandScale, 'baseline');
   }, [peaks, bands, bandScale]);
   if (!peaks.length) return <span className="mini-waveform-state">No waveform</span>;
   return <svg className="mini-waveform" viewBox="0 0 256 40" preserveAspectRatio="none" role="img" aria-label={label}>

@@ -1253,7 +1253,7 @@ const OverviewWave = memo(function OverviewWave({
       preserveAspectRatio="none"
     >
       <title>{RGB_WAVE_KEY}</title>
-      {wavePaths(samples, cy, bandGain).map(path => <path key={path.fill} {...path} />)}
+      {wavePaths(samples, cy, bandGain, 1, 'baseline').map(path => <path key={path.fill} {...path} />)}
     </svg>
   );
 });
