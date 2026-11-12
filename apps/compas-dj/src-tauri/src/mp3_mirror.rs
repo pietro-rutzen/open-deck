@@ -9,6 +9,25 @@ use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 pub(crate) const MIRROR_DIR: &str = "mp3";
+
+/// Frames a decoder plays before the first source sample of an MP3 that OpenDeck encoded:
+/// LAME's 576-frame encoder delay plus the 529-frame Layer III decoder delay. The mirror has
+/// no LAME info frame, so no decoder trims it. `mp3_encode` measures this in a test.
+pub(crate) const ENCODED_COPY_DELAY_FRAMES: u32 = 1105;
+
+/// Seconds an encoded copy plays behind its source. A source that is already an MP3 is
+/// copied byte for byte, so its copy has no shift.
+pub(crate) fn encoded_copy_delay_sec(source: &Path) -> f64 {
+    let copied_bytes = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"));
+    if copied_bytes {
+        0.0
+    } else {
+        f64::from(ENCODED_COPY_DELAY_FRAMES) / 44_100.0
+    }
+}
 const MANIFEST_VERSION: u32 = 2;
 const MANIFEST_FILE: &str = ".opendeck-mp3-manifest.json";
 /// One-minute load average divided by the CPU count. Above this, the worker
@@ -1225,6 +1244,16 @@ fn cmp_digit_runs(left: &str, right: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_encoded_copy_is_shifted_behind_its_source() {
+        let encoded = encoded_copy_delay_sec(Path::new("/music/set/song.m4a"));
+        assert!((encoded - 1105.0 / 44_100.0).abs() < 1e-12);
+        assert_eq!(
+            encoded_copy_delay_sec(Path::new("/music/set/song.MP3")),
+            0.0
+        );
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(

@@ -424,6 +424,8 @@ struct OpenFile {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
     track_id: u32,
+    declared_frames: Option<u64>,
+    decoded_frames: u64,
     consecutive_errors: u32,
     skipped_packets: u32,
 }
@@ -454,7 +456,7 @@ impl OpenFile {
         if let Some(revision) = format.metadata().current() {
             absorb_tags(&mut tags, revision);
         }
-        let (track_id, sample_rate, bits_per_sample, params) = {
+        let (track_id, sample_rate, bits_per_sample, declared_frames, params) = {
             let track = format
                 .tracks()
                 .iter()
@@ -469,6 +471,7 @@ impl OpenFile {
                 track.id,
                 sample_rate,
                 track.codec_params.bits_per_sample,
+                track.codec_params.n_frames.filter(|frames| *frames > 0),
                 track.codec_params.clone(),
             )
         };
@@ -482,6 +485,8 @@ impl OpenFile {
             format,
             decoder,
             track_id,
+            declared_frames,
+            decoded_frames: 0,
             consecutive_errors: 0,
             skipped_packets: 0,
         })
@@ -511,7 +516,11 @@ impl OpenFile {
                     let spec = *decoded.spec();
                     let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
                     buffer.copy_interleaved_ref(decoded);
-                    return Ok(Some(to_stereo(buffer.samples(), spec.channels.count())));
+                    let stereo = to_stereo(buffer.samples(), spec.channels.count());
+                    self.decoded_frames = self
+                        .decoded_frames
+                        .saturating_add((stereo.len() / 2) as u64);
+                    return Ok(Some(stereo));
                 }
                 Err(SymphoniaError::DecodeError(_)) => {
                     self.consecutive_errors = self.consecutive_errors.saturating_add(1);
@@ -523,6 +532,28 @@ impl OpenFile {
                 Err(error) => return Err(error.to_string()),
             }
         }
+    }
+}
+
+impl OpenFile {
+    /// A source that stops well before the length its header declares is a
+    /// cut-off file: a copy still in progress, a failed download, or a damaged
+    /// disk. Publishing its MP3 would put a silently short track on the stick,
+    /// so the encode fails and the next pass tries again.
+    fn ensure_complete(&self) -> Result<(), String> {
+        let Some(declared) = self.declared_frames else {
+            return Ok(());
+        };
+        let slack = u64::from(self.sample_rate) / 2;
+        if self.decoded_frames.saturating_add(slack) >= declared {
+            return Ok(());
+        }
+        let rate = f64::from(self.sample_rate);
+        Err(format!(
+            "the file ends early: {:.1} s of audio decoded, its header declares {:.1} s",
+            self.decoded_frames as f64 / rate,
+            declared as f64 / rate
+        ))
     }
 }
 
@@ -761,6 +792,7 @@ pub(crate) fn encode_mirror(
         )?;
     }
     during_encode();
+    opened.ensure_complete()?;
     drain(
         true,
         &mut resampler,
@@ -1178,6 +1210,117 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(report.parent().unwrap());
         let _ = std::fs::write(report, line);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn aac_in_m4a_becomes_cbr_320_mp3() {
+        let _guard = test_encode_lock();
+        let root = scratch("aac");
+        let m4a = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../crates/compas-sources/fixtures/tone.m4a"
+        ));
+        let mp3 = root.join("tone.mp3");
+        encode_mirror(&m4a, &mp3, None, None, || {}).unwrap();
+        assert_cbr_320(&mp3);
+        let (_rate, frames) = symphonia_mp3(&mp3);
+        let seconds = frames as f64 / 44_100.0;
+        assert!(seconds > 0.25 && seconds < 0.40, "{seconds}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cut_off_source_fails_and_leaves_no_mp3() {
+        let _guard = test_encode_lock();
+        let root = scratch("cut");
+        let wav = root.join("cut.wav");
+        write_stereo_pcm_wav(&wav, 44_100, &stereo_sine(44_100, 4.0, 330.0));
+        let full = std::fs::read(&wav).unwrap();
+        std::fs::write(&wav, &full[..full.len() / 2]).unwrap();
+        let mp3 = root.join("cut.mp3");
+        let error = encode_mirror(&wav, &mp3, None, None, || {}).unwrap_err();
+        assert!(error.contains("ends early"), "{error}");
+        assert!(!mp3.exists());
+        std::fs::write(&wav, &full).unwrap();
+        encode_mirror(&wav, &mp3, None, None, || {}).unwrap();
+        assert_cbr_320(&mp3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn decoded_left(path: &Path) -> Vec<f32> {
+        let file = File::open(path).unwrap();
+        let stream = MediaSourceStream::new(Box::new(file), Default::default());
+        let options = FormatOptions {
+            enable_gapless: true,
+            ..Default::default()
+        };
+        let probed = symphonia::default::get_probe()
+            .format(&Hint::new(), stream, &options, &MetadataOptions::default())
+            .unwrap();
+        let mut format = probed.format;
+        let track = format
+            .tracks()
+            .iter()
+            .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+            .unwrap();
+        let track_id = track.id;
+        let params = track.codec_params.clone();
+        let mut decoder = symphonia::default::get_codecs()
+            .make(&params, &DecoderOptions::default())
+            .unwrap();
+        let mut left = Vec::new();
+        while let Ok(packet) = format.next_packet() {
+            if packet.track_id() != track_id {
+                continue;
+            }
+            if let Ok(decoded) = decoder.decode(&packet) {
+                let spec = *decoded.spec();
+                let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                buffer.copy_interleaved_ref(decoded);
+                left.extend(buffer.samples().iter().step_by(spec.channels.count()));
+            }
+        }
+        left
+    }
+
+    /// The deck reuses the source track's beatgrid for an encoded copy, shifted by
+    /// `ENCODED_COPY_DELAY_FRAMES`. This measures that shift the way the deck decodes.
+    #[test]
+    fn an_encoded_copy_starts_one_fixed_delay_after_its_source() {
+        let _guard = test_encode_lock();
+        let root = scratch("delay");
+        let mut state = 0x1234_5678u32;
+        let noise: Vec<i16> = (0..44_100usize)
+            .flat_map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let value = ((state >> 16) as i16) / 4;
+                [value, value]
+            })
+            .collect();
+        let wav = root.join("noise.wav");
+        write_stereo_pcm_wav(&wav, 44_100, &noise);
+        let mp3 = root.join("noise.mp3");
+        encode_mirror(&wav, &mp3, None, None, || {}).unwrap();
+        let copy = decoded_left(&mp3);
+        let source: Vec<f32> = noise
+            .iter()
+            .step_by(2)
+            .take(8_192)
+            .map(|sample| f32::from(*sample) / 32_768.0)
+            .collect();
+        let mut best = (0usize, f32::MIN);
+        for lag in 0..4_000usize {
+            let score: f32 = source
+                .iter()
+                .zip(&copy[lag..])
+                .map(|(left, right)| left * right)
+                .sum();
+            if score > best.1 {
+                best = (lag, score);
+            }
+        }
+        assert_eq!(best.0 as u32, crate::mp3_mirror::ENCODED_COPY_DELAY_FRAMES);
         let _ = std::fs::remove_dir_all(&root);
     }
 

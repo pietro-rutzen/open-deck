@@ -2,8 +2,8 @@
 
 - Status: accepted for the local prototype
 - Date: 2026-11-12
-- Author / accountable role: the session that implemented Pietro's approved MP3 mirror
-- Decision authority: Pietro approved the auto MP3 converter for older CDJs that cannot read FLAC and the other lossless files the library already decodes
+- Author / accountable role: the session that implemented the MP3 mirror
+- Decision authority: the maintainer approved the automatic MP3 converter for older CDJs that cannot read FLAC and the other files the library already decodes
 - Related: `docs/MP3_MIRRORS.md`
 - Supersedes / superseded by: none
 

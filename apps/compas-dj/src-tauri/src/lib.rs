@@ -1521,11 +1521,18 @@ fn mirror_load_plan(
             let Some(stored) = stored else {
                 return MirrorLoadPlan::Skip;
             };
+            let copy_delay_sec = match &source {
+                mp3_mirror::CopySource::Mapped(source_path) => {
+                    mp3_mirror::encoded_copy_delay_sec(source_path)
+                }
+                _ => 0.0,
+            };
             MirrorLoadPlan::Stored(analysis_from_stored(
                 path,
                 generation,
                 installed_gain,
                 stored,
+                copy_delay_sec,
             ))
         }
     }
@@ -1544,6 +1551,7 @@ fn analysis_from_stored(
     generation: u64,
     installed_gain: f32,
     stored: db::StoredTempo,
+    copy_delay_sec: f64,
 ) -> deck_prepare::AnalysisBody {
     let bpm = finite_f32(stored.bpm);
     let interval = if stored.beat_interval_sec.is_finite() && stored.beat_interval_sec > 0.0 {
@@ -1568,7 +1576,7 @@ fn analysis_from_stored(
         path: path.to_string(),
         bpm,
         bpm_confidence: finite_f32(stored.bpm_confidence),
-        first_beat_sec: finite_f32(first + offset),
+        first_beat_sec: finite_f32(first + offset + copy_delay_sec),
         beat_interval_sec: finite_f32(interval),
         key_camelot: stored.key_camelot,
         key_name: stored.key_name,
