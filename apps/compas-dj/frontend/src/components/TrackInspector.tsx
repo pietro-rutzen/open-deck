@@ -317,7 +317,13 @@ export const TrackInspector = ({
             </dl>
             <div className="inspector-wave">
               {visual.data?.peaks.length ? (
-                <MiniWaveform peaks={visual.data.peaks} bands={visual.data.band_peaks} />
+                <MiniWaveform
+                  peaks={visual.data.peaks}
+                  bands={visual.data.band_peaks}
+                  gridOffset={track.grid_offset_sec}
+                  gridInterval={track.bpm != null && track.bpm > 0 ? 60 / track.bpm : 0}
+                  durationSec={track.duration_ms > 0 ? track.duration_ms / 1000 : 0}
+                />
               ) : (
                 <span className="mini-waveform-state">
                   {visual.status === "loading" ? "Reading waveform…" : "Waveform unavailable"}

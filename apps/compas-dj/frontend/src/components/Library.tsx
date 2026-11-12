@@ -1979,6 +1979,9 @@ export const Library = memo(
                         title={t.title || baseName(t.path)}
                         artist={t.artist}
                         color={loadedAs?.color}
+                        gridOffset={t.grid_offset_sec}
+                        gridInterval={t.bpm != null && t.bpm > 0 ? 60 / t.bpm : 0}
+                        durationSec={t.duration_ms > 0 ? t.duration_ms / 1000 : 0}
                         bpmCell={
                           <span
                             className="mono tl-bpm"

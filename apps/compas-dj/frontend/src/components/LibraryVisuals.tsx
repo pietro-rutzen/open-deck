@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { RGB_WAVE_KEY, presentAmplitude, smoothAmplitudes, structureGain, trackLevelReference, waveColumn, wavePaths } from "../lib/waveformDisplay";
+import { RGB_WAVE_KEY, shapeWavePoints, structureGain, waveColumn, wavePaths, waveStructure } from "../lib/waveformDisplay";
 import { inTauri } from "../lib/ipc";
 
 export interface TrackVisuals {
@@ -168,23 +168,23 @@ export function useTrackVisuals(path: string | null, enabled = true, includeArtw
   return result?.path === path ? result.state : { status: "loading" };
 }
 
-export function MiniWaveform({ peaks, bands = [], bandScale = 1, label = "Track frequency and amplitude overview" }: { peaks: number[]; bands?: [number, number, number][]; bandScale?: number; label?: string }) {
+export function MiniWaveform({ peaks, bands = [], bandScale = 1, label = "Track frequency and amplitude overview", gridOffset = 0, gridInterval = 0, durationSec = 0 }: { peaks: number[]; bands?: [number, number, number][]; bandScale?: number; label?: string; gridOffset?: number; gridInterval?: number; durationSec?: number }) {
   const paths = useMemo(() => {
     const count = Math.min(peaks.length, 256);
     const radius = 19;
-    const reference = trackLevelReference(peaks, bands);
+    const grid = gridInterval > 0.05 && durationSec > 0
+      ? { offsetSec: gridOffset, intervalSec: gridInterval, durationSec }
+      : null;
+    const structure = waveStructure(peaks, bands, grid);
     const points = Array.from({ length: count }, (_, column) => {
       const start = Math.floor(column * peaks.length / count);
       const end = Math.max(start + 1, Math.floor((column + 1) * peaks.length / count));
       const measured = waveColumn(peaks, bands, start, end, radius);
-      return {
-        ...measured,
-        amp: presentAmplitude(measured.amp, reference, radius),
-        x: ((column + 0.5) * 256) / count,
-      };
+      const time = durationSec > 0 ? ((start + end) / 2) / peaks.length * durationSec : undefined;
+      return { ...measured, time, x: ((column + 0.5) * 256) / count };
     });
-    return wavePaths(smoothAmplitudes(points), 20, structureGain(bands), bandScale, 'baseline');
-  }, [peaks, bands, bandScale]);
+    return wavePaths(shapeWavePoints(points, radius, structure), 20, structureGain(bands), bandScale, 'baseline');
+  }, [peaks, bands, bandScale, gridOffset, gridInterval, durationSec]);
   if (!peaks.length) return <span className="mini-waveform-state">No waveform</span>;
   return <svg className="mini-waveform" viewBox="0 0 256 40" preserveAspectRatio="none" role="img" aria-label={label}>
     <title>{RGB_WAVE_KEY}</title>
@@ -193,7 +193,7 @@ export function MiniWaveform({ peaks, bands = [], bandScale = 1, label = "Track 
 }
 
 /** One lazy subscription supplies artwork, tags and waveform for each visible row. */
-export function TrackCells({ path, title, artist, color, bpmCell, keyCell }: { path: string; title: string; artist: string; color?: string; bpmCell?: ReactNode; keyCell?: ReactNode }) {
+export function TrackCells({ path, title, artist, color, bpmCell, keyCell, gridOffset = 0, gridInterval = 0, durationSec = 0 }: { path: string; title: string; artist: string; color?: string; bpmCell?: ReactNode; keyCell?: ReactNode; gridOffset?: number; gridInterval?: number; durationSec?: number }) {
   const ref = useRef<HTMLSpanElement>(null);
   const [visible, setVisible] = useState(false);
   useEffect(() => {
@@ -211,7 +211,7 @@ export function TrackCells({ path, title, artist, color, bpmCell, keyCell }: { p
   useEffect(() => setFailedArtwork(false), [path, artwork]);
   return <>
     <span className="tl-mini-wave" style={color ? { color } : undefined}>
-      {visual.status === "ready" && visual.data?.peaks.length ? <MiniWaveform bandScale={0.5} peaks={visual.data.peaks} bands={visual.data.band_peaks} /> : <span className="mini-waveform-state">{visual.status === "loading" ? "…" : "—"}</span>}
+      {visual.status === "ready" && visual.data?.peaks.length ? <MiniWaveform bandScale={0.5} peaks={visual.data.peaks} bands={visual.data.band_peaks} gridOffset={gridOffset} gridInterval={gridInterval} durationSec={durationSec} /> : <span className="mini-waveform-state">{visual.status === "loading" ? "…" : "—"}</span>}
     </span>
     <span ref={ref} className="tl-title tl-title-with-art">
       <span className="tl-artwork" aria-hidden="true">

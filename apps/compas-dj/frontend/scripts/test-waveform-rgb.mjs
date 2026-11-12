@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 const source = readFileSync(new URL('../src/lib/waveformDisplay.ts', import.meta.url), 'utf8');
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 } }).outputText;
-const { frequencyColor, waveColumn, rgbPaths, wavePaths, structureGain, smoothAmplitudes, trackLevelReference, presentAmplitude } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const { frequencyColor, waveColumn, rgbPaths, wavePaths, structureGain, smoothAmplitudes, trackLevelReference, presentAmplitude, shapeWavePoints, waveStructure } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 for (let i = 0; i < 3; i++) {
   const band = [0, 0, 0]; band[i] = 1;
   const rgb = frequencyColor(...band).match(/\d+/g).map(Number);
@@ -102,17 +102,14 @@ const deck = readFileSync(new URL('../src/components/Deck.tsx', import.meta.url)
 const library = readFileSync(new URL('../src/components/LibraryVisuals.tsx', import.meta.url), 'utf8');
 const zone = readFileSync(new URL('../src/components/WaveformZone.tsx', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
-assert.match(deck, /wavePaths\(smoothAmplitudes\(samples\), height \/ 2, structureGain\(bands\), 1, 'baseline'\)/);
+assert.match(deck, /wavePaths\(shapeWavePoints\(samples, radius, structure\), height \/ 2, structureGain\(bands\), 1, 'baseline'\)/);
 assert.match(deck, /x: \(\(column \+ 0\.5\) \/ count\) \* width/);
-assert.match(deck, /trackLevelReference\(peaks, bands\)/);
-assert.match(deck, /presentAmplitude\(measured\.amp, reference, radius\)/);
-assert.match(library, /wavePaths\(smoothAmplitudes\(points\), 20, structureGain\(bands\), bandScale, 'baseline'\)/);
-assert.match(library, /trackLevelReference\(peaks, bands\)/);
-assert.match(library, /presentAmplitude\(measured\.amp, reference, radius\)/);
+assert.match(deck, /waveStructure\(peaks, bands,/);
+assert.match(library, /wavePaths\(shapeWavePoints\(points, radius, structure\), 20, structureGain\(bands\), bandScale, 'baseline'\)/);
+assert.match(library, /waveStructure\(peaks, bands, grid\)/);
 assert.equal(zone.includes("'baseline'"), false);
-assert.match(zone, /wavePaths\(smoothAmplitudes\(points\), centerY, bandGain\)/);
-assert.match(zone, /trackLevelReference\(peaks, bands\)/);
-assert.match(zone, /presentAmplitude\(column\.amp, levelReference, radius\)/);
+assert.match(zone, /wavePaths\(shapeWavePoints\(points, radius, structure\), centerY, bandGain\)/);
+assert.match(zone, /waveStructure\(peaks, bands,/);
 assert.equal(source.includes('replay_gain'), false);
 assert.equal(deck.includes('setDeckReplayGain'), false);
 assert.equal(library.includes('setDeckReplayGain'), false);
@@ -239,9 +236,10 @@ const broken = Array.from({ length: 40 }, (_, index) => (
   index >= 28 && index < 36 ? [0.2, 0.1, 0.05] : [0.4, 0.2, 0.1]
 ));
 const brokenFit = fitted(broken);
-assert.ok(Math.abs(brokenFit.amps[30] - (0.1 + 0.9 * 0.5) * radius) < 0.6);
-assert.ok(brokenFit.amps[30] < brokenFit.amps[8] * 0.7);
-assert.ok(brokenFit.amps[30] > brokenFit.amps[8] * 0.45);
+const stretchedHalf = (0.1 + 0.9 * (0.5 ** 2.2)) * radius;
+assert.ok(Math.abs(brokenFit.amps[30] - stretchedHalf) < 0.6);
+assert.ok(brokenFit.amps[30] < (0.1 + 0.9 * 0.5) * radius - 3);
+assert.ok(brokenFit.amps[30] > radius * 0.1);
 
 const fittedPoints = smoothAmplitudes(abruptBands.map((_, index) => {
   const measured = waveColumn(abruptPeaks, abruptBands, index, index + 1, radius);
@@ -276,4 +274,76 @@ assert.deepEqual(
   fittedPoints.map((point) => point.color),
   abruptBands.map((_, index) => waveColumn(abruptPeaks, abruptBands, index, index + 1, radius).color),
 );
+
+const pooled = waveColumn(
+  [1, 1, 1, 1],
+  [[0.6, 0.2, 0.2], [0.6, 0.2, 0.2], [0.6, 0.2, 0.2], [0, 0, 0]],
+  0, 4, 20,
+);
+assert.ok(pooled.crest > 0.9);
+assert.ok(pooled.crest > pooled.amp / 20);
+
+const dropoutBands = Array.from({ length: 24 }, (_, index) => (
+  index < 12 ? [0.5, 0.2, 0.1] : [0.04, 0.46, 0.3]
+));
+const dropoutPeaks = dropoutBands.map((band) => band[0] + band[1] + band[2]);
+const dropoutStructure = waveStructure(dropoutPeaks, dropoutBands, null);
+const dropout = shapeWavePoints(dropoutBands.map((_, index) => ({
+  x: index,
+  ...waveColumn(dropoutPeaks, dropoutBands, index, index + 1, radius),
+})), radius, dropoutStructure);
+assert.ok(dropout[4].amp > dropout[18].amp * 1.6);
+assert.equal(dropout[4].color, waveColumn(dropoutPeaks, dropoutBands, 4, 5, radius).color);
+
+const phraseBands = Array.from({ length: 32 }, (_, index) => {
+  if (index >= 28) return [0, 0, 0];
+  const wobble = (index % 3) * 0.015;
+  return index < 16 ? [0.5, 0.2, 0.1 + wobble] : [0.16, 0.08, 0.04];
+});
+const phrasePeaks = phraseBands.map((band) => band[0] + band[1] + band[2]);
+const phraseGrid = { offsetSec: 0, intervalSec: 0.5, durationSec: 32 };
+const phraseStructure = waveStructure(phrasePeaks, phraseBands, phraseGrid);
+const phrase = shapeWavePoints(phraseBands.map((_, index) => {
+  const measured = waveColumn(phrasePeaks, phraseBands, index, index + 1, radius);
+  return { x: index, time: index + 0.5, ...measured };
+}), radius, phraseStructure);
+assert.ok(Math.abs(phrase[3].amp - phrase[12].amp) < 0.05);
+assert.ok(Math.abs(phrase[18].amp - phrase[24].amp) < 0.05);
+assert.ok(phrase[8].amp > phrase[20].amp * 1.4);
+assert.equal(phrase[27].amp, phrase[20].amp);
+assert.equal(phrase[28].amp, 0);
+assert.equal(phrase[30].amp, 0);
+const phrasePaths = wavePaths(phrase, 20, structureGain(phraseBands), 1, 'baseline');
+const phraseCrest = new Map();
+for (const path of phrasePaths) {
+  const values = path.d.match(/-?\d+\.\d+/g).map(Number);
+  for (let offset = 0; offset < values.length; offset += 2) {
+    const key = values[offset].toFixed(1);
+    phraseCrest.set(key, Math.min(phraseCrest.get(key) ?? 40, values[offset + 1]));
+  }
+}
+const phraseHeight = (x) => 40 - (phraseCrest.get(x.toFixed(1)) ?? 40);
+const phraseLoud = phraseHeight(20.5);
+const sounding = [...phraseCrest.keys()].map(Number).filter((x) => phraseHeight(x) > phraseLoud * 0.7);
+const afterSound = [...phraseCrest.keys()].map(Number).filter((x) => x >= Math.max(...sounding) && phraseHeight(x) < 0.3);
+assert.ok(Math.min(...afterSound) - Math.max(...sounding) <= 2);
+
+const timedBands = Array.from({ length: 20000 }, () => [0.4, 0.2, 0.1]);
+const timedPeaks = timedBands.map((band) => band[0] + band[1] + band[2]);
+const timedGrid = { offsetSec: 0.2, intervalSec: 0.5, durationSec: 200 };
+const started = performance.now();
+for (let pass = 0; pass < 20; pass += 1) waveStructure(timedPeaks, timedBands, timedGrid);
+const structureMs = (performance.now() - started) / 20;
+const costPoints = Array.from({ length: 128 }, (_, index) => ({
+  x: index,
+  time: index,
+  ...waveColumn(timedPeaks, timedBands, index * 150, index * 150 + 150, 19),
+}));
+const previewStructure = waveStructure(timedPeaks, timedBands, timedGrid);
+const drawStarted = performance.now();
+for (let pass = 0; pass < 50; pass += 1) shapeWavePoints(costPoints, 19, previewStructure);
+const drawMs = (performance.now() - drawStarted) / 50;
+assert.ok(structureMs < 40);
+assert.ok(drawMs < 5);
+console.log(`Waveform structure ${structureMs.toFixed(2)} ms for 20000 bins; preview draw ${drawMs.toFixed(2)} ms`);
 console.log('Each track uses its own loud section, and level steps keep a vertical edge');

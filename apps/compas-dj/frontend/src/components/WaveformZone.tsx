@@ -5,7 +5,7 @@ import { memoryCueMarks, memoryLoopColor, memoryLoopSpans } from "../lib/memoryL
 import { type CSSProperties, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { useElementSize } from "../hooks/useElementSize";
 import type { DeckState } from "../hooks/useDeck";
-import { wavePaths, structureGain, RGB_WAVE_KEY, waveColumn, smoothAmplitudes, presentAmplitude, trackLevelReference, type WavePoint } from "../lib/waveformDisplay";
+import { wavePaths, structureGain, RGB_WAVE_KEY, waveColumn, shapeWavePoints, waveStructure, type WavePoint } from "../lib/waveformDisplay";
 import { laneTempo } from "../lib/deckReady";
 import { inTauri, onControllerUpdate } from "../lib/ipc";
 
@@ -219,7 +219,12 @@ const WaveGraphic = memo(function WaveGraphic({
   stretch: number;
 }) {
   const bandGain = useMemo(() => structureGain(bands), [bands]);
-  const levelReference = useMemo(() => trackLevelReference(peaks, bands), [peaks, bands]);
+  const durationSec = peaks.length * Math.max(binSec, 0);
+  const structure = useMemo(() => waveStructure(peaks, bands, beatInterval > 0.05 && durationSec > 0 ? {
+    offsetSec: beatOffset,
+    intervalSec: beatInterval,
+    durationSec,
+  } : null), [peaks, bands, beatInterval, beatOffset, durationSec]);
   const centerY = height / 2;
   const pixelsPerSecond = width / Math.max(view, 0.001);
   const span = view * WAVE_SPAN;
@@ -239,12 +244,12 @@ const WaveGraphic = memo(function WaveGraphic({
       const column = waveColumn(peaks, bands, index, end + 1, radius);
       points.push({
         ...column,
-        amp: presentAmplitude(column.amp, levelReference, radius),
+        time: ((index + end + 1) / 2) * binSec,
         x: (column.loudest * binSec / stretch - origin) * pixelsPerSecond,
       });
     }
-    return wavePaths(smoothAmplitudes(points), centerY, bandGain);
-  }, [bands, bandGain, binSec, centerY, levelReference, origin, peaks, pixelsPerSecond, span, stretch, width]);
+    return wavePaths(shapeWavePoints(points, radius, structure), centerY, bandGain);
+  }, [bands, bandGain, binSec, centerY, origin, peaks, pixelsPerSecond, span, stretch, structure, width]);
   const beats = useMemo(() => {
     if (beatInterval <= 0.05 || width <= 0 || stretch <= 0) return [];
     const end = origin + span;

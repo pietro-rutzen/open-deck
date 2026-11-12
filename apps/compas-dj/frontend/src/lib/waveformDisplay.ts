@@ -8,6 +8,11 @@ const LEVEL_STEP = 0.4;
 const LOUD_SECTION_PERCENTILE = 0.94;
 const LOUD_SECTION_FLOOR = 0.1;
 const SILENT_LEVEL = 1e-4;
+const CONTRAST = 2.2;
+const LOW_BLEND = 0.6;
+const COLUMN_PERCENTILE = 0.8;
+const PHRASE_BARS = 8;
+const PHRASE_SPLIT = 0.18;
 
 type Color = readonly [number, number, number];
 const BASS: Color = [255, 16, 33], MID: Color = [66, 255, 10], HIGH: Color = [8, 151, 255];
@@ -39,7 +44,17 @@ export function frequencyColor(low: number, mid: number, high: number) {
   return `rgb(${channel(0)},${channel(1)},${channel(2)})`;
 }
 
-export interface WavePoint { x: number; amp: number; color: string; rms?: Bands }
+export interface WavePoint { x: number; amp: number; color: string; rms?: Bands; crest?: number; low?: number; time?: number }
+
+export interface WaveGrid { offsetSec: number; intervalSec: number; durationSec: number }
+
+export interface WaveStructure {
+  broadbandRef: number;
+  lowRef: number;
+  barHeld: Float64Array | null;
+  barSec: number;
+  offsetSec: number;
+}
 
 // One scale for the whole track keeps a breakdown quiet when the scrolling view zooms in.
 export function structureGain(bands: Bands[]) {
@@ -50,22 +65,37 @@ export function structureGain(bands: Bands[]) {
 
 function columnMeasure(peaks: number[], bands: Bands[], start: number, end: number) {
   let loudest = start, peak = 0, peakSum = 0, low = 0, mid = 0, high = 0;
+  const broadbandBins: number[] = [];
+  const lowBins: number[] = [];
   const measured = bands.length === peaks.length;
   for (let i = start; i < end; i++) {
     const p = finite(peaks[i]);
     peakSum += p;
     if (p > peak) { peak = p; loudest = i; }
     if (measured) {
-      low += finite(bands[i][0]) ** 2;
-      mid += finite(bands[i][1]) ** 2;
-      high += finite(bands[i][2]) ** 2;
+      const binLow = finite(bands[i][0]);
+      const binMid = finite(bands[i][1]);
+      const binHigh = finite(bands[i][2]);
+      low += binLow ** 2;
+      mid += binMid ** 2;
+      high += binHigh ** 2;
+      broadbandBins.push(binLow + binMid + binHigh);
+      lowBins.push(binLow);
+    } else {
+      broadbandBins.push(p);
     }
   }
   const count = Math.max(1, end - start);
   const rms: Bands | undefined = measured
     ? [Math.sqrt(low / count), Math.sqrt(mid / count), Math.sqrt(high / count)] : undefined;
   const bandLevel = rms ? rms[0] + rms[1] + rms[2] : 0;
-  return { loudest, rms, level: bandLevel > 0 ? bandLevel : peakSum / count };
+  return {
+    loudest,
+    rms,
+    level: bandLevel > 0 ? bandLevel : peakSum / count,
+    crest: percentile(broadbandBins, COLUMN_PERCENTILE),
+    lowCrest: lowBins.length > 0 ? percentile(lowBins, COLUMN_PERCENTILE) : 0,
+  };
 }
 
 // Pool power across the whole output column, so a kick cannot erase a quieter hi-hat
@@ -76,6 +106,8 @@ export function waveColumn(peaks: number[], bands: Bands[], start: number, end: 
     loudest: measured.loudest,
     rms: measured.rms,
     amp: Math.min(1, measured.level) * radius,
+    crest: measured.crest,
+    low: measured.lowCrest,
     color: measured.rms ? frequencyColor(...measured.rms) : NEUTRAL,
   };
 }
@@ -87,30 +119,129 @@ function percentile(values: readonly number[], fraction: number) {
   return ranked[index] ?? 0;
 }
 
-// High percentile of the whole-track envelope, so one peak does not set the row height.
-export function trackLevelReference(peaks: number[], bands: Bands[]) {
-  const count = peaks.length;
-  if (count === 0) return 1;
-  const columns = Math.min(count, 512);
-  const levels = Array.from({ length: columns }, (_, column) => {
-    const start = Math.floor(column * count / columns);
-    const end = Math.max(start + 1, Math.floor((column + 1) * count / columns));
-    return columnMeasure(peaks, bands, start, end).level;
-  });
+function referenceOf(levels: readonly number[]) {
   const smoothed = smoothLevels(levels);
   const reference = percentile(smoothed, LOUD_SECTION_PERCENTILE);
   const loudest = smoothed.reduce((highest, level) => Math.max(highest, level), 0);
   return reference > 1e-5 ? reference : Math.max(loudest, 1e-5);
 }
 
-// Silence stays empty. Anything audible keeps a floor, then rises in proportion to the loud section.
+function sampledColumns(peaks: number[], bands: Bands[]) {
+  const count = peaks.length;
+  const columns = Math.min(count, 512);
+  return Array.from({ length: columns }, (_, column) => {
+    const start = Math.floor(column * count / columns);
+    const end = Math.max(start + 1, Math.floor((column + 1) * count / columns));
+    return columnMeasure(peaks, bands, start, end);
+  });
+}
+
+// High percentile of the whole-track envelope, so one peak does not set the row height.
+export function trackLevelReference(peaks: number[], bands: Bands[]) {
+  if (peaks.length === 0) return 1;
+  return referenceOf(sampledColumns(peaks, bands).map(column => column.crest));
+}
+
+export function trackLowReference(peaks: number[], bands: Bands[]) {
+  if (peaks.length === 0 || bands.length !== peaks.length) return 0;
+  return referenceOf(sampledColumns(peaks, bands).map(column => column.lowCrest));
+}
+
+function contrastAmplitude(relative: number, radius: number) {
+  if (!(relative > 0)) return 0;
+  const shaped = Math.min(1, relative) ** CONTRAST;
+  return (LOUD_SECTION_FLOOR + (1 - LOUD_SECTION_FLOOR) * shaped) * radius;
+}
+
+function blendLevels(crest: number, low: number, broadbandRef: number, lowRef: number) {
+  if (crest <= SILENT_LEVEL) return 0;
+  const span = broadbandRef > 1e-5 ? broadbandRef : crest;
+  const broadband = Math.min(1, crest / span);
+  const lowUseful = lowRef > 1e-4 && lowRef > broadbandRef * 0.05;
+  if (!lowUseful) return broadband;
+  return (1 - LOW_BLEND) * broadband + LOW_BLEND * Math.min(1, low / lowRef);
+}
+
+// Silence stays empty. Audible columns keep a floor, then a power curve opens 2–4 dB gaps.
 export function presentAmplitude(amp: number, reference: number, radius: number) {
   if (!(radius > 0) || !(amp > 0)) return 0;
   const level = amp / radius;
   if (level <= SILENT_LEVEL) return 0;
   const span = reference > 1e-5 ? reference : level;
-  const relative = Math.min(1, level / span);
-  return (LOUD_SECTION_FLOOR + (1 - LOUD_SECTION_FLOOR) * relative) * radius;
+  return contrastAmplitude(Math.min(1, level / span), radius);
+}
+
+function median(values: readonly number[]) {
+  const ranked = [...values].sort((left, right) => left - right);
+  return ranked[Math.floor(ranked.length / 2)] ?? 0;
+}
+
+function holdBarLevels(barLevel: readonly number[]) {
+  const audible = barLevel.flatMap((level, bar) => level > 0 ? [bar] : []);
+  const segments: number[][] = [];
+  let current: number[] = [];
+  for (const bar of audible) {
+    const level = barLevel[bar] ?? 0;
+    const anchor = barLevel[current[0] ?? bar] ?? level;
+    const louder = Math.max(level, anchor);
+    const gap = louder > 1e-8 ? Math.abs(level - anchor) / louder : 0;
+    if (current.length > 0 && (gap > PHRASE_SPLIT || current.length >= PHRASE_BARS)) {
+      segments.push(current);
+      current = [bar];
+    } else {
+      current.push(bar);
+    }
+  }
+  if (current.length > 0) segments.push(current);
+  const held = barLevel.slice();
+  for (const segment of segments) {
+    const level = median(segment.map(bar => barLevel[bar] ?? 0));
+    for (const bar of segment) held[bar] = level;
+  }
+  return held;
+}
+
+export function waveStructure(peaks: number[], bands: Bands[], grid: WaveGrid | null): WaveStructure {
+  const broadbandRef = trackLevelReference(peaks, bands);
+  const lowRef = trackLowReference(peaks, bands);
+  const empty: WaveStructure = { broadbandRef, lowRef, barHeld: null, barSec: 0, offsetSec: grid?.offsetSec ?? 0 };
+  if (!grid || !(grid.intervalSec > 0.05) || !(grid.durationSec > 0) || peaks.length === 0) return empty;
+  const barSec = grid.intervalSec * 4;
+  const barCount = Math.max(1, Math.ceil(grid.durationSec / barSec) + 1);
+  const groups = Array.from({ length: barCount }, () => [] as number[]);
+  const count = peaks.length;
+  const stride = Math.max(1, Math.floor(count / 512));
+  for (let index = 0; index < count; index += stride) {
+    const end = Math.min(count, index + stride);
+    const measured = columnMeasure(peaks, bands, index, end);
+    const time = ((index + end) / 2) / count * grid.durationSec;
+    const bar = Math.floor((time - grid.offsetSec) / barSec);
+    if (bar < 0 || bar >= barCount) continue;
+    const relative = blendLevels(measured.crest, measured.lowCrest, broadbandRef, lowRef);
+    if (relative > 0) groups[bar].push(relative);
+  }
+  const barLevel = groups.map(values => values.length > 0 ? median(values) : 0);
+  return { broadbandRef, lowRef, barHeld: Float64Array.from(holdBarLevels(barLevel)), barSec, offsetSec: grid.offsetSec };
+}
+
+export function shapeWavePoints<T extends { amp: number; crest?: number; low?: number; time?: number }>(
+  points: readonly T[],
+  radius: number,
+  structure: WaveStructure,
+): T[] {
+  const relative = points.map(point => {
+    const crest = point.crest ?? (radius > 0 ? point.amp / radius : 0);
+    if (crest <= SILENT_LEVEL) return 0;
+    if (structure.barHeld && structure.barSec > 0 && point.time != null) {
+      const bar = Math.floor((point.time - structure.offsetSec) / structure.barSec);
+      const held = structure.barHeld[bar];
+      if (held != null && held > 0) return held;
+    }
+    return blendLevels(crest, point.low ?? 0, structure.broadbandRef, structure.lowRef);
+  });
+  const shaped = relative.map(level => contrastAmplitude(level, radius));
+  const amplitudes = structure.barHeld ? shaped : smoothLevels(shaped);
+  return points.map((point, index) => ({ ...point, amp: amplitudes[index] ?? 0 }));
 }
 
 function smoothLevels(values: readonly number[], radius = SMOOTH_RADIUS) {

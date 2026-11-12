@@ -21,7 +21,7 @@ import {
 } from '../lib/ipc';
 import { bpmLabel, gridAvailable } from '../lib/deckReady';
 import { audibleFramesRemaining } from '../lib/silence';
-import { RGB_WAVE_KEY, presentAmplitude, smoothAmplitudes, structureGain, trackLevelReference, waveColumn, wavePaths } from '../lib/waveformDisplay';
+import { RGB_WAVE_KEY, shapeWavePoints, structureGain, waveColumn, wavePaths, waveStructure } from '../lib/waveformDisplay';
 import { useElementSize } from '../hooks/useElementSize';
 import { Fader } from './Fader';
 import { Knob } from './Knob';
@@ -1222,9 +1222,15 @@ export function Deck({
 const OverviewWave = memo(function OverviewWave({
   peaks,
   bands,
+  gridOffset,
+  gridInterval,
+  durationSec,
 }: {
   peaks: number[];
   bands: [number, number, number][];
+  gridOffset: number;
+  gridInterval: number;
+  durationSec: number;
 }) {
   const [svgRef, size] = useElementSize<SVGSVGElement>(600, 96);
   const paths = useMemo(() => {
@@ -1233,19 +1239,20 @@ const OverviewWave = memo(function OverviewWave({
     if (peaks.length === 0 || width < 1 || height < 1) return [];
     const count = Math.max(1, Math.min(peaks.length, Math.round(width)));
     const radius = (height / 2) * 0.94;
-    const reference = trackLevelReference(peaks, bands);
+    const structure = waveStructure(peaks, bands, gridInterval > 0.05 && durationSec > 0 ? {
+      offsetSec: gridOffset,
+      intervalSec: gridInterval,
+      durationSec,
+    } : null);
     const samples = Array.from({ length: count }, (_, column) => {
       const start = Math.floor(column * peaks.length / count);
       const end = Math.max(start + 1, Math.floor((column + 1) * peaks.length / count));
       const measured = waveColumn(peaks, bands, start, end, radius);
-      return {
-        ...measured,
-        amp: presentAmplitude(measured.amp, reference, radius),
-        x: ((column + 0.5) / count) * width,
-      };
+      const time = durationSec > 0 ? ((start + end) / 2) / peaks.length * durationSec : undefined;
+      return { ...measured, time, x: ((column + 0.5) / count) * width };
     });
-    return wavePaths(smoothAmplitudes(samples), height / 2, structureGain(bands), 1, 'baseline');
-  }, [peaks, bands, size.width, size.height]);
+    return wavePaths(shapeWavePoints(samples, radius, structure), height / 2, structureGain(bands), 1, 'baseline');
+  }, [peaks, bands, gridOffset, gridInterval, durationSec, size.width, size.height]);
   return (
     <svg
       ref={svgRef}
@@ -1370,7 +1377,13 @@ function OverviewBar({
         dragging.current = false;
       }}
     >
-      <OverviewWave peaks={peaks} bands={meta.band_peaks ?? []} />
+      <OverviewWave
+        peaks={peaks}
+        bands={meta.band_peaks ?? []}
+        gridOffset={(meta.first_beat_sec ?? 0) + state.gridOffset}
+        gridInterval={meta.beat_interval_sec ?? 0}
+        durationSec={meta.duration_ms / 1000}
+      />
       <OverviewPlayhead state={state} color={color} />
       {memoryCueFractions(state.memoryLoops, frames).map((mark) => (
         <div
