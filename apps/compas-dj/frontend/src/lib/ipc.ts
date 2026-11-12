@@ -393,10 +393,22 @@ export interface WatchFolderMp3 {
 
 export interface Mp3MirrorProgress {
   folder: string;
-  done: number;
-  total: number;
+  converted: number;
+  convertible: number;
+  already_mp3: number;
+  failures: string[];
   active: boolean;
 }
+
+export interface Mp3ConversionStatus {
+  converted: number;
+  convertible: number;
+  already_mp3: number;
+  failures: string[];
+}
+
+export const mp3ConversionStatus = (path: string) =>
+  invoke<Mp3ConversionStatus>("mp3_conversion_status", { path });
 
 export const listWatchFolderMp3 = () =>
   invoke<WatchFolderMp3[]>("list_watch_folder_mp3");

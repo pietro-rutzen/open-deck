@@ -1911,14 +1911,25 @@ struct Analyzer {
 struct Mp3Mirror {
     running: AtomicBool,
     requested: AtomicBool,
+    failures: Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
 
 #[derive(Clone, serde::Serialize)]
 struct Mp3MirrorProgress {
     folder: String,
-    done: u32,
-    total: u32,
+    converted: u32,
+    convertible: u32,
+    already_mp3: u32,
+    failures: Vec<String>,
     active: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct Mp3ConversionStatus {
+    converted: u32,
+    convertible: u32,
+    already_mp3: u32,
+    failures: Vec<String>,
 }
 
 /// Start the background analyzer if it isn't already running. Drains every un-analyzed track
@@ -2074,22 +2085,32 @@ fn kick_mp3_mirror(app: &AppHandle) {
                     || wait_while_playing(&app_for_folder),
                     &names,
                     |source| analysis_hint(&app_for_folder, source),
-                    |done, total, active| {
+                    |progress| {
                         let now = Instant::now();
-                        let settled = !active || (total > 0 && done >= total);
+                        let settled = !progress.active
+                            || (progress.convertible > 0
+                                && progress.converted >= progress.convertible
+                                && progress.failures.is_empty());
                         if !settled
                             && now.duration_since(last_progress) < Duration::from_millis(400)
                         {
                             return;
                         }
                         last_progress = now;
+                        if let Some(mirror) = app_for_folder.try_state::<Mp3Mirror>() {
+                            if let Ok(mut failures) = mirror.failures.lock() {
+                                failures.insert(folder.clone(), progress.failures.clone());
+                            }
+                        }
                         let _ = app_for_folder.emit(
                             "mp3-mirror:progress",
                             Mp3MirrorProgress {
                                 folder: folder.clone(),
-                                done,
-                                total,
-                                active,
+                                converted: progress.converted,
+                                convertible: progress.convertible,
+                                already_mp3: progress.already_mp3,
+                                failures: progress.failures,
+                                active: progress.active,
                             },
                         );
                     },
@@ -2409,13 +2430,62 @@ fn set_watch_folder_mp3(
             "mp3-mirror:progress",
             Mp3MirrorProgress {
                 folder: path,
-                done: 0,
-                total: 0,
+                converted: 0,
+                convertible: 0,
+                already_mp3: 0,
+                failures: Vec::new(),
                 active: false,
             },
         );
     }
     Ok(())
+}
+
+/// Converted sources, convertible sources, and files left alone because they are already MP3.
+#[tauri::command]
+fn mp3_conversion_status(
+    db: State<'_, db::Db>,
+    mirror: State<'_, Mp3Mirror>,
+    path: String,
+) -> Result<Mp3ConversionStatus, String> {
+    if path.len() > 4096 || !std::path::Path::new(&path).is_absolute() {
+        return Err("Folder path must be absolute".into());
+    }
+    let roots = with_db(&db, db::list_watch_folders)?;
+    let status = mp3_mirror::conversion_status_for_open(&roots, std::path::Path::new(&path));
+    let failures = mirror
+        .failures
+        .lock()
+        .ok()
+        .and_then(|failures| {
+            watched_root(&roots, &path).and_then(|root| failures.get(root).cloned())
+        })
+        .unwrap_or_default();
+    Ok(Mp3ConversionStatus {
+        converted: status.converted,
+        convertible: status.convertible,
+        already_mp3: status.already_mp3,
+        failures,
+    })
+}
+
+fn watched_root<'a>(roots: &'a [String], path: &str) -> Option<&'a String> {
+    let open = std::path::Path::new(path.trim_end_matches(['/', '\\']));
+    let mut found = None;
+    for root in roots {
+        let trimmed = root.trim_end_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let root_path = std::path::Path::new(trimmed);
+        if open == root_path || open.starts_with(root_path) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(root);
+        }
+    }
+    found
 }
 
 /// Build the live filesystem watcher over the currently-registered folders and spawn the
@@ -5025,6 +5095,7 @@ pub fn run() {
             list_watch_folder_mp3,
             set_watch_folder_mp3,
             list_mp3_mirror,
+            mp3_conversion_status,
             db_track_state,
             db_upsert_analysis,
             db_set_cue,

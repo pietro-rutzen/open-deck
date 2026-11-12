@@ -587,6 +587,78 @@ pub(crate) fn plan_mirror(
     }
 }
 
+/// Converted copies over convertible sources. Already-MP3 files are counted
+/// separately so a mirror's file count cannot become the denominator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConversionStatus {
+    pub(crate) converted: u32,
+    pub(crate) convertible: u32,
+    pub(crate) already_mp3: u32,
+}
+
+pub(crate) fn conversion_status(root: &Path, scope_prefix: &str) -> ConversionStatus {
+    let prefix = scope_prefix.trim_matches('/');
+    let in_scope =
+        |rel: &str| prefix.is_empty() || rel == prefix || rel.starts_with(&format!("{prefix}/"));
+    let sources: Vec<SourceStamp> = source_stamps(root)
+        .into_iter()
+        .filter(|source| in_scope(&source.rel))
+        .collect();
+    let (manifest, policy) = load_manifest(root);
+    let plan = plan_mirror(&sources, &manifest, policy, |dest| {
+        root.join(dest).is_file()
+    });
+    let converted =
+        u32::try_from(plan.keep.len().saturating_add(plan.rename.len())).unwrap_or(u32::MAX);
+    let convertible =
+        converted.saturating_add(u32::try_from(plan.encode.len()).unwrap_or(u32::MAX));
+    ConversionStatus {
+        converted,
+        convertible,
+        already_mp3: count_mp3_sources(root, prefix),
+    }
+}
+
+pub(crate) fn conversion_status_for_open(roots: &[String], open: &Path) -> ConversionStatus {
+    let Some(root) = single_watch_root(roots, open) else {
+        return ConversionStatus::default();
+    };
+    let open = trim_path(open);
+    let mirror = root.join(MIRROR_DIR);
+    let scope = if open == root || open == mirror {
+        String::new()
+    } else if let Ok(relative) = open.strip_prefix(&mirror) {
+        relative_string(relative).unwrap_or_default()
+    } else if let Ok(relative) = open.strip_prefix(&root) {
+        relative_string(relative).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    conversion_status(&root, &scope)
+}
+
+fn count_mp3_sources(root: &Path, prefix: &str) -> u32 {
+    let in_scope =
+        |rel: &str| prefix.is_empty() || rel == prefix || rel.starts_with(&format!("{prefix}/"));
+    let mut count = 0u32;
+    for path in crate::library_scan::collect_audio_files(root) {
+        let Some(rel) = path.strip_prefix(root).ok().and_then(relative_string) else {
+            continue;
+        };
+        if !in_scope(&rel) {
+            continue;
+        }
+        let mp3 = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mp3"));
+        if mp3 {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
 pub(crate) fn manifest_path(root: &Path) -> PathBuf {
     root.join(MIRROR_DIR).join(MANIFEST_FILE)
 }
@@ -1512,6 +1584,64 @@ mod tests {
         assert!(!empty.join("mp3").exists());
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::remove_dir_all(&empty).unwrap();
+    }
+
+    #[test]
+    fn finished_folder_counts_converted_sources_not_mirror_entries() {
+        let root = scratch("status");
+        std::fs::create_dir_all(root.join("mp3")).unwrap();
+        for index in 1..=23 {
+            std::fs::write(root.join(format!("track-{index:02}.mp3")), b"mp3").unwrap();
+        }
+        std::fs::write(root.join("one.flac"), b"flac-one").unwrap();
+        std::fs::write(root.join("two.flac"), b"flac-two").unwrap();
+        let mut manifest = Manifest {
+            version: 2,
+            files: BTreeMap::new(),
+        };
+        for (source, dest) in [("one.flac", "mp3/one.mp3"), ("two.flac", "mp3/two.mp3")] {
+            let meta = std::fs::metadata(root.join(source)).unwrap();
+            let (dev, ino) = file_identity(&meta);
+            let mtime_ns = meta
+                .modified()
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            std::fs::write(root.join(dest), b"copy").unwrap();
+            manifest.files.insert(
+                identity_key(dev, ino, source),
+                ManifestFile {
+                    source: source.to_string(),
+                    source_len: meta.len(),
+                    source_mtime_ns: u64::try_from(mtime_ns).unwrap(),
+                    dest: dest.to_string(),
+                    source_dev: dev,
+                    source_ino: ino,
+                },
+            );
+        }
+        save_manifest(&root, &manifest).unwrap();
+        let finished = conversion_status(&root, "");
+        assert_eq!(
+            finished,
+            ConversionStatus {
+                converted: 2,
+                convertible: 2,
+                already_mp3: 23,
+            }
+        );
+        std::fs::remove_file(root.join("mp3/two.mp3")).unwrap();
+        let partial = conversion_status(&root, "");
+        assert_eq!(
+            partial,
+            ConversionStatus {
+                converted: 1,
+                convertible: 2,
+                already_mp3: 23,
+            }
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn dir_names(dir: &Path) -> Vec<String> {

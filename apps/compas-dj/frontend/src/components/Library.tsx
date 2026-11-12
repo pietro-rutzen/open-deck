@@ -23,6 +23,7 @@ import {
   deleteLibraryFolder,
   inTauri,
   listMp3Mirror,
+  mp3ConversionStatus,
   listWatchFolderMp3,
   listWatchFolders,
   onMp3MirrorProgress,
@@ -82,7 +83,12 @@ import {
   reorderPaths,
   writeFolderOrders,
 } from '../lib/libraryFolders';
-import { isInsideMirror, mp3CopyProgressLabel, selectedWatchFolder } from '../lib/mp3Mirror';
+import {
+  isInsideMirror,
+  mp3ConversionPresentation,
+  selectedWatchFolder,
+  type Mp3ConversionState,
+} from '../lib/mp3Mirror';
 import { controllerLoadPath, selectedControllerRow, stepControllerRow } from '../lib/libraryController';
 import { filterLibraryTracks } from '../lib/librarySearch';
 import { listeningModeActive, setListeningMode } from '../lib/listeningMode';
@@ -552,9 +558,8 @@ export const Library = memo(
     const [mirrorBrowse, setMirrorBrowse] = useState<MirrorBrowse | null>(null);
     const [mirrorEpoch, setMirrorEpoch] = useState(0);
     const [mp3On, setMp3On] = useState<Record<string, boolean>>({});
-    const [mp3Progress, setMp3Progress] = useState<
-      Record<string, { done: number; total: number; active: boolean }>
-    >({});
+    const [mp3Status, setMp3Status] = useState<Mp3ConversionState | null>(null);
+    const mp3StatusEpoch = useRef(0);
     const [scanning, setScanning] = useState(false);
     const refreshFolders = useCallback(() => {
       if (!inTauri()) return;
@@ -571,14 +576,17 @@ export const Library = memo(
     useEffect(() => {
       if (!inTauri()) return;
       const un = onMp3MirrorProgress((progress) => {
-        setMp3Progress((current) => ({
-          ...current,
-          [progress.folder]: {
-            done: progress.done,
-            total: progress.total,
+        const watch = selectedWatchFolder(folderPathRef.current, foldersRef.current);
+        if (progress.folder === watch) {
+          mp3StatusEpoch.current += 1;
+          setMp3Status({
+            converted: progress.converted,
+            convertible: progress.convertible,
+            alreadyMp3: progress.already_mp3,
+            failures: progress.failures,
             active: progress.active,
-          },
-        }));
+          });
+        }
         if (!progress.active) setMirrorEpoch((epoch) => epoch + 1);
       });
       return () => {
@@ -597,6 +605,31 @@ export const Library = memo(
         })
         .catch(() => {
           if (!cancelled) setMirrorBrowse(null);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }, [folderPath, mirrorEpoch]);
+    useEffect(() => {
+      if (!inTauri() || !folderPath) {
+        setMp3Status(null);
+        return;
+      }
+      let cancelled = false;
+      const generation = mp3StatusEpoch.current;
+      mp3ConversionStatus(folderPath)
+        .then((status) => {
+          if (cancelled || generation !== mp3StatusEpoch.current) return;
+          setMp3Status({
+            converted: status.converted,
+            convertible: status.convertible,
+            alreadyMp3: status.already_mp3,
+            failures: status.failures,
+            active: false,
+          });
+        })
+        .catch(() => {
+          if (!cancelled && generation === mp3StatusEpoch.current) setMp3Status(null);
         });
       return () => {
         cancelled = true;
@@ -935,12 +968,16 @@ export const Library = memo(
     );
     const browsingFolder = Boolean(folderPath) && !q.trim();
     const mp3Folder = selectedWatchFolder(folderPath, folders);
-    const mp3ProgressForFolder = mp3Folder ? mp3Progress[mp3Folder] : undefined;
-    const mp3ProgressLabel = mp3CopyProgressLabel(
-      mp3ProgressForFolder?.done ?? 0,
-      mp3ProgressForFolder?.total ?? 0,
-      mp3ProgressForFolder?.active ?? false,
+    const mp3Presentation = mp3ConversionPresentation(
+      mp3Status ?? {
+        converted: 0,
+        convertible: 0,
+        alreadyMp3: 0,
+        failures: [],
+        active: false,
+      },
     );
+    const mp3Fraction = mp3Folder && mp3On[mp3Folder] ? mp3Presentation.fraction : '';
     const viewingMirror = Boolean(browsingFolder && mirrorBrowse?.inside);
     mirrorCopyPathsRef.current = new Set(
       viewingMirror ? (mirrorBrowse?.files ?? []).map((file) => file.path) : [],
@@ -1617,16 +1654,14 @@ export const Library = memo(
               disabled={mp3Folder == null}
               title={
                 mp3Folder
-                  ? mp3ProgressLabel
-                    ? `Keep MP3 copies ${mp3ProgressLabel}`
-                    : 'Keep MP3 copies'
+                  ? mp3Presentation.title
                   : 'Open one watched folder to keep MP3 copies'
               }
               onClick={() => {
                 if (mp3Folder) toggleMp3(mp3Folder);
               }}
             >
-              MP3
+              {mp3Fraction ? `MP3 ${mp3Fraction}` : 'MP3'}
             </button>
           </div>
 
@@ -1775,9 +1810,9 @@ export const Library = memo(
                         />
                         <span className="tl-folder-name">{row.name}</span>
                         <span
-                          className={`mono tl-folder-count ${row.kind === 'folder' ? playedClass(row.playedCount, row.trackCount) : ''}`}
+                          className={`mono tl-folder-count ${row.kind === 'folder' && !row.mirror ? playedClass(row.playedCount, row.trackCount) : ''}`}
                         >
-                          {row.kind === 'folder'
+                          {row.kind === 'folder' && !row.mirror
                             ? playedLabel(row.playedCount, row.trackCount)
                             : ''}
                         </span>

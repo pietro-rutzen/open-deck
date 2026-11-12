@@ -44,15 +44,36 @@ export const isInsideMirror = (
   return open === mirrorRoot || open.startsWith(`${mirrorRoot}${separator}`);
 };
 
-export const mp3CopyProgressLabel = (
-  done: number,
-  total: number,
-  active: boolean,
-): string => {
-  if (!active || !Number.isFinite(done) || !Number.isFinite(total) || total <= 0) {
-    return '';
-  }
-  const shownTotal = Math.floor(total);
-  const shownDone = Math.min(Math.max(Math.floor(done), 0), shownTotal);
-  return `${shownDone}/${shownTotal}`;
+export interface Mp3ConversionState {
+  converted: number;
+  convertible: number;
+  alreadyMp3: number;
+  failures: readonly string[];
+  active: boolean;
+}
+
+const wholeCount = (value: number) =>
+  Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+
+/// Painted fraction is converted / convertible sources. A finished folder hides
+/// it. Already-MP3 files and failures stay in the hover title.
+export const mp3ConversionPresentation = (
+  state: Mp3ConversionState,
+): { fraction: string; title: string } => {
+  const convertible = wholeCount(state.convertible);
+  const converted = Math.min(wholeCount(state.converted), convertible);
+  const alreadyMp3 = wholeCount(state.alreadyMp3);
+  const failures = state.failures.filter((failure) => failure.trim().length > 0);
+  const complete =
+    convertible > 0 && converted >= convertible && failures.length === 0 && !state.active;
+  const fraction = convertible > 0 && !complete ? `${converted}/${convertible}` : '';
+  const details = [
+    convertible > 0 ? `${converted} of ${convertible} converted` : null,
+    alreadyMp3 > 0 ? `${alreadyMp3} already MP3` : null,
+    failures.length > 0 ? `Failed: ${failures.join('; ')}` : null,
+  ].filter((line): line is string => line != null);
+  const title = details.length > 0
+    ? `Keep MP3 copies. ${details.join('. ')}.`
+    : 'Keep MP3 copies';
+  return { fraction, title };
 };
