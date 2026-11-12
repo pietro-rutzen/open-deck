@@ -20,7 +20,11 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 base64 = "0.22.1"
 rustfft = { workspace = true }
-symphonia = { workspace = true }
+symphonia = { workspace = true, features = ["mp3", "flac", "wav", "pcm", "ogg", "vorbis", "isomp4", "aac", "aiff"] }
+rubato = { workspace = true }
+libloading = "0.8"
+id3 = "1.16"
+image = { version = "0.24.9", default-features = false, features = ["jpeg", "png"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"   # in-app auto-update against GitHub Releases (latest.json + signed payloads)

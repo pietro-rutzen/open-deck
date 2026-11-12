@@ -105,7 +105,8 @@ CREATE TABLE IF NOT EXISTS track_tags (
 
 CREATE TABLE IF NOT EXISTS watch_folders (
     path     TEXT PRIMARY KEY,
-    added_at INTEGER NOT NULL
+    added_at INTEGER NOT NULL,
+    keep_mp3 INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS track_visuals (
@@ -148,6 +149,10 @@ fn migrate(conn: &Connection) {
     let _ = conn.execute("ALTER TABLE cues ADD COLUMN out_frame REAL", []);
     let _ = conn.execute(
         "ALTER TABLE memory_loops ADD COLUMN point INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE watch_folders ADD COLUMN keep_mp3 INTEGER NOT NULL DEFAULT 0",
         [],
     );
 }
@@ -531,6 +536,75 @@ pub fn list_watch_folders(c: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = c.prepare("SELECT path FROM watch_folders ORDER BY path ASC")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
     rows.collect()
+}
+
+#[derive(Serialize, Clone)]
+pub struct WatchFolderMp3 {
+    pub path: String,
+    pub keep_mp3: bool,
+}
+
+pub fn list_watch_folder_mp3(c: &Connection) -> rusqlite::Result<Vec<WatchFolderMp3>> {
+    let mut stmt = c.prepare("SELECT path, keep_mp3 FROM watch_folders ORDER BY path ASC")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(WatchFolderMp3 {
+            path: row.get(0)?,
+            keep_mp3: row.get::<_, i64>(1)? != 0,
+        })
+    })?;
+    rows.collect()
+}
+
+/// `false` when `path` is not a watched folder, so a click cannot create one.
+pub fn set_watch_folder_keep_mp3(
+    c: &Connection,
+    path: &str,
+    keep_mp3: bool,
+) -> rusqlite::Result<bool> {
+    let updated = c.execute(
+        "UPDATE watch_folders SET keep_mp3 = ?2 WHERE path = ?1",
+        params![path, i64::from(keep_mp3)],
+    )?;
+    Ok(updated == 1)
+}
+
+pub fn any_watch_folder_keeps_mp3(c: &Connection) -> rusqlite::Result<bool> {
+    let enabled: i64 = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM watch_folders WHERE keep_mp3 != 0)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(enabled != 0)
+}
+
+pub fn watch_folder_keeps_mp3(c: &Connection, path: &str) -> rusqlite::Result<bool> {
+    let enabled: Option<i64> = c
+        .query_row(
+            "SELECT keep_mp3 FROM watch_folders WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(enabled.is_some_and(|value| value != 0))
+}
+
+pub fn list_mp3_watch_folders(c: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt =
+        c.prepare("SELECT path FROM watch_folders WHERE keep_mp3 != 0 ORDER BY path ASC")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    rows.collect()
+}
+
+pub fn track_analysis_hint(
+    c: &Connection,
+    path: &str,
+) -> rusqlite::Result<Option<(Option<f64>, Option<String>, Option<String>)>> {
+    c.query_row(
+        "SELECT bpm, key_name, key_camelot FROM tracks WHERE path = ?1",
+        params![path],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
 }
 
 pub fn list_track_paths(c: &Connection) -> rusqlite::Result<Vec<String>> {
@@ -1959,6 +2033,21 @@ mod tests {
             list_watch_folders(&c).unwrap(),
             vec!["/music/techno".to_string()]
         );
+    }
+
+    #[test]
+    fn watch_folder_mp3_flag_defaults_off() {
+        let c = mem();
+        add_watch_folder(&c, "/music/house").unwrap();
+        let rows = list_watch_folder_mp3(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "/music/house");
+        assert!(!rows[0].keep_mp3);
+        assert!(!set_watch_folder_keep_mp3(&c, "/music/missing", true).unwrap());
+        assert!(set_watch_folder_keep_mp3(&c, "/music/house", true).unwrap());
+        assert!(list_watch_folder_mp3(&c).unwrap()[0].keep_mp3);
+        assert!(set_watch_folder_keep_mp3(&c, "/music/house", false).unwrap());
+        assert!(!list_watch_folder_mp3(&c).unwrap()[0].keep_mp3);
     }
 
     #[test]

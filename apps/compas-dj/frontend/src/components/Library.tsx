@@ -22,7 +22,10 @@ import {
   dbResetPlayCounts,
   deleteLibraryFolder,
   inTauri,
+  listWatchFolderMp3,
   listWatchFolders,
+  onMp3MirrorProgress,
+  setWatchFolderMp3,
   moveIntoFolder,
   renameLibraryFolder,
   onLibraryChanged,
@@ -77,6 +80,7 @@ import {
   reorderPaths,
   writeFolderOrders,
 } from '../lib/libraryFolders';
+import { mp3CopyProgressLabel } from '../lib/mp3Mirror';
 import { controllerLoadPath, selectedControllerRow, stepControllerRow } from '../lib/libraryController';
 import { filterLibraryTracks } from '../lib/librarySearch';
 import { listeningModeActive, setListeningMode } from '../lib/listeningMode';
@@ -533,14 +537,48 @@ export const Library = memo(
 
     // Watched folders (auto-import).
     const [folders, setFolders] = useState<string[]>([]);
+    const [mp3On, setMp3On] = useState<Record<string, boolean>>({});
+    const [mp3Progress, setMp3Progress] = useState<
+      Record<string, { done: number; total: number; active: boolean }>
+    >({});
     const [scanning, setScanning] = useState(false);
     const refreshFolders = useCallback(() => {
       if (!inTauri()) return;
       listWatchFolders()
         .then(setFolders)
         .catch(() => {});
+      listWatchFolderMp3()
+        .then((rows) => {
+          setMp3On(Object.fromEntries(rows.map((row) => [row.path, row.keep_mp3])));
+        })
+        .catch(() => {});
     }, []);
     useEffect(() => refreshFolders(), [refreshFolders]);
+    useEffect(() => {
+      if (!inTauri()) return;
+      const un = onMp3MirrorProgress((progress) => {
+        setMp3Progress((current) => ({
+          ...current,
+          [progress.folder]: {
+            done: progress.done,
+            total: progress.total,
+            active: progress.active,
+          },
+        }));
+      });
+      return () => {
+        un.then((stop) => stop());
+      };
+    }, []);
+    const toggleMp3 = (folder: string) => {
+      if (!inTauri()) return;
+      const next = !mp3On[folder];
+      setMp3On((current) => ({ ...current, [folder]: next }));
+      void setWatchFolderMp3(folder, next).catch((error) => {
+        setMp3On((current) => ({ ...current, [folder]: !next }));
+        reportError(error);
+      });
+    };
     useEffect(() => {
       if (!openedInitialFolder.current) return;
       try {
@@ -1337,6 +1375,12 @@ export const Library = memo(
           )}
           {folders.map((f) => {
             const counts = folderPlayCounts(lib.tracks, f);
+            const progress = mp3Progress[f];
+            const progressLabel = mp3CopyProgressLabel(
+              progress?.done ?? 0,
+              progress?.total ?? 0,
+              progress?.active ?? false,
+            );
             return (
               <div
                 key={f}
@@ -1358,12 +1402,32 @@ export const Library = memo(
                   }
                 }}
               >
+                <button
+                  type="button"
+                  className={`sq-check${mp3On[f] ? ' sq-check--on' : ''}`}
+                  aria-pressed={Boolean(mp3On[f])}
+                  aria-label="Keep MP3 copies"
+                  title="Keep MP3 copies"
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    toggleMp3(f);
+                  }}
+                />
                 <Icon name="folder" size={13} />
                 <span className="src-name">{baseName(f)}</span>
                 <span
                   className={`mono src-play-count ${playedClass(counts.played, counts.total)}`}
                 >
                   {playedLabel(counts.played, counts.total)}
+                </span>
+                <span
+                  className="mono src-mp3-progress"
+                  title={progressLabel ? `MP3 copies ${progressLabel}` : undefined}
+                  aria-hidden={progressLabel === ''}
+                >
+                  {progressLabel}
                 </span>
                 <button
                   className="crate-add"

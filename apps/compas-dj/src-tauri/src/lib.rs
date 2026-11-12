@@ -41,6 +41,9 @@ mod library_analysis;
 mod library_scan;
 #[cfg(target_os = "macos")]
 mod macos_drag;
+mod mp3_encode;
+mod mp3_mirror;
+mod mp3_worker;
 mod native_controls;
 mod native_effects;
 mod sampler_loading;
@@ -1266,12 +1269,13 @@ fn export_diagnostics(
         cue_ring_drops: state.telemetry.cue_ring_drops(),
         reclaim_ring_full: state.telemetry.reclaim_ring_full(),
     };
-    let (tracks, crates, watch_folders) = with_db(&db, |c| {
-        Ok((
-            db::list_tracks(c)?.len(),
-            db::list_crates(c)?.len(),
-            db::list_watch_folders(c)?,
-        ))
+    let (tracks, crates, watch_folders) = with_db(&db, |connection| {
+        let roots = db::list_watch_folders(connection)?;
+        let tracks = db::list_tracks(connection)?
+            .into_iter()
+            .filter(|row| !mp3_mirror::is_under_watch_mirror(&roots, &row.path))
+            .count();
+        Ok((tracks, db::list_crates(connection)?.len(), roots))
     })?;
 
     let report = Diagnostics {
@@ -1770,6 +1774,20 @@ struct Analyzer {
     priority: Mutex<Option<String>>,
 }
 
+#[derive(Default)]
+struct Mp3Mirror {
+    running: AtomicBool,
+    requested: AtomicBool,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct Mp3MirrorProgress {
+    folder: String,
+    done: u32,
+    total: u32,
+    active: bool,
+}
+
 /// Start the background analyzer if it isn't already running. Drains every un-analyzed track
 /// (BPM still NULL), decoding + analyzing off any lock and emitting `library:changed` per track so
 /// the list fills in live. A decode failure writes a 0 BPM sentinel so the row is never retried.
@@ -1853,6 +1871,142 @@ fn kick_analysis(app: &AppHandle) {
     });
 }
 
+fn deck_is_playing(app: &AppHandle) -> bool {
+    let engine = app.state::<EngineHandle>();
+    (0..compas_audio::NUM_DECKS).any(|deck| engine.telemetry.is_playing(deck))
+}
+
+fn kick_mp3_mirror(app: &AppHandle) {
+    let any = app
+        .try_state::<db::Db>()
+        .and_then(|db| with_db(&db, db::any_watch_folder_keeps_mp3).ok())
+        .unwrap_or(false);
+    let Some(mirror) = app.try_state::<Mp3Mirror>() else {
+        return;
+    };
+    if !any && !mirror.running.load(Ordering::SeqCst) {
+        return;
+    }
+    mirror.requested.store(true, Ordering::SeqCst);
+    if !any {
+        return;
+    }
+    if mirror
+        .running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let app = app.clone();
+    thread::spawn(move || {
+        mp3_worker::lower_thread_priority();
+        loop {
+            app.state::<Mp3Mirror>()
+                .requested
+                .store(false, Ordering::SeqCst);
+            let folders = app
+                .try_state::<db::Db>()
+                .and_then(|db| with_db(&db, db::list_mp3_watch_folders).ok())
+                .unwrap_or_default();
+            if folders.is_empty() {
+                break;
+            }
+            for folder in folders {
+                let folder_path = folder.clone();
+                let app_for_folder = app.clone();
+                let errors = mp3_worker::sync_folder(
+                    std::path::Path::new(&folder),
+                    || {
+                        app_for_folder
+                            .try_state::<db::Db>()
+                            .and_then(|db| {
+                                with_db(&db, |connection| {
+                                    db::watch_folder_keeps_mp3(connection, &folder_path)
+                                })
+                                .ok()
+                            })
+                            .unwrap_or(false)
+                    },
+                    || wait_for_mirror_slot(&app_for_folder),
+                    || wait_while_playing(&app_for_folder),
+                    |source| analysis_hint(&app_for_folder, source),
+                    |done, total, active| {
+                        let _ = app_for_folder.emit(
+                            "mp3-mirror:progress",
+                            Mp3MirrorProgress {
+                                folder: folder.clone(),
+                                done,
+                                total,
+                                active,
+                            },
+                        );
+                    },
+                );
+                match errors {
+                    Ok(errors) => {
+                        for error in errors {
+                            tracing::warn!("MP3 mirror {folder}: {error}");
+                        }
+                    }
+                    Err(error) => tracing::warn!("MP3 mirror {folder}: {error}"),
+                }
+            }
+            if !app.state::<Mp3Mirror>().requested.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        let mirror = app.state::<Mp3Mirror>();
+        mirror.running.store(false, Ordering::SeqCst);
+        if mirror.requested.swap(false, Ordering::SeqCst) {
+            kick_mp3_mirror(&app);
+        }
+    });
+}
+
+fn wait_while_playing(app: &AppHandle) {
+    while mp3_mirror::playback_should_pause(deck_is_playing(app)) {
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn wait_for_mirror_slot(app: &AppHandle) {
+    wait_while_playing(app);
+    let started = Instant::now();
+    while mp3_mirror::machine_is_busy(mp3_worker::load_per_cpu())
+        && started.elapsed() < Duration::from_secs(5)
+        && !deck_is_playing(app)
+    {
+        thread::sleep(Duration::from_millis(250));
+    }
+    wait_while_playing(app);
+}
+
+fn analysis_hint(app: &AppHandle, source: &std::path::Path) -> mp3_worker::AnalysisHint {
+    let Some(path) = source.to_str() else {
+        return mp3_worker::AnalysisHint {
+            bpm: None,
+            musical_key: None,
+        };
+    };
+    let hint = app
+        .try_state::<db::Db>()
+        .and_then(|db| with_db(&db, |connection| db::track_analysis_hint(connection, path)).ok());
+    let Some(Some((bpm, key_name, key_camelot))) = hint else {
+        return mp3_worker::AnalysisHint {
+            bpm: None,
+            musical_key: None,
+        };
+    };
+    let musical_key = key_name
+        .filter(|key| !key.trim().is_empty())
+        .or(key_camelot.filter(|key| !key.trim().is_empty()));
+    mp3_worker::AnalysisHint {
+        bpm: bpm.filter(|bpm| bpm.is_finite() && *bpm > 0.0),
+        musical_key,
+    }
+}
+
 /// Prioritize the selected library track after the current bounded analysis completes.
 /// A single pending path is retained; repeated selection never builds an unbounded queue.
 #[tauri::command]
@@ -1926,7 +2080,45 @@ fn rescan_watch_folders(app: AppHandle, db: State<'_, db::Db>) -> Result<usize, 
     if scan.added > 0 {
         kick_analysis(&app);
     }
+    kick_mp3_mirror(&app);
     Ok(scan.added)
+}
+
+#[tauri::command]
+fn list_watch_folder_mp3(db: State<'_, db::Db>) -> Result<Vec<db::WatchFolderMp3>, String> {
+    with_db(&db, db::list_watch_folder_mp3)
+}
+
+#[tauri::command]
+fn set_watch_folder_mp3(
+    app: AppHandle,
+    db: State<'_, db::Db>,
+    path: String,
+    keep_mp3: bool,
+) -> Result<(), String> {
+    if path.len() > 4096 || !std::path::Path::new(&path).is_absolute() {
+        return Err("Folder path must be an absolute watched folder".into());
+    }
+    let updated = with_db(&db, |connection| {
+        db::set_watch_folder_keep_mp3(connection, &path, keep_mp3)
+    })?;
+    if !updated {
+        return Err("That folder is not watched".into());
+    }
+    if keep_mp3 {
+        kick_mp3_mirror(&app);
+    } else {
+        let _ = app.emit(
+            "mp3-mirror:progress",
+            Mp3MirrorProgress {
+                folder: path,
+                done: 0,
+                total: 0,
+                active: false,
+            },
+        );
+    }
+    Ok(())
 }
 
 /// Build the live filesystem watcher over the currently-registered folders and spawn the
@@ -1975,29 +2167,57 @@ fn spawn_folder_watch(
     /// Quiet gap after the last event before a rescan fires.
     const DEBOUNCE: Duration = Duration::from_millis(800);
     thread::spawn(move || loop {
-        // Block until something changes; bail out when the sender is dropped.
-        if rx.recv().is_err() {
-            return;
-        }
-        // Wait for the burst to settle before scanning.
+        let first = match rx.recv() {
+            Ok(event) => event,
+            Err(_) => return,
+        };
+        let roots = watch_roots(&handle);
+        let mut library_change = event_touches_library(&roots, &first);
         loop {
             match rx.recv_timeout(DEBOUNCE) {
-                Ok(_) => continue,
+                Ok(event) => {
+                    if event_touches_library(&roots, &event) {
+                        library_change = true;
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
-        let scan = {
-            let db = handle.state::<db::Db>();
-            rescan_all_watch_folders(&db)
-        };
-        if scan.added > 0 || scan.removed > 0 {
-            let _ = handle.emit("library:changed", ());
+        if library_change {
+            let scan = {
+                let db = handle.state::<db::Db>();
+                rescan_all_watch_folders(&db)
+            };
+            if scan.added > 0 || scan.removed > 0 {
+                let _ = handle.emit("library:changed", ());
+            }
+            if scan.added > 0 {
+                kick_analysis(&handle);
+            }
         }
-        if scan.added > 0 {
-            kick_analysis(&handle);
-        }
+        kick_mp3_mirror(&handle);
     });
+}
+
+fn watch_roots(app: &AppHandle) -> Vec<String> {
+    let Some(db) = app.try_state::<db::Db>() else {
+        return Vec::new();
+    };
+    with_db(&db, db::list_watch_folders).unwrap_or_default()
+}
+
+fn event_touches_library(roots: &[String], event: &notify::Result<notify::Event>) -> bool {
+    let Ok(event) = event else {
+        return true;
+    };
+    if event.paths.is_empty() {
+        return true;
+    }
+    event
+        .paths
+        .iter()
+        .any(|path| !mp3_mirror::is_under_watch_mirror(roots, &path.to_string_lossy()))
 }
 
 // ----------------------------------------------------------------------------------
@@ -2015,7 +2235,21 @@ fn with_db<T>(
 
 #[tauri::command]
 fn db_list_tracks(db: State<'_, db::Db>) -> Result<Vec<db::TrackRow>, String> {
-    with_db(&db, db::list_tracks)
+    with_db(&db, |connection| {
+        let rows = db::list_tracks(connection)?;
+        without_mp3_mirrors(connection, rows)
+    })
+}
+
+fn without_mp3_mirrors(
+    connection: &rusqlite::Connection,
+    rows: Vec<db::TrackRow>,
+) -> rusqlite::Result<Vec<db::TrackRow>> {
+    let roots = db::list_watch_folders(connection)?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| !mp3_mirror::is_under_watch_mirror(&roots, &row.path))
+        .collect())
 }
 
 /// Probe a file's header, insert it into the library (no-op if already present), return its row.
@@ -2479,7 +2713,10 @@ fn db_history(db: State<'_, db::Db>, limit: i64) -> Result<Vec<db::HistoryRow>, 
 /// Search the library with the query grammar (`bpm:120-128 key:8A artist:foo -live`).
 #[tauri::command]
 fn db_search(db: State<'_, db::Db>, query: String) -> Result<Vec<db::TrackRow>, String> {
-    with_db(&db, |c| db::search_tracks(c, &query))
+    with_db(&db, |connection| {
+        let rows = db::search_tracks(connection, &query)?;
+        without_mp3_mirrors(connection, rows)
+    })
 }
 
 #[tauri::command]
@@ -2519,7 +2756,10 @@ fn db_remove_from_crate(db: State<'_, db::Db>, crate_id: i64, path: String) -> R
 
 #[tauri::command]
 fn db_crate_tracks(db: State<'_, db::Db>, crate_id: i64) -> Result<Vec<db::TrackRow>, String> {
-    with_db(&db, |c| db::crate_tracks(c, crate_id))
+    with_db(&db, |connection| {
+        let rows = db::crate_tracks(connection, crate_id)?;
+        without_mp3_mirrors(connection, rows)
+    })
 }
 
 /// Export a crate/playlist to a portable JSON manifest at `dest_path`: the resolved track list
@@ -4379,6 +4619,7 @@ pub fn run() {
         .manage(hid::HidState::default())
         .manage(FolderWatch::default())
         .manage(Analyzer::default())
+        .manage(Mp3Mirror::default())
         .setup(move |app| {
             // CoreMIDI binds notifications to the run loop of its first client.
             // Create it here on the main thread before any controller worker starts,
@@ -4422,6 +4663,7 @@ pub fn run() {
                                 // Backfill BPM/key for imported-but-unanalyzed tracks — this
                                 // rescan's new files plus any backlog from a prior session.
                                 kick_analysis(&handle);
+                                kick_mp3_mirror(&handle);
                             });
                             // Then keep watching them live so files dropped in while running
                             // auto-import without a manual rescan.
@@ -4465,6 +4707,8 @@ pub fn run() {
             add_watch_folder,
             remove_watch_folder,
             rescan_watch_folders,
+            list_watch_folder_mp3,
+            set_watch_folder_mp3,
             db_track_state,
             db_upsert_analysis,
             db_set_cue,

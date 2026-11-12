@@ -383,6 +383,29 @@ export const addWatchFolder = (path: string) => invoke<number>("add_watch_folder
 export const removeWatchFolder = (path: string) => invoke("remove_watch_folder", { path });
 /** Re-scan all watched folders for new files; returns the total newly imported. */
 export const rescanWatchFolders = () => invoke<number>("rescan_watch_folders");
+
+export interface WatchFolderMp3 {
+  path: string;
+  keep_mp3: boolean;
+}
+
+export interface Mp3MirrorProgress {
+  folder: string;
+  done: number;
+  total: number;
+  active: boolean;
+}
+
+export const listWatchFolderMp3 = () =>
+  invoke<WatchFolderMp3[]>("list_watch_folder_mp3");
+
+export const setWatchFolderMp3 = (path: string, keepMp3: boolean) =>
+  invoke("set_watch_folder_mp3", { path, keepMp3 });
+
+export const onMp3MirrorProgress = (
+  cb: (progress: Mp3MirrorProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<Mp3MirrorProgress>("mp3-mirror:progress", (event) => cb(event.payload));
 /** Fires after a watched-folder scan imports tracks — refresh the library view. */
 export const onLibraryChanged = (cb: () => void): Promise<UnlistenFn> =>
   listen("library:changed", () => cb());

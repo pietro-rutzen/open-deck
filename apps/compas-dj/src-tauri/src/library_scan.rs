@@ -40,7 +40,14 @@ fn walk(folder: &Path, depth: u32, found: &mut Vec<PathBuf>) {
         }
         let path = entry.path();
         if kind.is_dir() {
-            walk(&path, depth + 1, found);
+            let reserved_mirror = depth == 0
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case(crate::mp3_mirror::MIRROR_DIR));
+            if !reserved_mirror {
+                walk(&path, depth + 1, found);
+            }
         } else if kind.is_file() && crate::is_audio_file(&path) {
             found.push(path);
         }
@@ -103,6 +110,27 @@ mod tests {
             .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
             .collect();
         assert_eq!(names, vec!["inside.wav"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn startup_scan_skips_the_reserved_mp3_mirror_only() {
+        let root = scratch("mirror");
+        std::fs::write(root.join("kept.flac"), b"fLaC").unwrap();
+        let mirror = root.join("mp3");
+        std::fs::create_dir(&mirror).unwrap();
+        std::fs::write(mirror.join("hidden.wav"), b"RIFF").unwrap();
+        let nested = root.join("Artist").join("mp3");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("still.wav"), b"RIFF").unwrap();
+        let found = collect_audio_files(&root);
+        let names: Vec<_> = found
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        assert!(names.contains(&"kept.flac"));
+        assert!(names.contains(&"still.wav"));
+        assert!(!names.contains(&"hidden.wav"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
