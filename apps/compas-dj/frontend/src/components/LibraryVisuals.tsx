@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { RGB_WAVE_KEY, smoothAmplitudes, structureGain, waveColumn, wavePaths } from "../lib/waveformDisplay";
+import { RGB_WAVE_KEY, presentAmplitude, smoothAmplitudes, structureGain, trackLevelReference, waveColumn, wavePaths } from "../lib/waveformDisplay";
 import { inTauri } from "../lib/ipc";
 
 export interface TrackVisuals {
@@ -171,10 +171,17 @@ export function useTrackVisuals(path: string | null, enabled = true, includeArtw
 export function MiniWaveform({ peaks, bands = [], bandScale = 1, label = "Track frequency and amplitude overview" }: { peaks: number[]; bands?: [number, number, number][]; bandScale?: number; label?: string }) {
   const paths = useMemo(() => {
     const count = Math.min(peaks.length, 256);
+    const radius = 19;
+    const reference = trackLevelReference(peaks, bands);
     const points = Array.from({ length: count }, (_, column) => {
       const start = Math.floor(column * peaks.length / count);
       const end = Math.max(start + 1, Math.floor((column + 1) * peaks.length / count));
-      return { ...waveColumn(peaks, bands, start, end, 19), x: ((column + 0.5) * 256) / count };
+      const measured = waveColumn(peaks, bands, start, end, radius);
+      return {
+        ...measured,
+        amp: presentAmplitude(measured.amp, reference, radius),
+        x: ((column + 0.5) * 256) / count,
+      };
     });
     return wavePaths(smoothAmplitudes(points), 20, structureGain(bands), bandScale, 'baseline');
   }, [peaks, bands, bandScale]);

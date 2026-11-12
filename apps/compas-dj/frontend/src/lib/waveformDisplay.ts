@@ -3,9 +3,11 @@ type Bands = readonly [number, number, number];
 const finite = (value: number) => Number.isFinite(value) ? Math.max(0, value) : 0;
 export const RGB_WAVE_KEY = 'Band thickness shows bass (blue), mids (amber) and treble (ivory). The outer rim blends bass red, mid green and treble sky blue.';
 const NEUTRAL = '#8996a4';
-const LOUDNESS_REFERENCE = 1;
 const SMOOTH_RADIUS = 2;
 const LEVEL_STEP = 0.4;
+const LOUD_SECTION_PERCENTILE = 0.94;
+const LOUD_SECTION_FLOOR = 0.1;
+const SILENT_LEVEL = 1e-4;
 
 type Color = readonly [number, number, number];
 const BASS: Color = [255, 16, 33], MID: Color = [66, 255, 10], HIGH: Color = [8, 151, 255];
@@ -46,9 +48,7 @@ export function structureGain(bands: Bands[]) {
   return peak > 1e-5 ? 1 / peak : 0;
 }
 
-// Pool power across the whole output column, so a kick cannot erase a quieter hi-hat
-// from its color. Height is that column's loudness against full scale, the same ruler for every track.
-export function waveColumn(peaks: number[], bands: Bands[], start: number, end: number, radius: number) {
+function columnMeasure(peaks: number[], bands: Bands[], start: number, end: number) {
   let loudest = start, peak = 0, peakSum = 0, low = 0, mid = 0, high = 0;
   const measured = bands.length === peaks.length;
   for (let i = start; i < end; i++) {
@@ -65,33 +65,75 @@ export function waveColumn(peaks: number[], bands: Bands[], start: number, end: 
   const rms: Bands | undefined = measured
     ? [Math.sqrt(low / count), Math.sqrt(mid / count), Math.sqrt(high / count)] : undefined;
   const bandLevel = rms ? rms[0] + rms[1] + rms[2] : 0;
-  const level = bandLevel > 0 ? bandLevel : peakSum / count;
+  return { loudest, rms, level: bandLevel > 0 ? bandLevel : peakSum / count };
+}
+
+// Pool power across the whole output column, so a kick cannot erase a quieter hi-hat
+// from its color. Amplitude here is still absolute; row height is applied afterwards.
+export function waveColumn(peaks: number[], bands: Bands[], start: number, end: number, radius: number) {
+  const measured = columnMeasure(peaks, bands, start, end);
   return {
-    loudest,
-    rms,
-    amp: Math.min(1, level / LOUDNESS_REFERENCE) * radius,
-    color: rms ? frequencyColor(...rms) : NEUTRAL,
+    loudest: measured.loudest,
+    rms: measured.rms,
+    amp: Math.min(1, measured.level) * radius,
+    color: measured.rms ? frequencyColor(...measured.rms) : NEUTRAL,
   };
 }
 
-export function smoothAmplitudes<T extends { amp: number }>(points: readonly T[], radius = SMOOTH_RADIUS): T[] {
-  if (radius <= 0 || points.length < 3) return points.map(point => ({ ...point }));
-  const amps = points.map(point => point.amp);
-  const smoothed = amps.map((amp, index) => {
+function percentile(values: readonly number[], fraction: number) {
+  const ranked = [...values].sort((left, right) => left - right);
+  if (ranked.length === 0) return 0;
+  const index = Math.min(ranked.length - 1, Math.max(0, Math.ceil(fraction * ranked.length) - 1));
+  return ranked[index] ?? 0;
+}
+
+// High percentile of the whole-track envelope, so one peak does not set the row height.
+export function trackLevelReference(peaks: number[], bands: Bands[]) {
+  const count = peaks.length;
+  if (count === 0) return 1;
+  const columns = Math.min(count, 512);
+  const levels = Array.from({ length: columns }, (_, column) => {
+    const start = Math.floor(column * count / columns);
+    const end = Math.max(start + 1, Math.floor((column + 1) * count / columns));
+    return columnMeasure(peaks, bands, start, end).level;
+  });
+  const smoothed = smoothLevels(levels);
+  const reference = percentile(smoothed, LOUD_SECTION_PERCENTILE);
+  const loudest = smoothed.reduce((highest, level) => Math.max(highest, level), 0);
+  return reference > 1e-5 ? reference : Math.max(loudest, 1e-5);
+}
+
+// Silence stays empty. Anything audible keeps a floor, then rises in proportion to the loud section.
+export function presentAmplitude(amp: number, reference: number, radius: number) {
+  if (!(radius > 0) || !(amp > 0)) return 0;
+  const level = amp / radius;
+  if (level <= SILENT_LEVEL) return 0;
+  const span = reference > 1e-5 ? reference : level;
+  const relative = Math.min(1, level / span);
+  return (LOUD_SECTION_FLOOR + (1 - LOUD_SECTION_FLOOR) * relative) * radius;
+}
+
+function smoothLevels(values: readonly number[], radius = SMOOTH_RADIUS) {
+  if (radius <= 0 || values.length < 3) return values.slice();
+  return values.map((amp, index) => {
     const start = Math.max(0, index - radius);
-    const end = Math.min(amps.length - 1, index + radius);
+    const end = Math.min(values.length - 1, index + radius);
     let weighted = 0;
     let weight = 0;
     for (let sample = start; sample <= end; sample += 1) {
-      const louder = Math.max(amp, amps[sample]);
-      const crossesStep = sample !== index && louder > 1e-8 && Math.abs(amp - amps[sample]) / louder > LEVEL_STEP;
+      const louder = Math.max(amp, values[sample]);
+      const crossesStep = sample !== index && louder > 1e-8 && Math.abs(amp - values[sample]) / louder > LEVEL_STEP;
       if (crossesStep) continue;
       const sampleWeight = radius + 1 - Math.abs(sample - index);
-      weighted += amps[sample] * sampleWeight;
+      weighted += values[sample] * sampleWeight;
       weight += sampleWeight;
     }
     return weight > 0 ? weighted / weight : amp;
   });
+}
+
+export function smoothAmplitudes<T extends { amp: number }>(points: readonly T[], radius = SMOOTH_RADIUS): T[] {
+  const smoothed = smoothLevels(points.map(point => point.amp), radius);
   return points.map((point, index) => ({ ...point, amp: smoothed[index] }));
 }
 

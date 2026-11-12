@@ -21,7 +21,7 @@ import {
 } from '../lib/ipc';
 import { bpmLabel, gridAvailable } from '../lib/deckReady';
 import { audibleFramesRemaining } from '../lib/silence';
-import { RGB_WAVE_KEY, smoothAmplitudes, structureGain, waveColumn, wavePaths } from '../lib/waveformDisplay';
+import { RGB_WAVE_KEY, presentAmplitude, smoothAmplitudes, structureGain, trackLevelReference, waveColumn, wavePaths } from '../lib/waveformDisplay';
 import { useElementSize } from '../hooks/useElementSize';
 import { Fader } from './Fader';
 import { Knob } from './Knob';
@@ -1232,11 +1232,17 @@ const OverviewWave = memo(function OverviewWave({
     const height = size.height;
     if (peaks.length === 0 || width < 1 || height < 1) return [];
     const count = Math.max(1, Math.min(peaks.length, Math.round(width)));
+    const radius = (height / 2) * 0.94;
+    const reference = trackLevelReference(peaks, bands);
     const samples = Array.from({ length: count }, (_, column) => {
       const start = Math.floor(column * peaks.length / count);
       const end = Math.max(start + 1, Math.floor((column + 1) * peaks.length / count));
-      const measured = waveColumn(peaks, bands, start, end, (height / 2) * 0.94);
-      return { ...measured, x: ((column + 0.5) / count) * width };
+      const measured = waveColumn(peaks, bands, start, end, radius);
+      return {
+        ...measured,
+        amp: presentAmplitude(measured.amp, reference, radius),
+        x: ((column + 0.5) / count) * width,
+      };
     });
     return wavePaths(smoothAmplitudes(samples), height / 2, structureGain(bands), 1, 'baseline');
   }, [peaks, bands, size.width, size.height]);
