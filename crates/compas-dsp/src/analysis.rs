@@ -917,10 +917,10 @@ pub fn replaygain_linear(samples: &[f32]) -> f32 {
     ((TARGET_RMS / rms) as f32).clamp(0.25, 4.0)
 }
 
-/// Per-waveform-bin energy split into three frequency bands (low / mid / high), for drawing
-/// frequency-colored waveforms (low→red, mid→green, high→blue). `samples` is interleaved stereo;
-/// each output entry is `[low, mid, high]` RMS for one `bin_frames`-sized bin, globally normalized
-/// to `0..=1` by the largest single-band value so colors are comparable across the track. Offline.
+/// Per-waveform-bin energy split into three frequency bands (low / mid / high). `samples` is
+/// interleaved stereo; each output entry is the absolute `[low, mid, high]` RMS for one
+/// `bin_frames`-sized bin. Levels stay on a shared full-scale ruler so a loud master is not
+/// stretched to the top of the waveform. Offline.
 pub fn band_peaks(samples: &[f32], sample_rate: u32, bin_frames: usize) -> Vec<[f32; 3]> {
     let frames = samples.len() / 2;
     if frames == 0 || bin_frames == 0 || sample_rate == 0 {
@@ -958,22 +958,12 @@ pub fn band_peaks(samples: &[f32], sample_rate: u32, bin_frames: usize) -> Vec<[
     }
 
     let mut out = vec![[0.0f32; 3]; nbins];
-    let mut peak = 0.0f32;
     for (bin, (s, &c)) in sums.iter().zip(counts.iter()).enumerate() {
         if c == 0 {
             continue;
         }
         for b in 0..3 {
-            let rms = (s[b] / c as f64).sqrt() as f32;
-            out[bin][b] = rms;
-            peak = peak.max(rms);
-        }
-    }
-    if peak > 1e-9 {
-        for bin in out.iter_mut() {
-            for b in bin.iter_mut() {
-                *b /= peak;
-            }
+            out[bin][b] = (s[b] / c as f64).sqrt() as f32;
         }
     }
     out

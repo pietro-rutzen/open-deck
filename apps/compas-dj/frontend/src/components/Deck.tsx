@@ -21,7 +21,7 @@ import {
 } from '../lib/ipc';
 import { bpmLabel, gridAvailable } from '../lib/deckReady';
 import { audibleFramesRemaining } from '../lib/silence';
-import { OVERVIEW_WAVE_KEY, overviewPaths } from '../lib/waveformDisplay';
+import { RGB_WAVE_KEY, smoothAmplitudes, structureGain, waveColumn, wavePaths } from '../lib/waveformDisplay';
 import { useElementSize } from '../hooks/useElementSize';
 import { Fader } from './Fader';
 import { Knob } from './Knob';
@@ -1227,10 +1227,19 @@ const OverviewWave = memo(function OverviewWave({
   bands: [number, number, number][];
 }) {
   const [svgRef, size] = useElementSize<SVGSVGElement>(600, 96);
-  const paths = useMemo(
-    () => overviewPaths(peaks, bands, size.width, size.height),
-    [peaks, bands, size.width, size.height],
-  );
+  const paths = useMemo(() => {
+    const width = size.width;
+    const height = size.height;
+    if (peaks.length === 0 || width < 1 || height < 1) return [];
+    const count = Math.max(1, Math.min(peaks.length, Math.round(width)));
+    const samples = Array.from({ length: count }, (_, column) => {
+      const start = Math.floor(column * peaks.length / count);
+      const end = Math.max(start + 1, Math.floor((column + 1) * peaks.length / count));
+      const measured = waveColumn(peaks, bands, start, end, (height / 2) * 0.94);
+      return { ...measured, x: measured.loudest / peaks.length * width };
+    });
+    return wavePaths(smoothAmplitudes(samples), height / 2, structureGain(bands), 1, 'baseline');
+  }, [peaks, bands, size.width, size.height]);
   return (
     <svg
       ref={svgRef}
@@ -1238,7 +1247,7 @@ const OverviewWave = memo(function OverviewWave({
       viewBox={`0 0 ${size.width} ${size.height}`}
       preserveAspectRatio="none"
     >
-      <title>{OVERVIEW_WAVE_KEY}</title>
+      <title>{RGB_WAVE_KEY}</title>
       {paths.map(path => <path key={path.fill} {...path} />)}
     </svg>
   );

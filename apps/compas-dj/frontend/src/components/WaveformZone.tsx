@@ -5,7 +5,7 @@ import { memoryCueMarks, memoryLoopColor, memoryLoopSpans } from "../lib/memoryL
 import { type CSSProperties, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { useElementSize } from "../hooks/useElementSize";
 import type { DeckState } from "../hooks/useDeck";
-import { wavePaths, structureGain, RGB_WAVE_KEY, waveColumn, waveformScale, type WavePoint } from "../lib/waveformDisplay";
+import { wavePaths, structureGain, RGB_WAVE_KEY, waveColumn, smoothAmplitudes, type WavePoint } from "../lib/waveformDisplay";
 import { laneTempo } from "../lib/deckReady";
 import { inTauri, onControllerUpdate } from "../lib/ipc";
 
@@ -218,7 +218,6 @@ const WaveGraphic = memo(function WaveGraphic({
   beatOffset: number;
   stretch: number;
 }) {
-  const displayScale = useMemo(() => waveformScale(peaks), [peaks]);
   const bandGain = useMemo(() => structureGain(bands), [bands]);
   const centerY = height / 2;
   const pixelsPerSecond = width / Math.max(view, 0.001);
@@ -235,11 +234,11 @@ const WaveGraphic = memo(function WaveGraphic({
     const points: WavePoint[] = [];
     for (let index = first; index <= last; index += step) {
       const end = Math.min(last, index + step - 1);
-      const column = waveColumn(peaks, bands, index, end + 1, displayScale, centerY * 0.94);
+      const column = waveColumn(peaks, bands, index, end + 1, centerY * 0.94);
       points.push({ ...column, x: (column.loudest * binSec / stretch - origin) * pixelsPerSecond });
     }
-    return wavePaths(points, centerY, bandGain);
-  }, [bands, bandGain, binSec, centerY, displayScale, origin, peaks, pixelsPerSecond, span, stretch, width]);
+    return wavePaths(smoothAmplitudes(points), centerY, bandGain);
+  }, [bands, bandGain, binSec, centerY, origin, peaks, pixelsPerSecond, span, stretch, width]);
   const beats = useMemo(() => {
     if (beatInterval <= 0.05 || width <= 0 || stretch <= 0) return [];
     const end = origin + span;
