@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { wavePaths, structureGain, RGB_WAVE_KEY, waveColumn, waveformScale } from "../lib/waveformDisplay";
+import { OVERVIEW_WAVE_KEY, overviewPaths } from "../lib/waveformDisplay";
 import { inTauri } from "../lib/ipc";
 
 export interface TrackVisuals {
@@ -169,18 +169,13 @@ export function useTrackVisuals(path: string | null, enabled = true, includeArtw
 }
 
 export function MiniWaveform({ peaks, bands = [], bandScale = 1, label = "Track frequency and amplitude overview" }: { peaks: number[]; bands?: [number, number, number][]; bandScale?: number; label?: string }) {
-  const paths = useMemo(() => {
-    const gain = waveformScale(peaks);
-    const count = Math.min(peaks.length, 256);
-    const points = Array.from({ length: count }, (_, i) => ({
-      ...waveColumn(peaks, bands, Math.floor(i * peaks.length / count), Math.floor((i + 1) * peaks.length / count), gain, 19, 'preview'),
-      x: ((i + 0.5) * 256) / count,
-    }));
-    return wavePaths(points, 20, structureGain(bands), bandScale, 'baseline');
-  }, [peaks, bands, bandScale]);
+  const paths = useMemo(
+    () => overviewPaths(peaks, bands, 256, 40, bandScale),
+    [peaks, bands, bandScale],
+  );
   if (!peaks.length) return <span className="mini-waveform-state">No waveform</span>;
   return <svg className="mini-waveform" viewBox="0 0 256 40" preserveAspectRatio="none" role="img" aria-label={label}>
-    <title>{RGB_WAVE_KEY}</title>
+    <title>{OVERVIEW_WAVE_KEY}</title>
     {paths.map(path => <path key={path.fill} {...path} />)}
   </svg>;
 }

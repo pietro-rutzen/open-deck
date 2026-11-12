@@ -2,6 +2,11 @@
 type Bands = readonly [number, number, number];
 const finite = (value: number) => Number.isFinite(value) ? Math.max(0, value) : 0;
 export const RGB_WAVE_KEY = 'Band thickness shows bass (blue), mids (amber) and treble (ivory). The outer rim blends bass red, mid green and treble sky blue.';
+export const OVERVIEW_WAVE_KEY = 'Height is this track’s loudness. Blue is low, amber is mid, and the light cap is high.';
+const OVERVIEW_LOW = '#137fff';
+const OVERVIEW_MID = '#ffa916';
+const OVERVIEW_HIGH = '#fff4d9';
+const OVERVIEW_SMOOTH = 2;
 const NEUTRAL = '#8996a4';
 
 export function waveformScale(peaks: number[]) {
@@ -158,6 +163,115 @@ function baselineBands(
       fill: fills[i],
       d: `M${crests[i].join(' ')}L${lastX} ${floor} ${firstX} ${floor}Z`,
     });
+  }
+  return paths;
+}
+
+function smoothSeries(values: readonly number[], radius: number) {
+  if (radius <= 0 || values.length < 3) return values.slice();
+  const smoothed = new Array<number>(values.length);
+  for (let index = 0; index < values.length; index += 1) {
+    const start = Math.max(0, index - radius);
+    const end = Math.min(values.length - 1, index + radius);
+    let weighted = 0;
+    let weight = 0;
+    for (let sample = start; sample <= end; sample += 1) {
+      const sampleWeight = radius + 1 - Math.abs(sample - index);
+      weighted += values[sample] * sampleWeight;
+      weight += sampleWeight;
+    }
+    smoothed[index] = weight > 0 ? weighted / weight : 0;
+  }
+  return smoothed;
+}
+
+function stackedRibbon(
+  fill: string,
+  xs: readonly number[],
+  bottom: readonly number[],
+  top: readonly number[],
+  floor: number,
+) {
+  let visible = false;
+  for (let index = 0; index < xs.length; index += 1) {
+    if (top[index] - bottom[index] > 0.05) visible = true;
+  }
+  if (!visible) return null;
+  const crest = xs.map((x, index) => `${x.toFixed(1)} ${(floor - top[index]).toFixed(1)}`);
+  const base = xs.map((x, index) => `${x.toFixed(1)} ${(floor - bottom[index]).toFixed(1)}`);
+  return { fill, d: `M${crest.join(' ')}L${base.reverse().join(' ')}Z` };
+}
+
+// Overview previews use one track-wide linear scale of pooled band loudness.
+// Low, mid and high stack from the bottom edge; a short blur keeps phrases in blocks.
+export function overviewPaths(
+  peaks: number[],
+  bands: readonly Bands[],
+  width: number,
+  height: number,
+  bandScale = 1,
+) {
+  if (peaks.length === 0 || width < 1 || height < 1 || bandScale <= 0) return [];
+  const columns = Math.max(1, Math.min(peaks.length, Math.round(width)));
+  const measured = bands.length === peaks.length;
+  const low = new Array<number>(columns);
+  const mid = new Array<number>(columns);
+  const high = new Array<number>(columns);
+  const peakMean = new Array<number>(columns);
+  const xs = new Array<number>(columns);
+  for (let column = 0; column < columns; column += 1) {
+    const start = Math.floor(column * peaks.length / columns);
+    const end = Math.max(start + 1, Math.floor((column + 1) * peaks.length / columns));
+    let peakSum = 0;
+    let lowPower = 0;
+    let midPower = 0;
+    let highPower = 0;
+    for (let index = start; index < end; index += 1) {
+      peakSum += finite(peaks[index]);
+      if (measured) {
+        lowPower += finite(bands[index][0]) ** 2;
+        midPower += finite(bands[index][1]) ** 2;
+        highPower += finite(bands[index][2]) ** 2;
+      }
+    }
+    const count = Math.max(1, end - start);
+    low[column] = measured ? Math.sqrt(lowPower / count) : 0;
+    mid[column] = measured ? Math.sqrt(midPower / count) : 0;
+    high[column] = measured ? Math.sqrt(highPower / count) : 0;
+    peakMean[column] = peakSum / count;
+    xs[column] = (column + 0.5) * width / columns;
+  }
+  const smoothedLow = smoothSeries(low, OVERVIEW_SMOOTH);
+  const smoothedMid = smoothSeries(mid, OVERVIEW_SMOOTH);
+  const smoothedHigh = smoothSeries(high, OVERVIEW_SMOOTH);
+  let bandPeak = 0;
+  for (let index = 0; index < columns; index += 1) {
+    bandPeak = Math.max(bandPeak, smoothedLow[index] + smoothedMid[index] + smoothedHigh[index]);
+  }
+  const useBands = measured && bandPeak > 1e-8;
+  const smoothedLevel = useBands
+    ? smoothedLow.map((value, index) => value + smoothedMid[index] + smoothedHigh[index])
+    : smoothSeries(peakMean, OVERVIEW_SMOOTH);
+  let trackPeak = 0;
+  for (const value of smoothedLevel) trackPeak = Math.max(trackPeak, value);
+  if (trackPeak <= 1e-8) return [];
+  const span = height * 0.94 * bandScale;
+  const gain = span / trackPeak;
+  const floor = height;
+  if (!useBands) {
+    const body = smoothedLevel.map(value => value * gain);
+    const ribbon = stackedRibbon(OVERVIEW_LOW, xs, body.map(() => 0), body, floor);
+    return ribbon ? [ribbon] : [];
+  }
+  const slices = [smoothedLow, smoothedMid, smoothedHigh];
+  const fills = [OVERVIEW_LOW, OVERVIEW_MID, OVERVIEW_HIGH];
+  const paths: { fill: string; d: string }[] = [];
+  let base = new Array<number>(columns).fill(0);
+  for (let band = 0; band < slices.length; band += 1) {
+    const top = base.map((value, index) => value + slices[band][index] * gain);
+    const ribbon = stackedRibbon(fills[band], xs, base, top, floor);
+    if (ribbon) paths.push(ribbon);
+    base = top;
   }
   return paths;
 }

@@ -21,13 +21,7 @@ import {
 } from '../lib/ipc';
 import { bpmLabel, gridAvailable } from '../lib/deckReady';
 import { audibleFramesRemaining } from '../lib/silence';
-import {
-  waveColumn,
-  RGB_WAVE_KEY,
-  wavePaths, structureGain,
-  type WavePoint,
-  waveformScale,
-} from '../lib/waveformDisplay';
+import { OVERVIEW_WAVE_KEY, overviewPaths } from '../lib/waveformDisplay';
 import { useElementSize } from '../hooks/useElementSize';
 import { Fader } from './Fader';
 import { Knob } from './Knob';
@@ -1233,27 +1227,19 @@ const OverviewWave = memo(function OverviewWave({
   bands: [number, number, number][];
 }) {
   const [svgRef, size] = useElementSize<SVGSVGElement>(600, 96);
-  const W = size.width;
-  const H = size.height;
-  const cy = H / 2;
-  const N = peaks.length;
-  const gain = useMemo(() => waveformScale(peaks), [peaks]);
-  const bandGain = useMemo(() => structureGain(bands), [bands]);
-  const step = Math.max(1, Math.ceil(N / Math.max(1, W)));
-  const samples: WavePoint[] = [];
-  for (let i = 0; i < N; i += step) {
-    const column = waveColumn(peaks, bands, i, Math.min(N, i + step), gain, cy * 0.94, 'preview');
-    samples.push({ ...column, x: column.loudest / N * W });
-  }
+  const paths = useMemo(
+    () => overviewPaths(peaks, bands, size.width, size.height),
+    [peaks, bands, size.width, size.height],
+  );
   return (
     <svg
       ref={svgRef}
       className="ov-svg"
-      viewBox={`0 0 ${W} ${H}`}
+      viewBox={`0 0 ${size.width} ${size.height}`}
       preserveAspectRatio="none"
     >
-      <title>{RGB_WAVE_KEY}</title>
-      {wavePaths(samples, cy, bandGain, 1, 'baseline').map(path => <path key={path.fill} {...path} />)}
+      <title>{OVERVIEW_WAVE_KEY}</title>
+      {paths.map(path => <path key={path.fill} {...path} />)}
     </svg>
   );
 });

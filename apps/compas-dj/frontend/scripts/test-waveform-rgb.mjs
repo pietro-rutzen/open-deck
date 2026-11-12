@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 const source = readFileSync(new URL('../src/lib/waveformDisplay.ts', import.meta.url), 'utf8');
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2022, target: ts.ScriptTarget.ES2022 } }).outputText;
-const { frequencyColor, waveColumn, rgbPaths, wavePaths, structureGain } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
+const { frequencyColor, waveColumn, rgbPaths, wavePaths, structureGain, overviewPaths } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`);
 for (let i = 0; i < 3; i++) {
   const band = [0, 0, 0]; band[i] = 1;
   const rgb = frequencyColor(...band).match(/\d+/g).map(Number);
@@ -89,9 +89,11 @@ const deck = readFileSync(new URL('../src/components/Deck.tsx', import.meta.url)
 const library = readFileSync(new URL('../src/components/LibraryVisuals.tsx', import.meta.url), 'utf8');
 const zone = readFileSync(new URL('../src/components/WaveformZone.tsx', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../src/styles.css', import.meta.url), 'utf8');
-assert.match(deck, /wavePaths\(samples, cy, bandGain, 1, 'baseline'\)/);
-assert.match(library, /wavePaths\(points, 20, structureGain\(bands\), bandScale, 'baseline'\)/);
+assert.match(deck, /overviewPaths\(peaks, bands, size\.width, size\.height\)/);
+assert.match(library, /overviewPaths\(peaks, bands, 256, 40, bandScale\)/);
+assert.equal(zone.includes('overviewPaths'), false);
 assert.equal(zone.includes("'baseline'"), false);
+assert.match(zone, /wavePaths\(points, centerY, bandGain\)/);
 assert.match(css, /\.ov-cue \{[^}]*top:\s*0;[^}]*bottom:\s*0;/);
 assert.match(css, /\.ov-loop \{[^}]*top:\s*0;[^}]*bottom:\s*0;/);
 assert.match(css, /\.ov-memory \{[^}]*top:\s*0;[^}]*bottom:\s*0;/);
@@ -100,3 +102,78 @@ assert.match(css, /\.ov-marks \{[^}]*top:\s*4px;/);
 assert.match(deck, /y1="0"/);
 assert.match(deck, /y2="100"/);
 console.log('Preview waveforms use the upper half from the bottom edge; the scrolling waveform stays mirrored');
+
+const heightOf = (path, x) => {
+  const values = path.d.match(/-?\d+\.\d+/g).map(Number);
+  const ys = [];
+  for (let index = 0; index < values.length; index += 2) {
+    if (Math.abs(values[index] - x) < 0.05) ys.push(values[index + 1]);
+  }
+  assert.equal(ys.length, 2);
+  return Math.max(...ys) - Math.min(...ys);
+};
+const crestOf = (paths, x) => Math.min(...paths.flatMap(path => {
+  const values = path.d.match(/-?\d+\.\d+/g).map(Number);
+  const ys = [];
+  for (let index = 0; index < values.length; index += 2) {
+    if (Math.abs(values[index] - x) < 0.05) ys.push(values[index + 1]);
+  }
+  return ys;
+}));
+
+const loudBand = [1, 0.4, 0.15];
+const quietBand = [0.2, 0.05, 0.02];
+const bandSum = (band) => band[0] + band[1] + band[2];
+const energyRatio = bandSum(quietBand) / bandSum(loudBand);
+const overviewPeaks = Array.from({ length: 21 }, () => 1);
+const overviewBands = overviewPeaks.map((_, index) => (index >= 7 && index <= 13 ? quietBand : loudBand));
+const stacked = overviewPaths(overviewPeaks, overviewBands, 21, 40);
+assert.deepEqual(stacked.map(path => path.fill), ['#137fff', '#ffa916', '#fff4d9']);
+assert.equal(stacked.some(path => path.fill.startsWith('rgb')), false);
+const overviewHeight = 40;
+const overviewSpan = overviewHeight * 0.94;
+const loudCrest = crestOf(stacked, 3.5);
+const quietCrest = crestOf(stacked, 10.5);
+assert.ok(Math.abs((overviewHeight - loudCrest) - overviewSpan) <= 0.15);
+assert.ok(Math.abs((overviewHeight - quietCrest) / overviewSpan - energyRatio) <= 0.02);
+assert.ok(quietCrest > loudCrest + 20);
+for (const [band, previous] of stacked.slice(1).entries()) {
+  const lower = stacked[band];
+  const lowerValues = lower.d.match(/-?\d+\.\d+/g).map(Number);
+  const upperValues = previous.d.match(/-?\d+\.\d+/g).map(Number);
+  const shared = [];
+  for (let index = 0; index < lowerValues.length; index += 2) {
+    if (Math.abs(lowerValues[index] - 3.5) < 0.05) shared.push(lowerValues[index + 1]);
+  }
+  const above = [];
+  for (let index = 0; index < upperValues.length; index += 2) {
+    if (Math.abs(upperValues[index] - 3.5) < 0.05) above.push(upperValues[index + 1]);
+  }
+  assert.equal(Math.min(...shared), Math.max(...above));
+}
+assert.ok(heightOf(stacked[2], 3.5) < heightOf(stacked[1], 3.5));
+assert.ok(heightOf(stacked[1], 3.5) < heightOf(stacked[0], 3.5));
+assert.ok(stacked[0].d.includes(' 40.0'));
+
+const alternating = Array.from({ length: 40 }, (_, index) => (index % 2 === 0 ? [1, 0, 0] : [0.1, 0, 0]));
+const blended = overviewPaths(alternating.map(() => 1), alternating, 40, 40);
+const evenHeight = heightOf(blended[0], 16.5);
+const oddHeight = heightOf(blended[0], 17.5);
+assert.ok(evenHeight / oddHeight < 2);
+assert.ok(oddHeight > 0);
+
+const spike = Array.from({ length: 21 }, () => 0);
+spike[10] = 1;
+const spiked = overviewPaths(spike, spike.map(value => [value, 0, 0]), 21, 40);
+const spikeHeight = heightOf(spiked[0], 10.5);
+const neighborHeight = heightOf(spiked[0], 11.5);
+assert.ok(Math.abs(spikeHeight - overviewSpan) <= 0.15);
+assert.ok(neighborHeight > spikeHeight * 0.5 && neighborHeight < spikeHeight);
+
+const unbanded = [1, 1, 1, 1, 1, 0.25, 0.25, 0.25, 0.25, 0.25, 1, 1, 1, 1, 1];
+const linear = overviewPaths(unbanded, [], 15, 40);
+assert.deepEqual(linear.map(path => path.fill), ['#137fff']);
+assert.ok(Math.abs(heightOf(linear[0], 7.5) / heightOf(linear[0], 2.5) - 0.25) <= 0.03);
+assert.deepEqual(overviewPaths([0, 0, 0], [[0, 0, 0], [0, 0, 0], [0, 0, 0]], 3, 40), []);
+assert.deepEqual(overviewPaths([], [], 10, 40), []);
+console.log('Overview loudness is linear to the track peak, stacked, and lightly smoothed');
