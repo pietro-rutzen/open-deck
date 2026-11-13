@@ -51,3 +51,13 @@ Flag callback allocations/locks, UI-controlled timing, unbounded queues, unsafe 
 ## Maintainer delivery preference
 
 After completing and verifying a change, run `./scripts/opendeck-build.sh` to build, install, and relaunch the verified bundle. The standalone installer can retry delivery from a finished build. The maintainer uses `/Applications/Open Deck.app`. Commit finished project changes and push to the configured origin branch. Verify the remote revision and report any failed installation or push. Preserve unrelated working files.
+
+## Cursor Cloud specific instructions
+
+Cloud agents run on Linux. The macOS app bundle and a physical DDJ-FLX4 are outside this environment, so do not claim those from a Linux run.
+
+- Engine check: `cargo test --locked` from the repository root. `rust-toolchain.toml` selects stable, including rustfmt and clippy.
+- Frontend: in `apps/compas-dj/frontend`, `npm ci`, then `npm test`, `npm run typecheck`, and `npm run build`.
+- Desktop UI: from `apps/compas-dj`, run `frontend/node_modules/.bin/tauri dev`. That starts Vite at `http://localhost:5173` and the debug app. Launching the debug binary without Vite only shows a localhost connection error.
+- This VM has no sound card. Boot starts PulseAudio on a null sink, and `~/.asoundrc` routes the ALSA default device to `/run/user/<uid>/pulse/native`, so the engine can open a paced 44.1 kHz output. Regenerate the sample WAVs with `node scripts/make-test-audio.mjs`.
+- On current stable, `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings` fail on existing source. That is not an environment failure. `cargo test --locked` is the engine check that passes.
